@@ -44,6 +44,14 @@ object AiStoryboardDirector {
         val sceneContext: String? = null,
         /** 导演视觉指令（运镜/景别/构图） */
         val visualPrompt: String? = null,
+        /** 场次编号：同一场戏同号、从1连续递增；0=模型未给，由 stabilizeShots 归一化 */
+        val sceneNo: Int = 0,
+        /** 场次简短标题（如「深夜办公室」），分镜页按场分组用 */
+        val sceneTitle: String? = null,
+        /** 本镜主体站位：左/右/中；用于 180 度轴线一致性校验 */
+        val screenSide: String? = null,
+        /** 本镜主体视线方向：左/右/上/下/对方；正反打两侧视线应相反 */
+        val eyeline: String? = null,
     )
 
     /**
@@ -70,11 +78,13 @@ object AiStoryboardDirector {
     private const val MAX_SCRIPT_CHARS = 24000
     private const val WRITER_PROMPT = """你是短剧分镜编剧。把给定的剧本/小说片段拆成视频镜头表。
 只输出严格 JSON，不要markdown代码块。格式：
-{"shots":[{"shot_no":1,"action":"画面中发生的具体动作（30字内，纯动作描述）","scene_context":"时间+天气+空间位置，第一镜建立基准，后续镜头必须继承或写明变化原因","dialogue":"该镜台词原文（无台词则省略）","narration":"旁白（无则省略）","duration_seconds":6,"characters":["角色名"],"asset_ids":["a_xxx","a_yyy"],"beat_ref":"B01","carry_over":"本镜结束时角色/场景/道具的状态，供下一镜承接"}]}
+{"shots":[{"shot_no":1,"action":"画面中发生的具体动作（30字内，纯动作描述）","scene_context":"时间+天气+空间位置，第一镜建立基准，后续镜头必须继承或写明变化原因","dialogue":"该镜台词原文（无台词则省略）","narration":"旁白（无则省略）","duration_seconds":6,"characters":["角色名"],"asset_ids":["a_xxx","a_yyy"],"scene_no":1,"scene_title":"深夜办公室","screen_side":"左","eyeline":"看向对方","beat_ref":"B01","carry_over":"本镜结束时角色/场景/道具的状态，供下一镜承接"}]}
 规则：
 - 每镜4-10秒（推荐5-8秒）；一场戏2-5镜；台词必须与原文逐字一致不得改写；shot_no从1连续递增。
 - 节奏设计：不要所有镜头一样长。开场钩子4-6秒；场景建立镜头6-8秒；对话正反打5-7秒；冲突/动作/追逐4-5.5秒；情绪停留/沉默/独白8-10秒；每3-4镜至少出现一次明显时长变化。
 - 段落结构：同一场戏先用1个建立镜头交代空间与人物关系，再进入对话或动作；换场时用一个可理解的转场镜（推门/转身/跟拍/空镜）并把转场写进 carry_over。
+- 场次结构：同一场戏的镜头 scene_no 必须相同、从1连续递增，禁止跳号；scene_title 用4-8字概括本场（如"深夜办公室""医院走廊"）；每场2-5镜，只有过场/闪回允许单镜成场。
+- 轴线与视线（180度规则）：对话戏里两个角色固定分居画面左右，同一角色不要在相邻镜头换到另一侧；screen_side 写本镜主体站位（左/右/中）；正反打时两人 eyeline 必须相反（一个"看向左"、一个"看向右"），不允许两镜都看同一侧；确需越轴/反打/过肩时，在 action 或 carry_over 里明确写"越轴/反打/过肩/绕到另一侧"。
 - 景别与机位：相邻两镜不要同景别；对话戏用正反打（过肩/近景/特写交替）；冲突高潮用近景+特写；交代空间用全景/中景。
 - 镜头内调度：action 要写清人物在画面哪一侧、朝向谁、与前景/背景的关系（如"林见夕居左，顾沉背身入画右侧"）。
 - 短剧片段通常4-12镜；如果输入是长剧本，必须覆盖提供文本中的全部关键事件，镜头数量可以超过12，绝不能为了满足数量上限而省略后半段。
@@ -91,6 +101,7 @@ object AiStoryboardDirector {
 要求：先写机位语言（如"近景缓推，人物居左，背景纵深虚化"），再补充本镜的光线/影调/氛围（如"电脑屏幕蓝光映脸、办公室冷色调"）；必须与 scene_context、剧本及资产描述一致，不得自行新增剧本未写的时间、天气或光源；不要重复动作内容。
 asset_ids 已锁定：写 visual 时必须考虑该镜引用的资产（角色长相/场景/道具），visual_prompt 描述应与资产描述一致（如"近景缓推张角道长"而非"近景缓推一古装男子"）。
 镜头语言要求：每镜画面描述必须包含机位高度（平视/俯拍/仰拍）、景别、运镜，以及光比/色温/景深/前景遮挡中的至少一项；相邻镜头景别必须有变化，不得连续两镜同一景别；对话戏用过肩或正反打，冲突戏用近景+快速运镜，情绪戏用长焦特写+浅景深。
+轴线要求：同一场对话戏保持180度轴线——同一角色在相邻镜头里必须停在同一侧（screen_side），正反打两人视线方向相反；确需反打/越轴时在 visual 里写清"反打/过肩/越轴"，不要无理由把角色换到另一侧。
 跨镜连贯：必须继承上一镜的 carry_over、角色/场景资产与动作结果，禁止无因果跳转；通过 beat_ref 控制因果顺序与节奏。"""
 
     /**
@@ -205,11 +216,11 @@ asset_ids 已锁定：写 visual 时必须考虑该镜引用的资产（角色�
             val targets = issues.map { it.shotNo }.toSet()
             val context = current.filter { it.shotNo in targets || it.shotNo - 1 in targets }
                 .joinToString("\n") { s ->
-                    "镜头${s.shotNo}：action=${s.action}; dialogue=${s.dialogue ?: "无"}; narration=${s.narration ?: "无"}; scene_context=${s.sceneContext ?: "缺失"}; carry_over=${s.carryOver ?: "缺失"}; duration=${s.durationSeconds}; asset_ids=${s.assetIds}"
+                    "镜头${s.shotNo}：action=${s.action}; dialogue=${s.dialogue ?: "无"}; narration=${s.narration ?: "无"}; scene_context=${s.sceneContext ?: "缺失"}; scene_no=${s.sceneNo}; scene_title=${s.sceneTitle ?: "缺失"}; screen_side=${s.screenSide ?: "缺失"}; eyeline=${s.eyeline ?: "缺失"}; carry_over=${s.carryOver ?: "缺失"}; duration=${s.durationSeconds}; asset_ids=${s.assetIds}"
                 }
             val errors = issues.joinToString("\n") { "镜头${it.shotNo}: ${it.code} - ${it.message}" }
             val prompt = """你是分镜修复导演。只修复指定镜头，不要重写其他镜头。
-严格只输出 JSON：{"shots":[{"shot_no":2,"action":"...","dialogue":"原台词（无则省略）","narration":"原旁白（无则省略）","scene_context":"...","duration_seconds":6,"characters":["角色名"],"asset_ids":[],"beat_ref":"B02","carry_over":"..."}]}
+严格只输出 JSON：{"shots":[{"shot_no":2,"action":"...","dialogue":"原台词（无则省略）","narration":"原旁白（无则省略）","scene_context":"...","scene_no":1,"scene_title":"深夜办公室","screen_side":"左","eyeline":"看向对方","duration_seconds":6,"characters":["角色名"],"asset_ids":[],"beat_ref":"B02","carry_over":"..."}]}
 要求：scene_context 必须明确继承上一镜的时间、天气、空间、光线；若有变化，carry_over 必须写明转场因果（如推门进入、离开、切换地点）；保持原故事事件不变；dialogue/narration 必须原样照抄【相关镜头】里该镜已有的台词旁白，不得改写、删除或新增；asset_ids 只能使用资产目录中的 id；时长限定4-10秒（推荐5-8秒）。
 【错误】
 $errors
@@ -240,6 +251,10 @@ $script"""
                     beatRef = rep.beatRef ?: original.beatRef,
                     carryOver = rep.carryOver ?: original.carryOver,
                     sceneContext = rep.sceneContext ?: original.sceneContext,
+                    sceneNo = if (rep.sceneNo > 0) rep.sceneNo else original.sceneNo,
+                    sceneTitle = rep.sceneTitle ?: original.sceneTitle,
+                    screenSide = rep.screenSide ?: original.screenSide,
+                    eyeline = rep.eyeline ?: original.eyeline,
                     characterNames = if (rep.characterNames.isNotEmpty()) rep.characterNames else original.characterNames,
                 )
             }
@@ -250,9 +265,28 @@ $script"""
 
     private fun stabilizeShots(shots: List<Shot>, approvedAssetIds: Set<String>): List<Shot> {
         var previous: Shot? = null
+        // 场次归一：模型给的 scene_no 只用于判断“换没换场”，最终按出现顺序重排成 1..N，
+        // 保证连续、无跳号；同一场内每镜继承场标题，缺省补“第N场”。
+        var sceneNo = 0
+        var lastRawScene = Int.MIN_VALUE
+        var currentTitle: String? = null
         return shots.sortedBy { it.shotNo }.mapIndexed { index, raw ->
+            val rawScene = raw.sceneNo
+            if (index == 0) {
+                sceneNo = 1
+                lastRawScene = if (rawScene > 0) rawScene else 1
+                currentTitle = raw.sceneTitle?.takeIf { it.isNotBlank() } ?: "第1场"
+            } else if (rawScene > 0 && rawScene != lastRawScene) {
+                sceneNo += 1
+                lastRawScene = rawScene
+                currentTitle = raw.sceneTitle?.takeIf { it.isNotBlank() } ?: "第${sceneNo}场"
+            }
             val fixed = raw.copy(
                 shotNo = index + 1,
+                sceneNo = sceneNo,
+                sceneTitle = raw.sceneTitle?.takeIf { it.isNotBlank() } ?: currentTitle,
+                screenSide = normalizeSide(raw.screenSide),
+                eyeline = normalizeEyeline(raw.eyeline),
                 durationSeconds = raw.durationSeconds.coerceIn(ShotDesigner.MIN_SECONDS, ShotDesigner.MAX_SECONDS),
                 assetIds = if (approvedAssetIds.isEmpty()) raw.assetIds else raw.assetIds.filter { it in approvedAssetIds }.distinct(),
                 carryOver = if (index == 0) raw.carryOver else raw.carryOver
@@ -262,6 +296,32 @@ $script"""
                     ?: previous?.sceneContext
             ).also { previous = it }
             fixed
+        }
+    }
+
+    /** 画面站位归一：左/右/中，无法判断返回 null（避免把“左侧逆光”等描述误当站位保留）。 */
+    private fun normalizeSide(value: String?): String? {
+        val text = value?.trim().orEmpty()
+        if (text.isEmpty()) return null
+        return when {
+            text.contains("左") -> "左"
+            text.contains("右") -> "右"
+            text.contains("中") || text.contains("正") -> "中"
+            else -> null
+        }
+    }
+
+    /** 视线方向归一：左/右/上/下/对方。 */
+    private fun normalizeEyeline(value: String?): String? {
+        val text = value?.trim().orEmpty()
+        if (text.isEmpty()) return null
+        return when {
+            text.contains("对方") || text.contains("看对方") || text.contains("对视") -> "对方"
+            text.contains("左") -> "左"
+            text.contains("右") -> "右"
+            text.contains("上") -> "上"
+            text.contains("下") -> "下"
+            else -> null
         }
     }
 
@@ -348,7 +408,11 @@ $script"""
                 assetIds = assetIds,
                 beatRef = str("beat_ref").ifBlank { null },
                 carryOver = str("carry_over").ifBlank { null },
-                sceneContext = str("scene_context").ifBlank { null })
+                sceneContext = str("scene_context").ifBlank { null },
+                sceneNo = (o["scene_no"] as? JsonPrimitive)?.content?.toIntOrNull() ?: 0,
+                sceneTitle = str("scene_title").ifBlank { null },
+                screenSide = normalizeSide(str("screen_side")),
+                eyeline = normalizeEyeline(str("eyeline")))
         }
         return out.sortedBy { it.shotNo } to RefStats(assets.size, rawRefs, keptRefs)
     }

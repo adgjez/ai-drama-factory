@@ -101,4 +101,35 @@ class StoryCoherenceTest {
         assertTrue("dialogue_pace" !in StoryCoherence.validate(listOf(roomy)).map { it.code },
             "镜头给到 10 秒足够容纳台词，不应提示")
     }
+
+    @Test
+    fun 轴线视线越轴与单镜成场给软提示() {
+        val axle = listOf(
+            AiStoryboardDirector.Shot(1, "女秘书坐在电脑前", dialogue = "您好", durationSeconds = 6.0,
+                sceneContext = "夜晚，办公室内", sceneNo = 1, screenSide = "左", eyeline = "右"),
+            AiStoryboardDirector.Shot(2, "顾沉站在门口", dialogue = "我来了", durationSeconds = 6.0,
+                carryOver = "顾沉走进办公室", sceneContext = "夜晚，办公室内", sceneNo = 1,
+                screenSide = "右", eyeline = "右"),
+        )
+        val codes = StoryCoherence.validate(axle).map { it.code }
+        assertTrue("axis_jump" in codes, "左右站位互换且无越轴依据应提示，实际：$codes")
+        assertTrue("eyeline_mismatch" in codes, "正反打视线同向应提示，实际：$codes")
+
+        val intentional = listOf(axle[0], axle[1].copy(carryOver = "过肩反打，镜头绕到另一侧"))
+        assertTrue("axis_jump" !in StoryCoherence.validate(intentional).map { it.code },
+            "写明反打/绕侧属于有意越轴，不应提示")
+    }
+
+    @Test
+    fun 单镜成场与开场钩子弱给软提示() {
+        val shots = listOf(
+            AiStoryboardDirector.Shot(1, "她坐在窗边", durationSeconds = 6.0, sceneNo = 1,
+                sceneContext = "夜晚，办公室内"),
+            AiStoryboardDirector.Shot(2, "她低头看手机", durationSeconds = 6.0, sceneNo = 2,
+                carryOver = "她起身走到另一间办公室", sceneContext = "夜晚，会议室内"),
+        )
+        val codes = StoryCoherence.validate(shots).map { it.code }
+        assertTrue("scene_single_shot" in codes, "两场各一镜应提示单镜成场，实际：$codes")
+        assertTrue("hook_weak" in codes, "开场镜无台词无动作无悬念应提示钩子弱，实际：$codes")
+    }
 }

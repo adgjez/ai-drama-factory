@@ -95,7 +95,14 @@ class AiStoryboardDirectorTest {
         })
         assertEquals("推门进入堂屋，目光锁定密函", result.shots[1].action)
         assertEquals("堂屋内一片寂静", result.shots[1].narration, "修复连贯性时不得清空原旁白")
-        assertTrue(result.gateErrors.isEmpty())
+        // 场景/节奏/轴线类设计软提示会进 gateErrors（App 侧按 warn: 落库、不阻断渲染），
+        // 这里只断言没有硬错误。
+        val hardCodes = setOf(
+            "dialogue_not_verbatim", "action_empty", "carry_over_missing", "scene_context_missing",
+            "scene_context_conflict", "shot_order_gap", "rhythm_duration", "asset_unbound",
+        )
+        assertTrue(result.gateErrors.values.flatten().none { it in hardCodes },
+            "正常生成不应有硬错误：" + result.gateErrors)
     }
 
 

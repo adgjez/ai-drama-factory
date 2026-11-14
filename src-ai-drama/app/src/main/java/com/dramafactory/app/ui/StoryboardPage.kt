@@ -19,6 +19,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -36,6 +38,7 @@ import com.dramafactory.app.ui.components.LoadingRow
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.height
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.Icon
@@ -44,6 +47,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import com.dramafactory.app.ui.components.HeroButton
@@ -67,6 +71,11 @@ private fun storyboardCheckLabel(code: String): String = when (code) {
     "beat_index_invalid" -> "剧本节拍顺序无效"
     "beat_out_of_order" -> "剧本节拍顺序回退"
     "missing_asset" -> "引用了未批准资产：请重新选择资产库中的素材"
+    "axis_jump" -> "站位越轴待确认"
+    "eyeline_mismatch" -> "视线同向待确认"
+    "scene_single_shot" -> "单镜成场"
+    "hook_weak" -> "开场钩子弱"
+    "ending_weak" -> "结尾泄气"
     else -> code
 }
 
@@ -92,6 +101,83 @@ internal fun storyboardSizeLabelOf(text: String?): String? {
 private fun storyboardCheckSummary(raw: String): String = raw.removePrefix("error:").removePrefix("warn:")
     .split(",").map { it.trim() }.filter { it.isNotEmpty() }
     .joinToString("；") { storyboardCheckLabel(it) }
+
+/** 第三批：站位/视线编辑选项（空串=清除）。 */
+private val SCREEN_SIDE_OPTIONS = listOf("", "左", "右", "中")
+private val EYELINE_OPTIONS = listOf("", "左", "右", "上", "下", "对方")
+
+/** 第三批：按 scene_no 把相邻同场镜头聚组；scene_no=0 的镜头归「未分场」。 */
+private fun groupShotsByScene(
+    shots: List<com.dramafactory.app.data.ShotEntity>,
+): List<Pair<Int, List<com.dramafactory.app.data.ShotEntity>>> {
+    val groups = mutableListOf<Pair<Int, MutableList<com.dramafactory.app.data.ShotEntity>>>()
+    for (shot in shots) {
+        val last = groups.lastOrNull()
+        if (last != null && last.first == shot.scene_no) last.second.add(shot)
+        else groups.add(shot.scene_no to mutableListOf(shot))
+    }
+    return groups.map { (sceneNo, rows) -> sceneNo to rows.toList() }
+}
+
+/** 第三批：场次组头「第N场 · 标题 · N镜 · 共X秒」（scene_no=0 显示「未分场」）。 */
+@Composable
+private fun SceneGroupHeader(sceneNo: Int, rows: List<com.dramafactory.app.data.ShotEntity>) {
+    val title = rows.firstOrNull()?.scene_title?.takeIf { it.isNotBlank() }
+    val head = if (sceneNo > 0) "第${sceneNo}场" else "未分场"
+    val label = (if (title != null) "$head · $title" else head) +
+        " · ${rows.size}镜 · 共${rows.sumOf { it.duration_seconds }.toInt()}秒"
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Icon(Icons.Default.List, contentDescription = "场次",
+            tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+        Text(label, style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.primary)
+    }
+}
+
+/** 第三批：只读信息 chip（场次/站位/视线速览）。 */
+@Composable
+private fun InfoChip(text: String, tint: Color = MaterialTheme.colorScheme.secondary) {
+    Box(
+        modifier = Modifier
+            .clip(androidx.compose.foundation.shape.RoundedCornerShape(50))
+            .background(tint.copy(alpha = 0.12f))
+            .padding(horizontal = 8.dp, vertical = 2.dp),
+    ) {
+        Text(text, style = MaterialTheme.typography.labelSmall, color = tint)
+    }
+}
+
+/** 第三批：镜头卡首帧缩略图（16:9 · 128×72dp）；未出首帧时显示占位。 */
+@Composable
+private fun ShotFirstFrame(shot: com.dramafactory.app.data.ShotEntity) {
+    val uri = shot.first_image_uri
+    val shape = MaterialTheme.shapes.small
+    if (!uri.isNullOrBlank()) {
+        AsyncImage(
+            model = uri,
+            contentDescription = "镜头#${shot.shot_no}首帧",
+            modifier = Modifier.width(128.dp).height(72.dp).clip(shape),
+            contentScale = ContentScale.Crop,
+        )
+    } else {
+        Box(
+            modifier = Modifier.width(128.dp).height(72.dp).clip(shape)
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+            contentAlignment = androidx.compose.ui.Alignment.Center,
+        ) {
+            Icon(
+                painterResource(R.drawable.ic_image),
+                contentDescription = "暂无首帧",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(24.dp),
+            )
+        }
+    }
+}
 
 
 @Composable
@@ -154,6 +240,8 @@ fun StoryboardPage(
     var queuedCount by remember { mutableStateOf<Int?>(null) }
     // 第十三轮：分镜视频预览（非空=正在播放该本地路径）
     var previewUri by remember { mutableStateOf<String?>(null) }
+    // 第三批：按 scene_no 连续分组渲染；scene_no=0 归「未分场」。
+    val sceneGroups = groupShotsByScene(st.shots)
 
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(16.dp),
@@ -252,6 +340,57 @@ fun StoryboardPage(
                 }
             }
             item {
+                // 第三批：节奏条——每镜一根竖条，柱高∝时长（clamp 4–10 秒），同场用底色分组。
+                DramaCard(Modifier.fillMaxWidth()) {
+                    Column(Modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            "镜头节奏：柱高=时长（4–10 秒封顶）· 底色=同场分镜",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = androidx.compose.ui.Alignment.Bottom,
+                        ) {
+                            sceneGroups.forEachIndexed { groupIndex, group ->
+                                val groupShots = group.second
+                                Row(
+                                    modifier = Modifier
+                                        .clip(androidx.compose.foundation.shape.RoundedCornerShape(6.dp))
+                                        .background(
+                                            if (groupIndex % 2 == 0) {
+                                                MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.35f)
+                                            } else {
+                                                MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.35f)
+                                            }
+                                        )
+                                        .padding(4.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                                    verticalAlignment = androidx.compose.ui.Alignment.Bottom,
+                                ) {
+                                    groupShots.forEach { shot ->
+                                        val seconds = shot.duration_seconds.coerceIn(4.0, 10.0)
+                                        val barHeight = (10.0 + (seconds - 4.0) / 6.0 * 30.0).dp
+                                        val barColor = when {
+                                            shot.sb_check == "pass" -> MaterialTheme.colorScheme.primary
+                                            shot.sb_check.startsWith("warn:") -> MaterialTheme.colorScheme.tertiary
+                                            else -> MaterialTheme.colorScheme.error
+                                        }
+                                        Box(
+                                            Modifier.width(6.dp).height(barHeight)
+                                                .clip(androidx.compose.foundation.shape.RoundedCornerShape(2.dp))
+                                                .background(barColor),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            item {
                 PrimaryButton(
                     text = "渲染本集全部 ${st.shots.size} 镜",
                     onClick = { vm.enqueueRender { n -> queuedCount = n } },
@@ -301,116 +440,136 @@ fun StoryboardPage(
                 )
             }
         }
-        items(st.shots, key = { it.shot_id }) { shot ->
-            DramaCard(
-                onClick = { viewingShotId = shot.shot_id },   // v1.9.2：点卡=查看详情
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Column(Modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text("#${shot.shot_no} · ${shot.duration_seconds.toInt()}秒",
-                            style = MaterialTheme.typography.titleSmall)
-                        when {
-                            shot.sb_check == "pass" -> StatusChip(
-                                icon = Icons.Default.CheckCircle, text = "校验通过",
-                                tint = MaterialTheme.colorScheme.primary)
-                            shot.sb_check == "pending" -> StatusChip(
-                                icon = Icons.Default.DateRange, text = "待生成",
-                                tint = MaterialTheme.colorScheme.outline)
-                            shot.sb_check.startsWith("warn:") -> StatusChip(
-                                icon = Icons.Default.Info, text = storyboardCheckSummary(shot.sb_check),
-                                tint = MaterialTheme.colorScheme.tertiary)
-                            else -> StatusChip(
-                                icon = Icons.Default.Warning,
-                                text = storyboardCheckSummary(shot.sb_check),
-                                tint = MaterialTheme.colorScheme.error)
-                        }
-                    }
-                    shot.action?.let { Text("动作：${displayAction(shot)}", style = MaterialTheme.typography.bodyMedium) }
-                    shot.visual_prompt?.let {
-                        Row(
-                            verticalAlignment = androidx.compose.ui.Alignment.Top,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            Icon(painterResource(R.drawable.ic_movie), contentDescription = "视觉指令",
-                                tint = MaterialTheme.colorScheme.secondary, modifier = Modifier.size(16.dp))
-                            Text(it, style = MaterialTheme.typography.bodySmall,
-                                modifier = Modifier.weight(1f),
-                                color = MaterialTheme.colorScheme.secondary)
-                        }
-                    }
-                    shot.scene_context?.takeIf { it.isNotBlank() }?.let {
-                        Row(
-                            verticalAlignment = androidx.compose.ui.Alignment.Top,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            Icon(painterResource(R.drawable.ic_image), contentDescription = "场景上下文",
-                                tint = MaterialTheme.colorScheme.outline, modifier = Modifier.size(16.dp))
-                            Text("场景：$it", style = MaterialTheme.typography.bodySmall,
-                                modifier = Modifier.weight(1f),
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-                    // v1.7.17：把「本镜引用了哪些资产」显式摆出来。
-                    // 此前这层完全不可见——LLM 引错（或引了还没生图的卡）用户无从察觉，
-                    // 只会在成片里看到角色换脸。引用为空即代表渲染时回退项目级前4张，锁不住脸。
-                    val refs = AssetCatalog.parseRefIds(shot.first_asset_ids)
-                    if (refs.isNotEmpty()) {
-                        Row(
-                            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            Icon(painterResource(R.drawable.ic_link), contentDescription = "引用资产",
-                                tint = MaterialTheme.colorScheme.tertiary, modifier = Modifier.size(16.dp))
-                            Text("引用：${refs.joinToString("、") { st.assetNames[it] ?: it }}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.tertiary)
-                        }
-                    } else {
-                        Row(
-                            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            Icon(Icons.Default.Warning, contentDescription = "未引用资产",
-                                tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(16.dp))
-                            Text("未引用资产：渲染将回退项目级前4张",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.error)
-                        }
-                    }
-                    shot.dialogue?.let { Text("台词：「$it」", style = MaterialTheme.typography.bodySmall) }
-                    shot.narration?.let { Text("旁白：$it", style = MaterialTheme.typography.bodySmall) }
-                    shot.carry_over?.let { Text("承接：$it", style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.outline) }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        // 第十三轮：已出产视频 → 预览入口
-                        st.videoUris[shot.shot_id]?.let { uri ->
-                            OutlinedButton(onClick = { previewUri = uri }) {
-                                Icon(Icons.Default.PlayArrow, contentDescription = "预览",
-                                    modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(6.dp))
-                                Text("预览")
+        sceneGroups.forEach { (sceneNo, groupShots) ->
+            item(key = "scene_h_${groupShots.first().shot_id}") {
+                SceneGroupHeader(sceneNo, groupShots)
+            }
+            items(groupShots, key = { it.shot_id }) { shot ->
+                DramaCard(
+                    onClick = { viewingShotId = shot.shot_id },   // v1.9.2：点卡=查看详情
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(Modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("#${shot.shot_no} · ${shot.duration_seconds.toInt()}秒",
+                                style = MaterialTheme.typography.titleSmall)
+                            when {
+                                shot.sb_check == "pass" -> StatusChip(
+                                    icon = Icons.Default.CheckCircle, text = "校验通过",
+                                    tint = MaterialTheme.colorScheme.primary)
+                                shot.sb_check == "pending" -> StatusChip(
+                                    icon = Icons.Default.DateRange, text = "待生成",
+                                    tint = MaterialTheme.colorScheme.outline)
+                                shot.sb_check.startsWith("warn:") -> StatusChip(
+                                    icon = Icons.Default.Info, text = storyboardCheckSummary(shot.sb_check),
+                                    tint = MaterialTheme.colorScheme.tertiary)
+                                else -> StatusChip(
+                                    icon = Icons.Default.Warning,
+                                    text = storyboardCheckSummary(shot.sb_check),
+                                    tint = MaterialTheme.colorScheme.error)
                             }
                         }
-                        if (shot.sb_check != "pass") {
-                            OutlinedButton(onClick = { vm.regenerateShot(shot.shot_id) }) {
-                                Icon(Icons.Default.Refresh, contentDescription = "重新生成",
-                                    modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(6.dp))
-                                Text("重新生成")
+                        // 第三批：首帧缩略图 + 场次/站位/视线速览
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                        ) {
+                            ShotFirstFrame(shot)
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                shot.scene_title?.takeIf { it.isNotBlank() }?.let {
+                                    InfoChip(if (shot.scene_no > 0) "第${shot.scene_no}场 · $it" else "未分场 · $it")
+                                }
+                                shot.screen_side?.takeIf { it.isNotBlank() }?.let { InfoChip("站位：$it") }
+                                shot.eyeline?.takeIf { it.isNotBlank() }?.let { InfoChip("视线：$it") }
                             }
                         }
-                        OutlinedButton(onClick = { editingShotId = shot.shot_id }) {
-                            Icon(Icons.Default.Edit, contentDescription = "编辑",
-                                modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("编辑")
+                        shot.action?.let { Text("动作：${displayAction(shot)}", style = MaterialTheme.typography.bodyMedium) }
+                        shot.visual_prompt?.let {
+                            Row(
+                                verticalAlignment = androidx.compose.ui.Alignment.Top,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Icon(painterResource(R.drawable.ic_movie), contentDescription = "视觉指令",
+                                    tint = MaterialTheme.colorScheme.secondary, modifier = Modifier.size(16.dp))
+                                Text(it, style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.weight(1f),
+                                    color = MaterialTheme.colorScheme.secondary)
+                            }
                         }
-                        OutlinedButton(onClick = { confirmDeleteShotId = shot.shot_id }) {
-                            Icon(Icons.Default.Delete, contentDescription = "删除",
-                                modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("删除")
+                        shot.scene_context?.takeIf { it.isNotBlank() }?.let {
+                            Row(
+                                verticalAlignment = androidx.compose.ui.Alignment.Top,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Icon(painterResource(R.drawable.ic_image), contentDescription = "场景上下文",
+                                    tint = MaterialTheme.colorScheme.outline, modifier = Modifier.size(16.dp))
+                                Text("场景：$it", style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.weight(1f),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                        // v1.7.17：把「本镜引用了哪些资产」显式摆出来。
+                        // 此前这层完全不可见——LLM 引错（或引了还没生图的卡）用户无从察觉，
+                        // 只会在成片里看到角色换脸。引用为空即代表渲染时回退项目级前4张，锁不住脸。
+                        val refs = AssetCatalog.parseRefIds(shot.first_asset_ids)
+                        if (refs.isNotEmpty()) {
+                            Row(
+                                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Icon(painterResource(R.drawable.ic_link), contentDescription = "引用资产",
+                                    tint = MaterialTheme.colorScheme.tertiary, modifier = Modifier.size(16.dp))
+                                Text("引用：${refs.joinToString("、") { st.assetNames[it] ?: it }}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.tertiary)
+                            }
+                        } else {
+                            Row(
+                                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Icon(Icons.Default.Warning, contentDescription = "未引用资产",
+                                    tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(16.dp))
+                                Text("未引用资产：渲染将回退项目级前4张",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error)
+                            }
+                        }
+                        shot.dialogue?.let { Text("台词：「$it」", style = MaterialTheme.typography.bodySmall) }
+                        shot.narration?.let { Text("旁白：$it", style = MaterialTheme.typography.bodySmall) }
+                        shot.carry_over?.let { Text("承接：$it", style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.outline) }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            // 第十三轮：已出产视频 → 预览入口
+                            st.videoUris[shot.shot_id]?.let { uri ->
+                                OutlinedButton(onClick = { previewUri = uri }) {
+                                    Icon(Icons.Default.PlayArrow, contentDescription = "预览",
+                                        modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("预览")
+                                }
+                            }
+                            if (shot.sb_check != "pass") {
+                                OutlinedButton(onClick = { vm.regenerateShot(shot.shot_id) }) {
+                                    Icon(Icons.Default.Refresh, contentDescription = "重新生成",
+                                        modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("重新生成")
+                                }
+                            }
+                            OutlinedButton(onClick = { editingShotId = shot.shot_id }) {
+                                Icon(Icons.Default.Edit, contentDescription = "编辑",
+                                    modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("编辑")
+                            }
+                            OutlinedButton(onClick = { confirmDeleteShotId = shot.shot_id }) {
+                                Icon(Icons.Default.Delete, contentDescription = "删除",
+                                    modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("删除")
+                            }
                         }
                     }
                 }
@@ -451,6 +610,15 @@ fun StoryboardPage(
                     viewingShot.narration?.let { DetailLine("旁白", it) }
                     viewingShot.carry_over?.let {
                         DetailLine("承接", it, MaterialTheme.colorScheme.outline) }
+                    // 第三批：场次/站位/视线
+                    if (viewingShot.scene_no > 0 || !viewingShot.scene_title.isNullOrBlank()) {
+                        val sceneTitle = viewingShot.scene_title?.takeIf { it.isNotBlank() }
+                        DetailLine("场次",
+                            (if (viewingShot.scene_no > 0) "第${viewingShot.scene_no}场" else "未分场") +
+                                (sceneTitle?.let { " · $it" } ?: ""))
+                    }
+                    viewingShot.screen_side?.takeIf { it.isNotBlank() }?.let { DetailLine("站位", it) }
+                    viewingShot.eyeline?.takeIf { it.isNotBlank() }?.let { DetailLine("视线", it) }
 
                     Text("引用资产", style = MaterialTheme.typography.titleSmall)
                     val refs = AssetCatalog.parseRefIds(viewingShot.first_asset_ids)
@@ -528,13 +696,65 @@ fun StoryboardPage(
         var eDur by remember(editingShot.shot_id) {
             mutableStateOf(editingShot.duration_seconds.toInt().toString())
         }
+        // 第三批：场次 / 站位 / 视线编辑态
+        var eSceneNo by remember(editingShot.shot_id) {
+            mutableStateOf(if (editingShot.scene_no > 0) editingShot.scene_no.toString() else "")
+        }
+        var eSceneTitle by remember(editingShot.shot_id) {
+            mutableStateOf(editingShot.scene_title ?: "")
+        }
+        var eSide by remember(editingShot.shot_id) { mutableStateOf(editingShot.screen_side ?: "") }
+        var eEye by remember(editingShot.shot_id) { mutableStateOf(editingShot.eyeline ?: "") }
+        var sideMenu by remember(editingShot.shot_id) { mutableStateOf(false) }
+        var eyeMenu by remember(editingShot.shot_id) { mutableStateOf(false) }
         AlertDialog(
             onDismissRequest = { editingShotId = null },
             title = { Text("编辑镜头 #${editingShot.shot_no}") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(
+                    Modifier.fillMaxWidth().heightIn(max = 440.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
                     OutlinedTextField(value = eAction, onValueChange = { eAction = it },
                         label = { Text("动作描述") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
+                    // 第三批：场次号（0=未分场）+ 场次标题
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(value = eSceneNo,
+                            onValueChange = { txt -> eSceneNo = txt.filter(Char::isDigit) },
+                            label = { Text("场次号（0=未分场）") }, singleLine = true,
+                            modifier = Modifier.weight(1f))
+                        OutlinedTextField(value = eSceneTitle, onValueChange = { eSceneTitle = it },
+                            label = { Text("场次标题") }, singleLine = true,
+                            modifier = Modifier.weight(1f))
+                    }
+                    // 第三批：站位 / 视线 下拉选择
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Box(Modifier.weight(1f)) {
+                            OutlinedButton(onClick = { sideMenu = true },
+                                modifier = Modifier.fillMaxWidth()) {
+                                Text("站位：" + eSide.ifBlank { "未设置" })
+                            }
+                            DropdownMenu(expanded = sideMenu, onDismissRequest = { sideMenu = false }) {
+                                SCREEN_SIDE_OPTIONS.forEach { option ->
+                                    DropdownMenuItem(text = { Text(option.ifBlank { "未设置" }) },
+                                        onClick = { eSide = option; sideMenu = false })
+                                }
+                            }
+                        }
+                        Box(Modifier.weight(1f)) {
+                            OutlinedButton(onClick = { eyeMenu = true },
+                                modifier = Modifier.fillMaxWidth()) {
+                                Text("视线：" + eEye.ifBlank { "未设置" })
+                            }
+                            DropdownMenu(expanded = eyeMenu, onDismissRequest = { eyeMenu = false }) {
+                                EYELINE_OPTIONS.forEach { option ->
+                                    DropdownMenuItem(text = { Text(option.ifBlank { "未设置" }) },
+                                        onClick = { eEye = option; eyeMenu = false })
+                                }
+                            }
+                        }
+                    }
                     OutlinedTextField(value = eDialogue, onValueChange = { eDialogue = it },
                         label = { Text("台词（留空删除）") }, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(value = eNarration, onValueChange = { eNarration = it },
@@ -557,6 +777,11 @@ fun StoryboardPage(
                         eDialogue.ifBlank { null }, eNarration.ifBlank { null },
                         eVisual.ifBlank { null }, (eDur.toIntOrNull() ?: 6).toDouble(),
                         eScene.ifBlank { null }, eCarry.ifBlank { null })
+                    // 第三批：场次/站位/视线单独走局部 UPDATE，避开 upsert 整行覆盖
+                    vm.updateShotSceneInfo(editingShot.shot_id,
+                        eSceneNo.toIntOrNull()?.coerceAtLeast(0) ?: 0,
+                        eSceneTitle.ifBlank { null }, eSide.ifBlank { null },
+                        eEye.ifBlank { null })
                     editingShotId = null
                 }) { Text("保存") }
             },

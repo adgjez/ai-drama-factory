@@ -455,6 +455,11 @@ class DefaultAiOrchestrator(
         val carryOver: String? = null,
         val beatRef: String? = null,
         val durationSeconds: Double = 6.0,
+        // ★第三批：场次结构与轴线/视线（追加末尾带默认值，兼容既有位置参数构造）
+        val sceneNo: Int = 0,
+        val sceneTitle: String? = null,
+        val screenSide: String? = null,
+        val eyeline: String? = null,
     )
     data class AuditResult(val passed: Boolean, val score: Double? = null, val reason: String? = null)
 }

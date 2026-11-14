@@ -52,6 +52,8 @@ internal class BrokenDramaDao : DramaDao {
     override suspend fun setShotReferenceVideo(shotId: String, uri: String?) = noStorage()
     override suspend fun shotKeyframes(shotId: String): ShotEntity? = noStorage()
     override suspend fun shotReferenceVideo(shotId: String): String? = noStorage()
+    override suspend fun updateShotSceneInfo(shotId: String, sceneNo: Int, sceneTitle: String?, screenSide: String?, eyeline: String?) = noStorage()
+    override suspend fun setProjectBgm(projectId: String, bgmPath: String?, bgmVolume: Double) = noStorage()
     override suspend fun upsertRenderTask(t: RenderTaskEntity) = noStorage()
     override suspend fun renderTasksOf(ep: String): List<RenderTaskEntity> = noStorage()
     override suspend fun renderTask(shotId: String): RenderTaskEntity? = noStorage()

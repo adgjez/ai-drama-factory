@@ -23,7 +23,7 @@ import kotlinx.coroutines.sync.withLock
         FinishedFilmEntity::class,
         ActionIdempotencyEntity::class,
     ],
-    version = 8,
+    version = 9,
     exportSchema = true,
 )
 abstract class DramaDatabase : RoomDatabase() {
@@ -42,7 +42,8 @@ abstract class DramaDatabase : RoomDatabase() {
                 // 第十轮：v3→v4 shots 新增 visual_prompt + duration_seconds。
                 // T014：v4→v5 新增成片库表 finished_films。
                 // v1.9.12：v5→v6 assets 新增 enriched_prompt 列（LLM 扩写视觉描述永久落盘）。
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
+                // 第三批：v8→v9 shots 新增场次/站位/视线列，projects 新增 BGM 列。
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9)
                 .build().also { instance = it }
         }
 
@@ -134,6 +135,29 @@ abstract class DramaDatabase : RoomDatabase() {
                     while (c.moveToNext()) if (nameIndex >= 0 && c.getString(nameIndex) == "scene_context") found = true
                     if (!found) db.execSQL("ALTER TABLE shots ADD COLUMN scene_context TEXT")
                 }
+            }
+        }
+
+        /** v8→v9：shots 新增场次结构（scene_no/scene_title/screen_side/eyeline），projects 新增 BGM。 */
+        val MIGRATION_8_9 = object : androidx.room.migration.Migration(8, 9) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                val shotColumns = mutableSetOf<String>()
+                db.query("PRAGMA table_info(shots)").use { c ->
+                    val nameIndex = c.getColumnIndex("name")
+                    while (c.moveToNext()) if (nameIndex >= 0) shotColumns += c.getString(nameIndex)
+                }
+                if ("scene_no" !in shotColumns) db.execSQL("ALTER TABLE shots ADD COLUMN scene_no INTEGER NOT NULL DEFAULT 0")
+                if ("scene_title" !in shotColumns) db.execSQL("ALTER TABLE shots ADD COLUMN scene_title TEXT")
+                if ("screen_side" !in shotColumns) db.execSQL("ALTER TABLE shots ADD COLUMN screen_side TEXT")
+                if ("eyeline" !in shotColumns) db.execSQL("ALTER TABLE shots ADD COLUMN eyeline TEXT")
+
+                val projectColumns = mutableSetOf<String>()
+                db.query("PRAGMA table_info(projects)").use { c ->
+                    val nameIndex = c.getColumnIndex("name")
+                    while (c.moveToNext()) if (nameIndex >= 0) projectColumns += c.getString(nameIndex)
+                }
+                if ("bgm_path" !in projectColumns) db.execSQL("ALTER TABLE projects ADD COLUMN bgm_path TEXT")
+                if ("bgm_volume" !in projectColumns) db.execSQL("ALTER TABLE projects ADD COLUMN bgm_volume REAL NOT NULL DEFAULT 0.22")
             }
         }
 

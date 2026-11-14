@@ -309,6 +309,18 @@ object AppGraph {
      * 返回成片 File；无可用镜头/合成失败返回 null。
      * 复用成片库(S7)逻辑，供 AI 模式跑完自动产出成品展示。
      */
+    /**
+     * 第三批：读取本集所属项目的 BGM 配置。
+     * 文件可能已被用户删除（返回 null 文件），音量仍返回（便于 UI 回显默认值 0.22）。
+     */
+    suspend fun bgmForEpisode(episodeId: String): Pair<java.io.File?, Double> {
+        val projectId = episodeId.substringBefore("_ep")
+        val row = runCatching { dao.project(projectId) }.getOrNull()
+        val file = row?.bgm_path?.takeIf { it.isNotBlank() }?.let { java.io.File(it) }
+            ?.takeIf { it.exists() && it.length() > 0L }
+        return file to (row?.bgm_volume ?: 0.22)
+    }
+
     suspend fun composeFilmIfReady(episodeId: String, ctx: Context): java.io.File? {
         val composer = movieAssembler
         if (composer is EmptyMovieAssembler) return null
@@ -357,6 +369,8 @@ object AppGraph {
                 }
                 cursorMs += durMs
             }
+            // ★第三批：项目 BGM 端到端（成片页选曲 → 合成时混音）；文件丢失时自动跳过。
+            val (bgmFile, bgmVolume) = bgmForEpisode(episodeId)
             // ★第二批 P0-D2：成片统一落 filesDir/movies（cacheDir 会被系统清理）
             val out = FilmPaths.film(ctx, episodeId)
             withContext(kotlinx.coroutines.Dispatchers.IO) {
@@ -364,6 +378,8 @@ object AppGraph {
                     clips, out,
                     com.dramafactory.core.assemble.MovieAssembler.AssembleOptions(
                         subtitles = cues,
+                        bgm = bgmFile,
+                        bgmVolume = bgmVolume,
                         loudnessNormalize = true,
                         transition = com.dramafactory.core.assemble.MovieAssembler.Transition.FADE,
                         transitionSeconds = transitionSeconds,

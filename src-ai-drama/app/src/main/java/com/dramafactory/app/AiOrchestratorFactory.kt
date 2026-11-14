@@ -202,6 +202,10 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                         carryOver = s.carryOver,
                         beatRef = s.beatRef,
                         durationSeconds = s.durationSeconds,
+                        sceneNo = s.sceneNo,
+                        sceneTitle = s.sceneTitle,
+                        screenSide = s.screenSide,
+                        eyeline = s.eyeline,
                     )
                 }
             }
@@ -265,6 +269,10 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                     beat_ref = s.beatRef,
                     carry_over = s.carryOver,
                     duration_seconds = s.durationSeconds,
+                    scene_no = s.sceneNo,
+                    scene_title = s.sceneTitle,
+                    screen_side = s.screenSide,
+                    eyeline = s.eyeline,
                     first_asset_ids = AssetCatalog.encodeRefIds(s.assetIds),
                     last_asset_ids = "[]",
                 )

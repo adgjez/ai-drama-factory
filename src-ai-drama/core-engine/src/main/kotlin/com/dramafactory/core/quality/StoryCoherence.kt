@@ -68,6 +68,12 @@ object StoryCoherence {
     private val TIME_SHIFT = Regex("过了|随后数小时|天亮|次日|翌日|第二天|时间推移|多年后|不知不觉|一分一秒|到晚上|入夜|天色|夕阳|时间.*过去|许久|良久|过了一会儿")
     private val WEATHER_SHIFT = Regex("雨停|放晴|转晴|转阴|下起|天色|风起|乌云")
 
+    /** 越轴依据：动作/承接里明确写了反打、过肩、越轴、绕到另一侧等，就不算错误越轴。 */
+    private val CROSS_AXIS = Regex("越轴|反打|过肩|换位|绕到|另一侧|转到另一边|走到对面|坐到对面")
+
+    /** 开场钩子要素：冲突、悬念、反转、强动作、疑问。 */
+    private val HOOK_WORDS = Regex("突然|却|竟|居然|没想到|竟然|冲突|争吵|质问|威胁|追|逃|摔|砸|抢|夺|？！|\\?!|！|？")
+
     private fun envStateOf(text: String): EnvState {
         val s = text.trim()
         return EnvState(
@@ -111,6 +117,11 @@ object StoryCoherence {
     //   rhythm_flat          连续 4 镜以上同时长 → 成片匀速像 PPT
     //   establishing_missing 场次切换后的首镜不是全景/中景 → 空间没交代
     //   dialogue_pace        台词/旁白朗读时长超过镜头时长 → 成片会被加速或截断
+    //   axis_jump            相邻镜人物站位左右互换且无越轴依据 → 观众空间感断裂
+    //   eyeline_mismatch     正反打双方视线同向 → 看起来像在看同一个方向
+    //   scene_single_shot    一场只有一镜 → 场次没有展开，像硬切素材
+    //   hook_weak            开场镜没有冲突/悬念/台词/强动作 → 前 3 秒抓不住人
+    //   ending_weak          收尾镜偏短且没有情绪落点 → 结尾泄气
     // 这些码不在 AiStoryboardDirector 的修复清单里，分镜页按软提示显示，不阻断渲染。
     // ---------------------------------------------------------------------
     private fun designIssues(shots: List<AiStoryboardDirector.Shot>): List<Issue> {
@@ -161,6 +172,50 @@ object StoryCoherence {
             if (size == null || size == "特写" || size == "大特写" || size == "近景")
                 issues += Issue("establishing_missing", shots[i].shotNo, "场次切换后首镜缺少全景/中景建立镜头")
         }
+
+        // 场次结构：一场只有一镜说明这场没有展开（整集只有一镜的极端情况不提示）。
+        if (shots.size > 1) {
+            var sceneStart = 0
+            for (i in 1..shots.size) {
+                val sceneEnded = i == shots.size ||
+                    (shots[i].sceneNo > 0 && shots[sceneStart].sceneNo > 0 && shots[i].sceneNo != shots[sceneStart].sceneNo)
+                if (sceneEnded) {
+                    if (i - sceneStart <= 1) {
+                        val label = if (shots[sceneStart].sceneNo > 0) "第" + shots[sceneStart].sceneNo + "场" else "本场"
+                        issues += Issue("scene_single_shot", shots[sceneStart].shotNo, label + "只有1镜，建议补建立镜/反应镜")
+                    }
+                    sceneStart = i
+                }
+            }
+        }
+
+        // 轴线与视线：相邻镜左右站位互换必须有越轴/反打依据；正反打双方视线同向属于剪辑错误。
+        for (i in 1 until shots.size) {
+            val before = shots[i - 1]
+            val after = shots[i]
+            if (before.sceneNo > 0 && after.sceneNo > 0 && before.sceneNo != after.sceneNo) continue
+            val sideA = before.screenSide
+            val sideB = after.screenSide
+            if (sideA != null && sideB != null && ((sideA == "左" && sideB == "右") || (sideA == "右" && sideB == "左"))) {
+                val evidence = listOfNotNull(before.action, before.carryOver, after.action, after.carryOver).joinToString(" ")
+                if (!CROSS_AXIS.containsMatchIn(evidence))
+                    issues += Issue("axis_jump", after.shotNo, "相邻镜人物站位从" + sideA + "侧跳到" + sideB + "侧，缺少越轴/反打依据")
+            }
+            val eyeA = before.eyeline
+            val eyeB = after.eyeline
+            if (!before.dialogue.isNullOrBlank() && !after.dialogue.isNullOrBlank() &&
+                eyeA != null && eyeB != null && eyeA == eyeB && eyeA != "对方")
+                issues += Issue("eyeline_mismatch", after.shotNo, "正反打双方视线同为「" + eyeA + "」，会像在看同一方向")
+        }
+
+        // 开场/收尾：钩子与落点。
+        val first = shots.first()
+        if (first.dialogue.isNullOrBlank() && !ShotDesigner.hasActionWords(first.action) &&
+            !HOOK_WORDS.containsMatchIn(first.action + " " + (first.narration ?: "")))
+            issues += Issue("hook_weak", first.shotNo, "开场镜缺少冲突/悬念/台词，前3秒可能抓不住人")
+        val last = shots.last()
+        if (last.durationSeconds < 6.0 && last.dialogue.isNullOrBlank() && !ShotDesigner.hasEmotionWords(last.action))
+            issues += Issue("ending_weak", last.shotNo, "收尾镜偏短且没有情绪落点，建议留一个停顿/反应镜")
         return issues
     }
 

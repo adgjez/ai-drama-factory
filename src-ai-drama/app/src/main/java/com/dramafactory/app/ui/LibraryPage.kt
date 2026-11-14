@@ -41,6 +41,14 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.ui.unit.dp
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.sp
 
 /**
  * 成片库页（S7）：已完成集数列表 + 导出/分享（Android ACTION_SEND分享mp4）。
@@ -53,10 +61,60 @@ fun LibraryPage() {
     var composingEp by remember { mutableStateOf<String?>(null) }
     // v1.7.2：成片直接预览——点预览后弹出本地播放器播放已合成成片
     var previewUri by remember { mutableStateOf<Uri?>(null) }
+    // ★第三批：预览时锁定预览的集号（字幕时间轴按该集 shots 构建）
+    var previewEp by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+    // ★第三批：BGM 选曲——页面级 launcher，bgmTargetEp 记录本次要设置 BGM 的集
+    var bgmTargetEp by remember { mutableStateOf<String?>(null) }
+    // epId -> 当前 BGM 文件名（null=未选择）；BGM 是项目级配置，同项目各集同步回填
+    val bgmNames = remember { mutableStateMapOf<String, String?>() }
+    // episodes 必须先声明：bgmPicker 回调里要按项目刷新各集 BGM 回显
+    val episodes = remember { mutableStateOf<List<Triple<String, Int, Int>>>(emptyList()) }
+    val bgmPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        val epId = bgmTargetEp
+        bgmTargetEp = null
+        if (uri == null || epId == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            // content:// 只有临时读权限：立即拷进 filesDir/bgm/<epId>.<ext>（同名覆盖，可长期合成用）
+            val local: java.io.File? = runCatching {
+                withContext(Dispatchers.IO) {
+                    val mime = runCatching { context.contentResolver.getType(uri) }.getOrNull()
+                    val ext = when {
+                        mime?.contains("mpeg", ignoreCase = true) == true -> "mp3"
+                        mime?.contains("mp4", ignoreCase = true) == true -> "m4a"
+                        mime?.contains("aac", ignoreCase = true) == true -> "m4a"
+                        mime?.contains("ogg", ignoreCase = true) == true -> "ogg"
+                        mime?.contains("wav", ignoreCase = true) == true -> "wav"
+                        mime?.contains("flac", ignoreCase = true) == true -> "flac"
+                        else -> "mp3"
+                    }
+                    val dir = java.io.File(context.filesDir, "bgm").apply { mkdirs() }
+                    val target = java.io.File(dir, "$epId.$ext")
+                    val ok = context.contentResolver.openInputStream(uri)?.use { input ->
+                        target.outputStream().use { output -> input.copyTo(output) }
+                        target.length() > 0L   // 空文件视为失败（选到被移除/不可读的媒体）
+                    } ?: false
+                    if (!ok) throw java.io.IOException("所选音频无法读取（可能已损坏或被移除）")
+                    target
+                }
+            }.getOrElse { e ->
+                shareMsg = "BGM 设置失败：" + (e.message ?: "读取音频失败")
+                null
+            }
+            if (local == null) return@launch
+            val projectId = epId.substringBefore("_ep")
+            runCatching {
+                com.dramafactory.app.AppGraph.dao.setProjectBgm(projectId, local.absolutePath, 0.22)
+            }.onSuccess {
+                // 同项目各集共用一条 BGM，回显一起刷新
+                episodes.value.filter { it.first.substringBefore("_ep") == projectId }
+                    .forEach { bgmNames[it.first] = local.name }
+                shareMsg = "BGM 已设置：${local.name}（重新合成后生效）"
+            }.onFailure { e -> shareMsg = "BGM 落库失败：" + (e.message ?: "数据库写入失败") }
+        }
+    }
 
     // MVP：从Room读全部episode及其完成度（简单同步读取在VM更佳，此处直接组合DAO）
-    val episodes = remember { mutableStateOf<List<Triple<String, Int, Int>>>(emptyList()) }
     androidx.compose.runtime.LaunchedEffect(Unit) {
         episodes.value = runCatching {
             com.dramafactory.app.AppGraph.dao.allEpisodeIds().map { epId ->
@@ -64,6 +122,13 @@ fun LibraryPage() {
                 Triple(epId, tasks.count { it.state == "COMPLETED" }, tasks.size)
             }
         }.getOrDefault(emptyList())
+        // ★第三批：回填每集当前 BGM 文件名（项目级配置，来自 projects.bgm_path）
+        bgmNames.clear()
+        episodes.value.forEach { (epId, _, _) ->
+            bgmNames[epId] = runCatching {
+                com.dramafactory.app.AppGraph.bgmForEpisode(epId).first?.name
+            }.getOrNull()
+        }
     }
 
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -99,6 +164,7 @@ fun LibraryPage() {
                                     // ★第二批 P0-D2：统一从 filesDir/movies 找片（兼容旧 cacheDir 位置）
                                     val f = com.dramafactory.app.FilmPaths.resolveExisting(context, epId)
                                     if (f != null) {
+                                        previewEp = epId
                                         previewUri = Uri.fromFile(f)
                                     } else shareMsg = "成片尚未合成，请先点「合成」"
                                 }, modifier = Modifier.weight(1f)) { Text("预览") }
@@ -140,6 +206,36 @@ fun LibraryPage() {
                                     }
                                 }, enabled = doneAll, modifier = Modifier.weight(1f)) { Text("分享") }
                             }
+                            // ★第三批：BGM 选曲（项目级：同项目各集共用一条 BGM，合成时混音）
+                            Row(verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text("BGM：${bgmNames[epId] ?: "未选择"}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.outline,
+                                    maxLines = 1,
+                                    modifier = Modifier.weight(1f))
+                                OutlinedButton(onClick = {
+                                    bgmTargetEp = epId
+                                    bgmPicker.launch(arrayOf("audio/*"))
+                                }) { Text("选择 BGM") }
+                                if (bgmNames[epId] != null) {
+                                    OutlinedButton(onClick = {
+                                        val projectId = epId.substringBefore("_ep")
+                                        scope.launch {
+                                            runCatching {
+                                                com.dramafactory.app.AppGraph.dao.setProjectBgm(projectId, null, 0.22)
+                                            }.onSuccess {
+                                                episodes.value
+                                                    .filter { it.first.substringBefore("_ep") == projectId }
+                                                    .forEach { bgmNames[it.first] = null }
+                                                shareMsg = "已清除 BGM（重新合成后生效）"
+                                            }.onFailure { e ->
+                                                shareMsg = "清除 BGM 失败：" + (e.message ?: "数据库写入失败")
+                                            }
+                                        }
+                                    }) { Text("清除") }
+                                }
+                            }
                         }
                     }
                 }
@@ -155,21 +251,67 @@ fun LibraryPage() {
 
     // v1.7.2：成片库直接预览——本地 VideoView 弹窗播放已合成成片
     previewUri?.let { uri ->
+        // ★第三批：预览字幕叠加——底部居中的半透明字幕层（数据来自该集 shots 的台词/旁白）
+        var subtitleLine by remember(uri) { mutableStateOf<String?>(null) }
+        // VideoView 实例用普通数组槽位持有：AndroidView factory 里不写 Compose state，避免额外重组
+        val vvHolder = remember(uri) { arrayOfNulls<VideoView>(1) }
+        LaunchedEffect(uri, previewEp) {
+            val epId = previewEp ?: return@LaunchedEffect
+            // 时间轴：按 shot_no 排序后简单累计 duration_seconds（转场重叠忽略，与成片字幕轨同口径）
+            val timeline = runCatching {
+                var cursorMs = 0L
+                com.dramafactory.app.AppGraph.dao.shotsOf(epId).sortedBy { it.shot_no }.mapNotNull { shot ->
+                    val durMs = ((shot.duration_seconds.takeIf { it > 0.0 } ?: 5.0) * 1000).toLong()
+                    val startMs = cursorMs
+                    cursorMs += durMs
+                    val line = shot.dialogue?.takeIf { it.isNotBlank() }
+                        ?: shot.narration?.takeIf { it.isNotBlank() }
+                    line?.let { text -> Triple(startMs, cursorMs, text) }
+                }
+            }.getOrDefault(emptyList())
+            if (timeline.isEmpty()) {
+                subtitleLine = null
+                return@LaunchedEffect
+            }
+            // 每 250ms 读播放位置映射到当前镜头字幕；弹窗关闭（离开组合）时 effect 取消，轮询即停止
+            while (true) {
+                val pos = vvHolder[0]?.currentPosition?.toLong() ?: 0L
+                subtitleLine = timeline.firstOrNull { pos >= it.first && pos < it.second }?.third
+                kotlinx.coroutines.delay(250L)
+            }
+        }
         androidx.compose.material3.AlertDialog(
-            onDismissRequest = { previewUri = null },
-            confirmButton = { Button(onClick = { previewUri = null }) { Text("关闭") } },
+            onDismissRequest = { previewUri = null; previewEp = null },
+            confirmButton = { Button(onClick = { previewUri = null; previewEp = null }) { Text("关闭") } },
             text = {
-                AndroidView(
-                    modifier = Modifier.fillMaxWidth().height(420.dp),
-                    factory = { ctx ->
-                        VideoView(ctx).apply {
-                            setVideoURI(uri)
-                            setOnPreparedListener { it.isLooping = false; it.start() }
-                            setOnErrorListener { _, _, _ -> true }
-                        }
-                    },
-                    update = { vv -> vv.setVideoURI(uri); vv.start() }
-                )
+                Box(modifier = Modifier.fillMaxWidth().height(420.dp)) {
+                    AndroidView(
+                        modifier = Modifier.fillMaxSize(),
+                        factory = { ctx ->
+                            VideoView(ctx).apply {
+                                vvHolder[0] = this
+                                setVideoURI(uri)
+                                setOnPreparedListener { it.isLooping = false; it.start() }
+                                setOnErrorListener { _, _, _ -> true }
+                            }
+                        },
+                        update = { vv -> vv.setVideoURI(uri); vv.start() }
+                    )
+                    subtitleLine?.let { line ->
+                        Text(
+                            text = line,
+                            color = Color.White,
+                            fontSize = 15.sp,
+                            textAlign = TextAlign.Center,
+                            maxLines = 3,
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(bottom = 16.dp, start = 12.dp, end = 12.dp)
+                                .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(6.dp))
+                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                        )
+                    }
+                }
             }
         )
     }
@@ -227,12 +369,20 @@ fun LibraryPage() {
                         }
                         cursorMs += durMs
                     }
+                    // ★第三批：手动合成也混入项目 BGM（成片页选曲；文件被删/未选则自动跳过）
+                    val bgmPair: Pair<java.io.File?, Double>? = kotlin.runCatching {
+                        com.dramafactory.app.AppGraph.bgmForEpisode(targetEpId)
+                    }.getOrNull()
+                    val bgmFile = bgmPair?.first
+                    val bgmVolume = bgmPair?.second ?: 0.22
                     // ★第二批 P0-D6：ffmpeg 内部 CountDownLatch 阻塞，必须在 IO 线程合成，否则主线程 ANR
                     val res = withContext(Dispatchers.IO) {
                         composer.assemble(
                             clips, out,
                             com.dramafactory.core.assemble.MovieAssembler.AssembleOptions(
                                 subtitles = cues,
+                                bgm = bgmFile,
+                                bgmVolume = bgmVolume,
                                 loudnessNormalize = true,
                                 transition = com.dramafactory.core.assemble.MovieAssembler.Transition.FADE,
                                 transitionSeconds = transitionSeconds,

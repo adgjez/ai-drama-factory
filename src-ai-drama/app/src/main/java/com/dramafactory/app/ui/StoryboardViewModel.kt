@@ -8,6 +8,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
@@ -33,6 +35,9 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
 
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> get() = _state
+
+    /** 第三批：分镜写入串行锁——updateShot 读整行再 upsert，避免与场次局部 UPDATE 并发互相覆盖。 */
+    private val writeLock = Mutex()
 
     init { refresh() }
 
@@ -124,6 +129,8 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
                         beat_ref = s.beatRef, carry_over = s.carryOver, scene_context = s.sceneContext,
                         first_asset_ids = AssetCatalog.encodeRefIds(s.assetIds), last_asset_ids = "[]",
                         visual_prompt = s.visualPrompt, duration_seconds = s.durationSeconds,
+                        scene_no = s.sceneNo, scene_title = s.sceneTitle,
+                        screen_side = s.screenSide, eyeline = s.eyeline,
                         sb_check = sbCheckFromResult(result.gateErrors[s.shotNo])
                     )
                 }
@@ -222,20 +229,49 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
     ) = viewModelScope.launch {
         val failure = runCatching {
             withContext(Dispatchers.IO) {
-                val row = AppGraph.dao.shotKeyframes(shotId)
-                    ?: error("找不到分镜：$shotId")
-                AppGraph.dao.upsertShot(row.copy(
-                    action = action.trim(), dialogue = dialogue?.trim()?.ifBlank { null },
-                    narration = narration?.trim()?.ifBlank { null }, visual_prompt = visualPrompt?.trim()?.ifBlank { null },
-                    scene_context = sceneContext?.trim()?.ifBlank { null },
-                    carry_over = carryOver?.trim()?.ifBlank { null },
-                    duration_seconds = durationSeconds.coerceIn(1.0, 60.0)))
-                val back = AppGraph.dao.shotKeyframes(shotId)
-                check(back?.action == action.trim()) { "分镜编辑后读回不一致：$shotId" }
+                writeLock.withLock {
+                    val row = AppGraph.dao.shotKeyframes(shotId)
+                        ?: error("找不到分镜：$shotId")
+                    AppGraph.dao.upsertShot(row.copy(
+                        action = action.trim(), dialogue = dialogue?.trim()?.ifBlank { null },
+                        narration = narration?.trim()?.ifBlank { null }, visual_prompt = visualPrompt?.trim()?.ifBlank { null },
+                        scene_context = sceneContext?.trim()?.ifBlank { null },
+                        carry_over = carryOver?.trim()?.ifBlank { null },
+                        duration_seconds = durationSeconds.coerceIn(1.0, 60.0)))
+                    val back = AppGraph.dao.shotKeyframes(shotId)
+                    check(back?.action == action.trim()) { "分镜编辑后读回不一致：$shotId" }
+                }
             }
         }.exceptionOrNull()
         refresh()
         _state.value = _state.value.copy(message = failure?.let { "保存分镜失败：${it.message}" } ?: "已保存镜头修改✓")
+    }
+
+    /**
+     * 第三批：只更新场次/站位/视线四列（DAO 局部 UPDATE，不做整行 upsert）。
+     * 与 updateShot 共用 writeLock，防止「读整行→回写」把刚保存的场次列覆盖回旧值。
+     */
+    fun updateShotSceneInfo(
+        shotId: String, sceneNo: Int, sceneTitle: String?,
+        screenSide: String?, eyeline: String?,
+    ) = viewModelScope.launch {
+        val failure = runCatching {
+            withContext(Dispatchers.IO) {
+                writeLock.withLock {
+                    AppGraph.dao.shotKeyframes(shotId) ?: error("找不到分镜：$shotId")
+                    val no = sceneNo.coerceAtLeast(0)
+                    AppGraph.dao.updateShotSceneInfo(shotId, no,
+                        sceneTitle?.trim()?.ifBlank { null },
+                        screenSide?.trim()?.ifBlank { null },
+                        eyeline?.trim()?.ifBlank { null })
+                    val back = AppGraph.dao.shotKeyframes(shotId)
+                    check(back?.scene_no == no) { "场次保存后读回不一致：$shotId" }
+                }
+            }
+        }.exceptionOrNull()
+        refresh()
+        _state.value = _state.value.copy(message =
+            failure?.let { "保存场次信息失败：${it.message}" } ?: "已保存场次/站位/视线✓")
     }
 
     /** 删除单镜 */

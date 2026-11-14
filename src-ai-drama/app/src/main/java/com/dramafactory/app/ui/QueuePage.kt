@@ -333,13 +333,18 @@ private fun QueueActionButton(
     }
 }
 
-/** 只提示、不阻断渲染的软校验码：场景/光线/节奏差异属于画面设计问题，不该挡住整集渲染。 */
+/** 只提示、不阻断渲染的软校验码：场景/光线/节奏/站位视线/场次结构差异属于画面设计问题，不该挡住整集渲染。 */
 internal val SOFT_SB_CHECK_CODES = setOf(
     "scene_context_conflict",
     "rhythm_monotone",
     "rhythm_flat",
     "establishing_missing",
     "dialogue_pace",
+    "axis_jump",
+    "eyeline_mismatch",
+    "scene_single_shot",
+    "hook_weak",
+    "ending_weak",
 )
 
 /** gateErrors → sb_check 持久化值：硬错误写 error:（渲染闸拦截），软提示写 warn:（界面黄色提示）。 */
@@ -372,6 +377,11 @@ internal fun sbCheckLabel(code: String) = when (code) {
     "rhythm_flat" -> "连续多镜同一时长（建议做节奏变化，仅提示）"
     "establishing_missing" -> "场次切换后缺少建立镜头（建议先给全景/中景，仅提示）"
     "dialogue_pace" -> "台词/旁白朗读时长超过镜头（建议加长或拆镜，仅提示）"
+    "axis_jump" -> "站位越轴待确认"
+    "eyeline_mismatch" -> "视线同向待确认"
+    "scene_single_shot" -> "单镜成场"
+    "hook_weak" -> "开场钩子弱"
+    "ending_weak" -> "结尾泄气"
     "scene_context_conflict" -> "画面描述与上一镜场景不连续（仅提示，不阻断渲染）"
     "scene_context_missing" -> "缺少场景上下文：请补充时间、空间、天气"
     "beat_ref_missing" -> "缺少剧本节拍来源"

@@ -92,6 +92,8 @@ interface MovieAssembler {
         val subtitles: List<SubtitleCue> = emptyList(),
         /** 背景音乐文件；非空时按低音量混入成片音轨 */
         val bgm: File? = null,
+        /** BGM 混音音量（0~1）；默认 0.22 保证人声清楚 */
+        val bgmVolume: Double = 0.22,
         /** 是否做响度归一化（loudnorm -16 LUFS）；人声成片建议开启 */
         val loudnessNormalize: Boolean = false,
         /** 镜头间转场；NONE 保持旧行为 */
@@ -579,7 +581,7 @@ class MovieAssemblerImpl(
         var result: MovieAssembler.AssembleResult.Success = base
         if (wantAudio) {
             emit(MovieAssembler.AssembleStage.NORMALIZE, total, total, "post audio mix", t0)
-            val mixed = mixAudio(base.output, output, bgm, options.loudnessNormalize, warnings)
+            val mixed = mixAudio(base.output, output, bgm, options.loudnessNormalize, warnings, options.bgmVolume)
             result = if (mixed != null) {
                 base.copy(
                     output = mixed,
@@ -636,8 +638,10 @@ class MovieAssemblerImpl(
         bgm: File?,
         loudness: Boolean,
         warnings: MutableList<String>,
+        bgmVolume: Double = 0.22,
     ): File? {
         output.parentFile?.mkdirs()
+        val vol = String.format(java.util.Locale.US, "%.2f", bgmVolume.coerceIn(0.0, 1.0))
         val tmp = File(output.parentFile ?: File("."), output.nameWithoutExtension + "_mix.mp4")
         runCatching { tmp.delete() }
         val aacOut = listOf("-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2")
@@ -648,7 +652,7 @@ class MovieAssemblerImpl(
             } else {
                 "[0:a]aresample=48000[a0]"
             }
-            val bg = "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=0.22[bgm]"
+            val bg = "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=$vol[bgm]"
             val mix = if (loudness) {
                 "[a0][bgm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[mix];" +
                     "[mix]alimiter=limit=0.98[aout]"
@@ -663,10 +667,10 @@ class MovieAssemblerImpl(
             // 成片无音轨时，退化为「原视频 + BGM」
             val bgmOnly = if (loudness) {
                 "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo," +
-                    "volume=0.22,loudnorm=I=-16:TP=-1.5:LRA=11,alimiter=limit=0.98[aout]"
+                    "volume=$vol,loudnorm=I=-16:TP=-1.5:LRA=11,alimiter=limit=0.98[aout]"
             } else {
                 "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo," +
-                    "volume=0.22[aout]"
+                    "volume=$vol[aout]"
             }
             attempts += listOf(
                 "-y", "-i", baseFile.absolutePath, "-stream_loop", "-1", "-i", bgm.absolutePath,

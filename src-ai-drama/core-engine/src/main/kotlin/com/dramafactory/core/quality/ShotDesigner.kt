@@ -70,6 +70,13 @@ object ShotDesigner {
         return cjk / CHARS_PER_SECOND + words * SECONDS_PER_WORD + SPEECH_LEAD_SECONDS
     }
 
+    /** 供 StoryCoherence 复用的分类判定（保持单一事实来源，避免两处词表漂移）。 */
+    fun hasActionWords(text: String?): Boolean = text != null && ACTION_WORDS.containsMatchIn(text)
+
+    fun hasEmotionWords(text: String?): Boolean = text != null && EMOTION_WORDS.containsMatchIn(text)
+
+    fun hasTransitionWords(text: String?): Boolean = text != null && TRANSITION_WORDS.containsMatchIn(text)
+
     /** 从视觉指令/动作里解析景别；解析不到返回 null。 */
     fun shotSizeOf(shot: AiStoryboardDirector.Shot): String? =
         shotSizeOf(listOfNotNull(shot.visualPrompt, shot.action).joinToString(" "))
@@ -80,18 +87,30 @@ object ShotDesigner {
         return SIZE_RULES.firstOrNull { it.second.containsMatchIn(s) }?.first
     }
 
-    /**
-     * 按镜头功能重排时长。输出保持 shotNo 升序；空列表原样返回。
-     * 只在 AI 生成路径调用，人工编辑过的时长不会被覆盖。
-     */
-    fun refine(shots: List<AiStoryboardDirector.Shot>): List<AiStoryboardDirector.Shot> {
-        if (shots.isEmpty()) return shots
-        val ordered = shots.sortedBy { it.shotNo }
-        var previousScene: String? = null
-        val functions = ordered.mapIndexed { index, shot ->
-            val scene = shot.sceneContext?.trim().orEmpty()
-            val sceneChanged = index > 0 && scene.isNotBlank() && scene != previousScene
-            if (scene.isNotBlank()) previousScene = scene
+    /** 节奏曲线上的一个点：分镜页按它画「时长柱 + 强度折线 + 场次分段」。 */
+    data class RhythmPoint(
+        val shotNo: Int,
+        val sceneNo: Int,
+        val seconds: Double,
+        /** 0~10 的戏剧强度，用于画节奏起伏（不是精确预测，只做相对比较）。 */
+        val intensity: Double,
+        val size: String?
+    )
+
+    /** 逐镜功能分类：先按 shotNo 排序，再由场次变化/动作/情绪/台词判定。 */
+    private fun classify(ordered: List<AiStoryboardDirector.Shot>): List<ShotFunction> {
+        var previousSceneNo = 0
+        var previousSceneText: String? = null
+        return ordered.mapIndexed { index, shot ->
+            val sceneNo = shot.sceneNo
+            val sceneText = shot.sceneContext?.trim().orEmpty()
+            val sceneChanged = if (sceneNo > 0) {
+                index > 0 && sceneNo != previousSceneNo
+            } else {
+                index > 0 && sceneText.isNotBlank() && sceneText != previousSceneText
+            }
+            if (sceneNo > 0) previousSceneNo = sceneNo
+            if (sceneText.isNotBlank()) previousSceneText = sceneText
             when {
                 index == 0 -> ShotFunction.HOOK
                 sceneChanged -> ShotFunction.ESTABLISHING
@@ -102,6 +121,54 @@ object ShotDesigner {
                 else -> ShotFunction.DEFAULT
             }
         }
+    }
+
+    /** 功能基线强度：钩子/动作最高，建立/转场最低。 */
+    private fun baseIntensity(function: ShotFunction): Double = when (function) {
+        ShotFunction.HOOK -> 8.5
+        ShotFunction.ACTION -> 7.5
+        ShotFunction.EMOTION -> 6.0
+        ShotFunction.DIALOGUE -> 5.0
+        ShotFunction.TRANSITION -> 3.5
+        ShotFunction.ESTABLISHING -> 3.0
+        ShotFunction.DEFAULT -> 4.5
+    }
+
+    /**
+     * 节奏曲线：输出与镜头一一对应的点（按 shotNo 升序）。
+     * 强度 = 功能基线 + 集内位置渐进（越接近结尾越紧）+ 台词/动作密度微调，最终裁到 0~10。
+     */
+    fun rhythmCurve(shots: List<AiStoryboardDirector.Shot>): List<RhythmPoint> {
+        if (shots.isEmpty()) return emptyList()
+        val ordered = shots.sortedBy { it.shotNo }
+        val functions = classify(ordered)
+        val total = ordered.size
+        return ordered.mapIndexed { index, shot ->
+            val arc = if (total <= 1) 0.0 else (index.toDouble() / (total - 1)) * 1.5
+            val actionDensity = if (ACTION_WORDS.findAll(shot.action).count() >= 2) 0.6 else 0.0
+            val spoken = spokenSeconds(shot.dialogue, shot.narration)
+            val speechDensity = if (spoken > shot.durationSeconds) 0.4 else 0.0
+            val intensity = (baseIntensity(functions[index]) + arc + actionDensity + speechDensity)
+                .coerceIn(0.0, 10.0)
+            RhythmPoint(
+                shotNo = shot.shotNo,
+                sceneNo = shot.sceneNo,
+                seconds = shot.durationSeconds,
+                intensity = intensity,
+                size = shotSizeOf(shot)
+            )
+        }
+    }
+
+    /**
+     * 按镜头功能重排时长。输出保持 shotNo 升序；空列表原样返回。
+     * 只在 AI 生成路径调用，人工编辑过的时长不会被覆盖。
+     */
+    fun refine(shots: List<AiStoryboardDirector.Shot>): List<AiStoryboardDirector.Shot> {
+        if (shots.isEmpty()) return shots
+        val ordered = shots.sortedBy { it.shotNo }
+        // 用 stabilizeShots 归一后的 sceneNo 判换场；sceneNo 缺失时才退回 scene_context 文本比较。
+        val functions = classify(ordered)
         val durations = avoidMonotony(ordered.mapIndexed { index, shot ->
             val base = durationFor(functions[index])
             // 台词/旁白长的镜头不能按固定秒数切：至少给足朗读时长，否则成片会加速或截断台词。
