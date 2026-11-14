@@ -151,19 +151,20 @@ object RenderRuntime {
      * 这里在提交前用「场景底图 + 角色参考图」做一次 img2img，把电影开场静帧写回 first_image_uri
      * 以便复用与审计；任何一步失败返回 null，队列自动回落到原始 first 逻辑（绝不阻断渲染）。
      */
-    private suspend fun synthesizeOpeningFrame(shotId: String): String? = try {
+    private suspend fun synthesizeOpeningFrame(shotId: String): String? {
+        return try {
         val dao = AppGraph.dao
         val epId = shotId.substringBeforeLast("_shot").takeIf { it.contains("_ep") } ?: shotId
         val shot = dao.shotKeyframes(shotId) ?: dao.shotsOf(epId).firstOrNull { it.shot_id == shotId }
         val existing = shot?.first_image_uri?.takeIf { it.isNotBlank() }
-        if (existing != null) return@runCatching existing
+        if (existing != null) return existing
         val projectId = epId.substringBeforeLast("_ep").ifBlank { epId }
         val all = dao.assetsAllOf(projectId).filter { it.audit_state == "approved" }
         val refIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
         val refUris = AssetCatalog.resolveRefUris(all, refIds)
             .ifEmpty { AssetCatalog.fallbackUris(all) }
             .filter { it.isNotBlank() }.distinct().take(4)
-        if (refUris.isEmpty()) return@runCatching null
+        if (refUris.isEmpty()) return null
         val sceneBase = all.firstOrNull {
             it.kind == "scene" && (!it.remote_url.isNullOrBlank() || !it.image_uri.isNullOrBlank())
         }?.let { it.remote_url?.takeIf { s -> s.isNotBlank() } ?: it.image_uri }
@@ -203,10 +204,11 @@ object RenderRuntime {
             // 单镜写库失败不阻断整集，返回 URL 供本次渲染兜底使用
         }
         publicUrl
-    } catch (e: kotlinx.coroutines.CancellationException) {
-        throw e
-    } catch (_: Throwable) {
-        null
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     /**
@@ -215,7 +217,8 @@ object RenderRuntime {
      * 镜 N 的尾帧 = 镜 N+1 的首帧，保证图生视频首尾连续。
      * 任何一镜失败只跳过该镜，绝不阻断流水线；返回成功合成的镜数。
      */
-    suspend fun synthesizeEpisodeKeyframes(episodeId: String, maxShots: Int = 24): Int = try {
+    suspend fun synthesizeEpisodeKeyframes(episodeId: String, maxShots: Int = 24): Int {
+        return try {
         // 无可用图像 Key 时直接跳过：否则会逐镜走到 Provider 才失败，白跑 24 次（A-G4）
         if (!AppGraph.agnesKeyReady()) return 0
         val dao = AppGraph.dao
@@ -251,10 +254,11 @@ object RenderRuntime {
             }
         }
         written
-    } catch (e: kotlinx.coroutines.CancellationException) {
-        throw e
-    } catch (_: Throwable) {
-        0
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            0
+        }
     }
 
     /** UI/Service便捷入口 */
