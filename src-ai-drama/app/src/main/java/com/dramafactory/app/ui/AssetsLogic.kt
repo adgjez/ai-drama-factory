@@ -13,6 +13,13 @@ import kotlinx.coroutines.flow.update
  */
 class AssetsLogic {
 
+    /**
+     * ★去时代锁：参考图套装使用的时代预设（默认中性=不锁朝代）。
+     * App 层在 AssetsViewModel 构造时注入 { eraPreset }，跟随剧本检测结果。
+     */
+    var eraPresetProvider: () -> com.dramafactory.core.quality.StylePreset =
+        { com.dramafactory.core.quality.StylePreset.NEUTRAL_DEFAULT }
+
     enum class Kind(val label: String) { CHARACTER("角色"), SCENE("场景"), PROP("道具"), LOCAL("本地") }
 
     /** 资产卡片数据 */
@@ -367,7 +374,7 @@ class AssetsLogic {
     fun buildReferenceSheet(characterId: String, idGen: () -> String): Int {
         val parent = _assets.value.firstOrNull { it.assetId == characterId } ?: return 0
         if (parent.kind != Kind.CHARACTER) return 0
-        val preset = com.dramafactory.core.quality.StylePreset.HAN_DEFAULT
+        val preset = eraPresetProvider()
         var added = 0
         for (shot in preset.referenceShots) {
             val subId = idGen()
@@ -392,7 +399,7 @@ class AssetsLogic {
         characterDesc: String,
         shot: com.dramafactory.core.quality.StylePreset.ReferenceShotSpec,
     ): String = com.dramafactory.core.quality.AssetPromptBuilder
-        .finalReferencePrompt(com.dramafactory.core.quality.StylePreset.HAN_DEFAULT, characterDesc, shot)
+        .finalReferencePrompt(eraPresetProvider(), characterDesc, shot)
 
     /** 取某角色母卡关联的参考图子卡。 */
     fun referenceChildrenOf(characterId: String): List<AssetCard> =

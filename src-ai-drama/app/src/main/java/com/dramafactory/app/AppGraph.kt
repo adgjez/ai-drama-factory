@@ -277,7 +277,7 @@ object AppGraph {
      * 不再写死西汉）。generateImage 生成链路一律用 presetFor(currentEraKey) 组装约束。
      * 单活跃 run 假设下用 @Volatile 保证可见性；并发多 run 由上层串行保证。
      */
-    @Volatile internal var currentEraKey: String = "han"
+    @Volatile internal var currentEraKey: String = "neutral"
 
     /** 当前时代红线预设（AI 助手/资产生成共用；由 createEpisode 按剧本推断更新） */
     fun currentPreset(): com.dramafactory.core.quality.StylePreset =

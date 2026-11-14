@@ -437,7 +437,12 @@ class AgnesProvider(
         val h = closestValidDimension(req.height)
 
         // 决议Q9：中文配音指令注入（中文台词主导开头+显式指令追加）
-        val prompt = ChineseAudioInjector.inject(req.prompt)
+        val basePrompt = ChineseAudioInjector.inject(req.prompt)
+        // ★质量修复 D：2.5 协议没有 negative_prompt 字段，旧代码把默认 11 个锁脸负向词整体丢弃，
+        // 人物漂移/手崩/水印无任何抑制。这里在 2.5 分支把负向补偿折进正向 prompt。
+        val prompt = if (isAgnesVideo25(effectiveVideoModel) && !req.negativePrompt.isNullOrBlank())
+            "$basePrompt 画面要求：人物面部与身份保持稳定，双手结构正确、手指数量正常，画面清晰，无水印、无文字。"
+        else basePrompt
 
         // v1.9.27：2.5/2.5-flash 官方独立协议（wiki agnes-video-25）——
         // 顶层禁止 width/height/fps/num_frames（400 forbidden field），尺寸=size档位+aspect_ratio，时长=seconds。
@@ -450,12 +455,13 @@ class AgnesProvider(
                 put("seconds", video25Seconds(nf, req.frameRate))
                 put("size", "720P")   // flash 仅支持 720P（其他值 400）；2.5 同档保守
                 put("aspect_ratio", video25AspectRatio(w, h))
-                // 模式互斥：首+尾且无资产参考→keyframe（保构图）；有资产参考→reference（锁脸优先）；无图→text
-                val extraRefs = req.inputImages.filter { it != req.firstImageUri && it != req.lastImageUri }
+                // 模式互斥：显式尾帧→keyframe（锁首尾构图，最高优先）；否则有资产参考→reference（锁脸优先）；无图→text
                 val refMedia = (listOfNotNull(req.firstImageUri ?: req.referenceImageUri) + req.inputImages).distinct()
                 val maxRefs = video25MaxImages(effectiveVideoModel)
                 when {
-                    req.lastImageUri != null && extraRefs.isEmpty() -> {
+                    // ★质量修复 D：旧逻辑要求「无额外资产参考图」才走 keyframe，只要有角色参考图
+                    // 就掉进 reference 分支，req.lastImageUri 被静默丢弃。显式尾帧必须优先。
+                    req.lastImageUri != null -> {
                         put("prompt", prompt)
                         put("mode", "keyframe")
                         put("first_frame", req.firstImageUri ?: req.lastImageUri!!)

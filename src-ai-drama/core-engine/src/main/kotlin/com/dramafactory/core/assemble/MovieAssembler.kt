@@ -187,27 +187,40 @@ class MovieAssemblerImpl(
             )
         }
 
-        // 二级归一化路径：scale+pad 到 448x832 + h264_mediacodec（端侧硬编）
+        // 二级归一化路径：scale+pad 到 720x1280 + h264_mediacodec（端侧硬编）
+        // ★质量修复 E：旧实现 concat v=1:a=0 且只 map [vout] —— 归一化兜底路径会整段丢音轨；
+        // 这里带音频 concat（v=1:a=1），失败再回退纯视频路径，绝不因音轨问题丢成片。
         val normOut = File(output.parentFile, "${output.nameWithoutExtension}_norm.mp4")
         normOut.parentFile?.mkdirs()
-        val filter = gradedFiles.indices.joinToString(";") { i ->
-            "[$i:v]scale=448:832:force_original_aspect_ratio=decrease," +
-                "pad=448:832:(ow-iw)/2:(oh-ih)/2,setsar=1[v$i]"
-        } + ";" + gradedFiles.indices.joinToString("") { "[v$it]" } +
-            "concat=n=${gradedFiles.size}:v=1:a=0[vout]"
-        val normArgs = buildList {
+        fun normFilter(withAudio: Boolean): String {
+            val video = gradedFiles.indices.joinToString(";") { i ->
+                "[$i:v]scale=720:1280:force_original_aspect_ratio=decrease," +
+                    "pad=720:1280:(ow-iw)/2:(oh-ih)/2,setsar=1[v$i]"
+            } + ";" + gradedFiles.indices.joinToString("") { "[v$it]" } +
+                "concat=n=${gradedFiles.size}:v=1:a=0[vout]"
+            if (!withAudio) return video
+            val audio = gradedFiles.indices.joinToString(";") { i ->
+                "[$i:a]aresample=async=1:first_pts=0[a$i]"
+            } + ";" + gradedFiles.indices.joinToString("") { "[a$it]" } +
+                "concat=n=${gradedFiles.size}:v=0:a=1[aout]"
+            return "$video;$audio"
+        }
+        fun normArgs(withAudio: Boolean): List<String> = buildList {
             add("-y")
             gradedFiles.forEach { addAll(listOf("-i", it.absolutePath)) }
-            addAll(listOf(
-                "-filter_complex", filter,
-                "-map", "[vout]",
-                "-c:v", "h264_mediacodec",
-                "-b:v", "2M", "-r", "24",
-                normOut.absolutePath,
-            ))
+            addAll(listOf("-filter_complex", normFilter(withAudio)))
+            if (withAudio) addAll(listOf("-map", "[vout]", "-map", "[aout]"))
+            else addAll(listOf("-map", "[vout]"))
+            addAll(listOf("-c:v", "h264_mediacodec", "-b:v", "2M", "-r", "24"))
+            if (withAudio) addAll(listOf("-c:a", "aac", "-b:a", "128k"))
+            add(normOut.absolutePath)
         }
         emit(MovieAssembler.AssembleStage.NORMALIZE, 0, total, "normalize + mediacodec", t0)
-        val (rcNorm, _) = executor.execute(normArgs)
+        var rcNorm = -1
+        for (withAudio in listOf(true, false)) {
+            val (rc, _) = executor.execute(normArgs(withAudio))
+            if (rc == 0 && normOut.exists() && normOut.length() > 0) { rcNorm = 0; break }
+        }
         if (rcNorm == 0 && normOut.exists() && normOut.length() > 0) {
             emit(MovieAssembler.AssembleStage.DONE, total, total, "normalize done", t0)
             return MovieAssembler.AssembleResult.Success(

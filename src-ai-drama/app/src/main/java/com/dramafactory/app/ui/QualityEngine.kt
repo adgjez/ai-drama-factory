@@ -85,11 +85,12 @@ class QualityEngine {
      * 把 era 红线约束折叠进生成 prompt（C 子模块：negative 折叠进 negative_prompt，
      * positive 折叠进 suffix；按剧集放行剔除禁词）。
      */
-    fun withEra(prompt: String, allowedCrossEra: List<String> = emptyList(), preset: StylePreset = StylePreset.HAN_DEFAULT): String =
+    fun withEra(prompt: String, allowedCrossEra: List<String> = emptyList(),
+                preset: StylePreset = com.dramafactory.app.AppGraph.currentPreset()): String =
         preset.withEraConstraints(prompt, allowedCrossEra)
 
     companion object {
-        /** 全局默认西汉预设单例（App 启动即用）。 */
-        val HAN_PRESET = StylePreset.HAN_DEFAULT
+        /** ★去时代锁：全局默认改为中性预设（不锁朝代，服化道以剧本为准）。 */
+        val DEFAULT_PRESET = StylePreset.NEUTRAL_DEFAULT
     }
 }

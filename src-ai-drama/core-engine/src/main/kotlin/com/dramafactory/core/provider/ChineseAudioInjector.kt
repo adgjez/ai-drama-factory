@@ -33,14 +33,31 @@ object ChineseAudioInjector {
 
     /** 组装一镜完整提交prompt：中文台词/旁白主导开头 + 显式中文指令 */
     fun buildShotPrompt(dialogue: String, narration: String, action: String): String =
-        buildShotPrompt(dialogue, narration, action, "")
+        buildShotPrompt(dialogue, narration, action, "", "")
 
     /** 将分镜场景连续性锚点放入最终视频 prompt，避免渲染阶段重新自由发挥环境。 */
-    fun buildShotPrompt(dialogue: String, narration: String, action: String, sceneContext: String): String {
+    fun buildShotPrompt(dialogue: String, narration: String, action: String, sceneContext: String): String =
+        buildShotPrompt(dialogue, narration, action, sceneContext, "")
+
+    /**
+     * ★质量修复 B：把导演的镜头语言（景别/运镜/构图/光影）拼进最终视频 prompt。
+     * 旧链路只提交 台词+旁白+≤30字action，导演 visual_prompt / StylePreset 全被丢弃，
+     * 导致「分镜写得再好，生成端只剩一句话」。
+     *
+     * @param cinematic 镜头语言描述（来自 shots.visual_prompt + StylePreset.globalPromptSuffix）
+     */
+    fun buildShotPrompt(
+        dialogue: String,
+        narration: String,
+        action: String,
+        sceneContext: String,
+        cinematic: String,
+    ): String {
         val head = listOf(dialogue.trim(), narration.trim()).filter { it.isNotEmpty() }.joinToString(" ")
         val environment = sceneContext.trim().takeIf { it.isNotEmpty() }?.let { "场景连续性约束（仅复用已明确事实，不新增天气/时间/光线）：$it。" } ?: ""
         val body = action.trim()
-        val raw = listOf(head, environment, body).filter { it.isNotEmpty() }.joinToString(if (head.isEmpty()) "" else " ")
+        val shot = cinematic.trim().takeIf { it.isNotEmpty() }?.let { "镜头与影调：$it。" } ?: ""
+        val raw = listOf(head, environment, body, shot).filter { it.isNotEmpty() }.joinToString(if (head.isEmpty()) "" else " ")
         return inject(raw)
     }
 }

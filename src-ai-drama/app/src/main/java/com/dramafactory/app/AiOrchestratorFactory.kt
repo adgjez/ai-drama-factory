@@ -41,7 +41,7 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                 com.dramafactory.core.quality.EraDetector.detect(scriptText, llmReady) { req ->
                     agnes.chat(req)
                 }
-            }.getOrElse { com.dramafactory.core.quality.EraDetector.Detection("han", "", false) }.eraKey
+            }.getOrElse { com.dramafactory.core.quality.EraDetector.Detection("neutral", "", false) }.eraKey
             val flags = DramaDatabase.Companion.AiStageFlags
             val stageFlags =
                 flags.put(flags.putBool("", flags.AI_MANAGED, true),
@@ -132,6 +132,21 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                     description = asset.prompt, assetType = asset.kind,
                     describer = describer,
                 )
+                // ★质量修复 G：审计结论必须落库（旧实现只回传不写 DB）。
+                // 否则渲染侧只看到「有 URL」，被 QC 拒绝的图照样被逐镜当参考图（audit_state 永远 pending）。
+                runCatching {
+                    dao.setAssetQuality(
+                        assetId = asset.assetId,
+                        qualityScore = outcome.qualityScore,
+                        auditState = outcome.auditState.name.lowercase(),
+                        defectsJson = outcome.defectsJson(),
+                        rejectReason = outcome.rejectReason,
+                        g1ErrorCode = outcome.g1ErrorCode,
+                        faceRatio = outcome.faceRatio,
+                        poseRole = outcome.poseRole,
+                        updatedAt = System.currentTimeMillis(),
+                    )
+                }
                 DefaultAiOrchestrator.AuditResult(
                     passed = outcome.auditState == com.dramafactory.core.model.AuditState.APPROVED,
                     score = outcome.qualityScore,
@@ -150,7 +165,19 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                 val r = com.dramafactory.core.quality.AiStoryboardDirector.generate(
                     script, chat = { req -> tp.chat(req) }, assets = catalog)
                 r.shots.map { s ->
-                    DefaultAiOrchestrator.AiShot(s.shotNo, s.action ?: "", s.dialogue, s.assetIds)
+                    // ★质量修复 B：完整映射导演字段（旧实现只传 4 个参数，visual/scene/carry/duration 全丢）
+                    DefaultAiOrchestrator.AiShot(
+                        shotNo = s.shotNo,
+                        action = s.action ?: "",
+                        dialogue = s.dialogue,
+                        assetIds = s.assetIds,
+                        narration = s.narration,
+                        visualPrompt = s.visualPrompt,
+                        sceneContext = s.sceneContext,
+                        carryOver = s.carryOver,
+                        beatRef = s.beatRef,
+                        durationSeconds = s.durationSeconds,
+                    )
                 }
             }
         },
@@ -195,6 +222,13 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                     shot_no = s.shotNo,
                     action = s.action,
                     dialogue = s.dialogue,
+                    // ★质量修复 B：导演字段落库（旧实现丢弃 visual/scene/carry/duration → 视频端只剩台词+action）
+                    narration = s.narration,
+                    scene_context = s.sceneContext,
+                    visual_prompt = s.visualPrompt,
+                    beat_ref = s.beatRef,
+                    carry_over = s.carryOver,
+                    duration_seconds = s.durationSeconds,
                     first_asset_ids = AssetCatalog.encodeRefIds(s.assetIds),
                     last_asset_ids = "[]",
                 )

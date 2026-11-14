@@ -253,7 +253,7 @@ class DefaultAiOrchestrator(
                         if (passed) break
                     }
                     if (passed) auditedOk++
-                    else emit(PipelineStage5.AUDIT, i + 1, "资产${i + 1}审计未过，标红放行", stA, ProgressEvent.Level.WARN)
+                    else emit(PipelineStage5.AUDIT, i + 1, "资产${i + 1}审计未过：已标记 rejected，渲染侧不再引用", stA, ProgressEvent.Level.WARN)
                 }
                 emit(PipelineStage5.AUDIT, assets.size, "审计通过 ${auditedOk}/${assets.size}，未过已标红放行", stA)
                 writeCheckpoint(episodeId, PipelineStage5.AUDIT, assetCount, 0, false, null)
@@ -334,6 +334,18 @@ class DefaultAiOrchestrator(
     // ---------- 依赖类型 ----------
     data class AiAsset(val assetId: String, val kind: String, val name: String, val prompt: String)
     /** 第十五轮：assetIds 为分镜引用的真实资产ID，persistShots 写入 first_asset_ids */
-    data class AiShot(val shotNo: Int, val action: String, val dialogue: String? = null, val assetIds: List<String> = emptyList())
+    data class AiShot(
+        val shotNo: Int,
+        val action: String,
+        val dialogue: String? = null,
+        val assetIds: List<String> = emptyList(),
+        // ★质量修复 B：以下字段此前在 factory 映射时被整体丢弃，导致落库后视频端拿不到镜头语言/场景/时长
+        val narration: String? = null,
+        val visualPrompt: String? = null,
+        val sceneContext: String? = null,
+        val carryOver: String? = null,
+        val beatRef: String? = null,
+        val durationSeconds: Double = 6.0,
+    )
     data class AuditResult(val passed: Boolean, val score: Double? = null, val reason: String? = null)
 }

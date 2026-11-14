@@ -42,17 +42,26 @@ object RenderRuntime {
                 // 取 episodeId 后查 shots 表回填该镜文本。若查不到（如 Room 未初始化）安全退化为空三元组。
                 shotPromptResolver = { shotId ->
                     val shot = runCatching { AppGraph.dao.shotKeyframes(shotId) }.getOrNull()
-                    Triple(
-                        shot?.dialogue ?: "",
-                        shot?.narration ?: "",
-                        listOfNotNull(
-                            shot?.scene_context?.takeIf { !it.isNullOrBlank() }?.let { "场景连续性：$it" },
-                            shot?.action
-                        ).joinToString("；")
-                    )
+                    // ★质量修复 B：scene_context 改由 shotSceneContextProvider 单独传递（避免重复拼接）
+                    Triple(shot?.dialogue ?: "", shot?.narration ?: "", shot?.action ?: "")
                 },
                 // v1.7.18：视频参数透传（设置页可调；每镜提交前读取，改参数即时生效）
                 videoParamsProvider = { _ -> AppGraph.videoParams },
+                // ★质量修复 B/F：镜头语言 / 场景锚点 / 镜头时长（落库字段直通队列；prompt 与帧数都用）
+                shotSceneContextProvider = { shotId ->
+                    runCatching { AppGraph.dao.shotKeyframes(shotId)?.scene_context }.getOrNull() ?: ""
+                },
+                shotCinematicProvider = { shotId ->
+                    runCatching {
+                        val shot = AppGraph.dao.shotKeyframes(shotId)
+                        val visual = shot?.visual_prompt?.takeIf { it.isNotBlank() } ?: ""
+                        val style = AppGraph.currentPreset().globalPromptSuffix
+                        if (visual.isBlank()) style else "景别与运镜：$visual。影调：$style"
+                    }.getOrDefault("")
+                },
+                shotDurationProvider = { shotId ->
+                    runCatching { AppGraph.dao.shotKeyframes(shotId)?.duration_seconds }.getOrNull() ?: 0.0
+                },
                 // ★v1.8.0 质量三闸接线（对齐 pavo fidelity_gate + storyboard 六铁律 + shot_director 开场帧重渲染）
                 // 提交前保真闸：把该镜分镜条目编译为 StoryboardGate.Entry 跑 FidelityGate。
                 // 未绑定资产的镜 fail-soft 跳过（避免误杀纯场景/动作镜，整集 sb_check 仍覆盖）。
@@ -83,6 +92,8 @@ object RenderRuntime {
                 catalogApprovedIdsProvider = { epId ->
                     val pid = epId.substringBeforeLast("_ep")
                     runCatching { AppGraph.dao.assetsAllOf(pid) }.getOrNull()
+                        // ★质量修复 G：被 QC 拒绝(REJECTED)的资产不算「已批准」，否则差图照样进保真闸/参考图
+                        ?.filter { it.audit_state != "rejected" }
                         ?.filter { !it.remote_url.isNullOrBlank() || !it.image_uri.isNullOrBlank() }
                         ?.map { it.asset_id }?.toSet() ?: emptySet()
                 },
@@ -92,10 +103,8 @@ object RenderRuntime {
                         shots.any { it.sb_check.contains("error", ignoreCase = true) && it.sb_check != "pass" }
                     }
                 },
-                // 开场帧重渲染（不去头改重渲染）：用写回 shot.first_image_uri 的重渲染帧；空=逃生用原始 first
-                openingFrameProvider = { shotId ->
-                    runCatching { AppGraph.dao.shotKeyframes(shotId)?.first_image_uri }.getOrNull()
-                },
+                // 开场帧重渲染（不去头改重渲染）：已有写回首帧→直接用；没有→按剧本 i2i 合成电影开场静帧
+                openingFrameProvider = { shotId -> synthesizeOpeningFrame(shotId) },
                 // v1.9.24 TD-7 修复：资产锁脸三件套此前只在 QueueViewModel 接到 queueFor("default")，
                 // 真实 episode 队列（queueFor(episodeId)）永远拿到空 lambda → 道具 ref 从不注入、跨镜不锁脸。
                 // 现统一在 queueFor 构造期接齐，每个 episode 实例均生效。
@@ -112,7 +121,8 @@ object RenderRuntime {
                         val shot = AppGraph.dao.shotKeyframes(shotId)
                             ?: AppGraph.dao.shotsOf(epId).firstOrNull { it.shot_id == shotId }
                         val refIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
-                        val all = AppGraph.dao.assetsAllOf(projectId)
+                        // ★质量修复 G：拒绝态资产不再作为逐镜参考图（旧实现只看 URL 非空）
+                        val all = AppGraph.dao.assetsAllOf(projectId).filter { it.audit_state != "rejected" }
                         AssetCatalog.resolveRefUris(all, refIds)
                             .ifEmpty { AssetCatalog.fallbackUris(all) }
                     }.getOrDefault(emptyList())
@@ -131,6 +141,61 @@ object RenderRuntime {
             )
         }
     }
+
+    /**
+     * ★质量修复 C：自动开场帧合成（i2i）。
+     * 旧链路 first_image_uri 的唯一真实写入点是 QueuePage 里人工从相册选图 → 流水线产出的镜
+     * 95% 没有首帧，视频模型只能从纯文字起步，人物/场景每镜重掷。
+     * 这里在提交前用「场景底图 + 角色参考图」做一次 img2img，把电影开场静帧写回 first_image_uri
+     * 以便复用与审计；任何一步失败返回 null，队列自动回落到原始 first 逻辑（绝不阻断渲染）。
+     */
+    private suspend fun synthesizeOpeningFrame(shotId: String): String? = runCatching {
+        val dao = AppGraph.dao
+        val epId = shotId.substringBeforeLast("_shot").takeIf { it.contains("_ep") } ?: shotId
+        val shot = dao.shotKeyframes(shotId) ?: dao.shotsOf(epId).firstOrNull { it.shot_id == shotId }
+        val existing = shot?.first_image_uri?.takeIf { it.isNotBlank() }
+        if (existing != null) return@runCatching existing
+        val projectId = epId.substringBeforeLast("_ep").ifBlank { epId }
+        val all = dao.assetsAllOf(projectId).filter { it.audit_state != "rejected" }
+        val refIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
+        val refUris = AssetCatalog.resolveRefUris(all, refIds)
+            .ifEmpty { AssetCatalog.fallbackUris(all) }
+            .filter { it.isNotBlank() }.distinct().take(4)
+        if (refUris.isEmpty()) return@runCatching null
+        val sceneBase = all.firstOrNull {
+            it.kind == "scene" && (!it.remote_url.isNullOrBlank() || !it.image_uri.isNullOrBlank())
+        }?.let { it.remote_url?.takeIf { s -> s.isNotBlank() } ?: it.image_uri }
+        val base = sceneBase ?: refUris.first()
+        // 场景锚点 + 导演镜头语言一起作为「本镜开场画面描述」（旧链路两者都没有）
+        val frameStart = listOfNotNull(
+            shot?.scene_context?.takeIf { it.isNotBlank() },
+            shot?.visual_prompt?.takeIf { it.isNotBlank() },
+        ).ifEmpty { listOfNotNull(shot?.action) }.joinToString("；")
+        val (prompt, negative) = com.dramafactory.core.quality.ShotDirector.buildOpeningFramePrompt(
+            frameStart = frameStart,
+            binding = com.dramafactory.core.quality.ShotDirector.Binding(
+                baseUri = base,
+                assetUris = refUris.filter { it != base },
+                legend = "参考图片为角色/场景设定图，仅用于保持人物长相与场景一致，不要照搬棚拍背景。",
+            ),
+            stylePreset = AppGraph.currentPreset(),
+        )
+        val inputs = (listOfNotNull(sceneBase) + refUris).distinct()
+        val url = try {
+            AppGraph.image.generateImage(com.dramafactory.core.model.ImageGenRequest(
+                prompt = prompt, size = "720x1280", inputImages = inputs))
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // 各图像 Provider 支持的尺寸/参数不同（Agnes 图像端拒绝 negative_prompt、尺寸档位各异）：
+            // 退回默认尺寸且不带负向词再试一次；仍失败由外层 runCatching 返回 null 回落原始首帧逻辑。
+            AppGraph.image.generateImage(com.dramafactory.core.model.ImageGenRequest(
+                prompt = prompt, inputImages = inputs))
+        }
+        val publicUrl = AppGraph.uploadImageToCloud(url)
+        runCatching { dao.setShotKeyframes(shotId, publicUrl, shot?.last_image_uri) }
+        publicUrl
+    }.getOrNull()
 
     /** UI/Service便捷入口 */
     fun queue(): DefaultRenderQueue = queueFor("default")

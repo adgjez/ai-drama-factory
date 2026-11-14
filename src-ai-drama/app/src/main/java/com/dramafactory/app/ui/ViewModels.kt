@@ -523,6 +523,8 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
 
     // 显式类型：generateHandler/enrichHandler 内部需引用本实例，避免 apply 内自引用导致循环类型推断
     private val logic: AssetsLogic = AssetsLogic().apply {
+        // ★去时代锁：参考图套装（pose pack）跟随本集按剧本检测出的时代预设，不再写死西汉
+        eraPresetProvider = { eraPreset }
         // 资产生成：文本通道出细化prompt → 图像通道出图（双Provider桩接线）
         // 第九轮：生成 prompt 折叠 era 红线约束（C）；图生图参考图作为 input_images。
         generateHandler = { card ->
@@ -551,8 +553,14 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
                     basePrompt = basePrompt,
                     preset = preset,
                     inputImages = if (card.referenceImageUri != null) listOf(card.referenceImageUri) else emptyList())
-                // A. 资产质量闸门：G1 文件级硬校验 + G2 多模态打分（defects 直接拒，重试≤3）
-                runCatching { auditGeneratedAsset(card.assetId, url, erPrompt, card) }
+                // A. 资产质量闸门：G1 文件级硬校验 + G2 多模态打分，结论落库（audit_state）
+                // ★质量修复 G：旧实现 runCatching 后无条件 Result.success 且异常被吞；这里至少保留失败痕迹，
+                // 拒绝态会由渲染侧过滤（不再逐镜引用）。自动重试需要改生成循环，方案文档列为下一步。
+                val audit = runCatching { auditGeneratedAsset(card.assetId, url, erPrompt, card) }
+                if (audit.isFailure) {
+                    android.util.Log.w("AssetsViewModel",
+                        "auditGeneratedAsset failed: ${audit.exceptionOrNull()?.message}")
+                }
                 Result.success(url)
             }
         }
@@ -691,8 +699,8 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
      * 第十三轮：按剧本自动推断的时代预设（默认西汉，init 时 LLM/规则检测后更新）。
      * 生成链路一律用 [eraPreset] 而非写死的 HAN_PRESET。
      */
-    @Volatile private var eraKey: String = "han"
-    private val _eraLabel = kotlinx.coroutines.flow.MutableStateFlow("西汉末年至新莽时期（默认）")
+    @Volatile private var eraKey: String = "neutral"
+    private val _eraLabel = kotlinx.coroutines.flow.MutableStateFlow("时代待判定（按剧本）")
     val eraLabel: kotlinx.coroutines.flow.StateFlow<String> get() = _eraLabel
     private val eraPreset: com.dramafactory.core.quality.StylePreset
         get() = com.dramafactory.core.quality.EraDetector.presetFor(eraKey)
@@ -755,7 +763,7 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
                     com.dramafactory.core.quality.EraDetector.detect(scriptForEra, llmReady) { req ->
                         AppGraph.text.chat(req)
                     }
-                }.getOrElse { com.dramafactory.core.quality.EraDetector.Detection("han", "", false) }
+                }.getOrElse { com.dramafactory.core.quality.EraDetector.Detection("neutral", "", false) }
                 eraKey = det.eraKey
                 _eraLabel.value = det.label + if (det.usedLlm) "" else "（规则推断）"
             }

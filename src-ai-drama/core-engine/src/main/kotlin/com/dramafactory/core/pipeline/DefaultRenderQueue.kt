@@ -69,6 +69,10 @@ class DefaultRenderQueue(
     // v1.7.18：视频参数提供器（分辨率/帧数/帧率）。App 层从设置持久化读取，
     // null 表示用 VideoSubmitRequest 默认值。每镜提交前查询，改参数即时生效。
     var videoParamsProvider: suspend (shotId: String) -> VideoParams? = { _ -> null },
+    /** ★质量修复 B：场景连续性 / 镜头语言 / 镜头时长（来自 shots 表，供 prompt 与帧数使用） */
+    var shotSceneContextProvider: suspend (String) -> String = { "" },
+    var shotCinematicProvider: suspend (String) -> String = { "" },
+    var shotDurationProvider: suspend (String) -> Double = { 0.0 },
     // v1.9.28：本地媒体 URI → 公网 URL（图床）。2.5 要求参考媒体公开可访问，
     // content:///file:///data: 必须先上传再提交。默认恒等透传（无图床/单测）。
     // 上传失败抛异常 → 本镜按 ValidationError 标 FAILED（可读原因），不烧钱提交。
@@ -95,6 +99,14 @@ class DefaultRenderQueue(
 
     /** P1-4：取回失败重试退避上限（指数退避封顶） */
     companion object {
+        /** 由镜头时长（秒, 24fps）换算 Agnes 合法帧数 8n+1（clamp 9..441）；时长非法返回 null。 */
+        fun numFramesForDuration(durationSeconds: Double, fps: Int = 24): Int? {
+            if (durationSeconds <= 0.0) return null
+            val target = Math.round(durationSeconds * fps).toInt()
+            val n = Math.round((target - 1) / 8.0).toInt()
+            return (n * 8 + 1).coerceIn(9, 441)
+        }
+
         const val FETCH_RETRY_BASE_MS = 2_000L
         const val FETCH_RETRY_CAP_MS = 60_000L
         /** ★F5 修复：取回失败重试次数上限。达到上限后保持 SUBMITTED 退出本 repoll，
@@ -192,7 +204,12 @@ class DefaultRenderQueue(
             if (epBlocked == true) { pause("storyboard_gate"); return }
 
             val (dialogue, narration, action) = shotPromptResolver(shotId)
-            val prompt = com.dramafactory.core.provider.ChineseAudioInjector.buildShotPrompt(dialogue, narration, action)
+            // ★质量修复 B：把导演的镜头语言与场景锚点带进最终视频 prompt（旧链路只剩台词+action）
+            val sceneContext = runCatching { shotSceneContextProvider(shotId) }.getOrDefault("")
+            val cinematic = runCatching { shotCinematicProvider(shotId) }.getOrDefault("")
+            val shotDuration = runCatching { shotDurationProvider(shotId) }.getOrDefault(0.0)
+            val prompt = com.dramafactory.core.provider.ChineseAudioInjector.buildShotPrompt(
+                dialogue, narration, action, sceneContext, cinematic)
 
             // ★v1.8.0 质量三闸·提交前保真闸（FidelityGate A.1-A.7 确定性校验）：
             // 资产真实 / 台词逐字 / 时长镜序 / 禁编造 / 禁时间逆转 / 状态不漂移 / 跨镜一致。
@@ -204,7 +221,7 @@ class DefaultRenderQueue(
                     entry = gateEntry,
                     motionPrompt = prompt,
                     catalogApprovedIds = catIds,
-                    submittedDuration = gateEntry.panel.duration,
+                    submittedDuration = if (shotDuration > 0.0) shotDuration else gateEntry.panel.duration,
                     expectedIndex = gateEntry.index,
                 )
                 if (gr.blocked) {
@@ -244,9 +261,12 @@ class DefaultRenderQueue(
                     referenceVideoUri = pubRefVideo,
                     inputImages = pubAssets,
                     negativePrompt = videoNegative,
-                    width = vp?.width ?: com.dramafactory.core.model.VideoSubmitRequest.DEFAULT_WIDTH,
-                    height = vp?.height ?: com.dramafactory.core.model.VideoSubmitRequest.DEFAULT_HEIGHT,
-                    numFrames = vp?.numFrames ?: com.dramafactory.core.model.VideoSubmitRequest.DEFAULT_NUM_FRAMES,
+                    // ★质量修复 F：未显式配置时默认竖屏 720x1280（旧默认 448x832 成片模糊且非 9:16）
+                    width = vp?.width ?: 720,
+                    height = vp?.height ?: 1280,
+                    // 帧数按本镜真实时长换算 8n+1（旧链路所有镜固定 121 帧≈5s，时长字段形同虚设）
+                    numFrames = vp?.numFrames ?: numFramesForDuration(shotDuration)
+                        ?: com.dramafactory.core.model.VideoSubmitRequest.DEFAULT_NUM_FRAMES,
                     frameRate = vp?.frameRate ?: com.dramafactory.core.model.VideoSubmitRequest.DEFAULT_FRAME_RATE,
                 )
             )

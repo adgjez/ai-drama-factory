@@ -236,16 +236,18 @@ data class StylePreset(
     fun eraPositiveFor(kind: String): String {
         val label = era.label
         val isHan = label.contains("西汉") || label.contains("新莽")
+        // ★中性预设（未指定时代）复用「只描绘主体/空场/单件器物」的精编约束，但不写死任何朝代形制
+        val isNeutral = name == NEUTRAL_NAME
         val noModern = if (era.negative.isEmpty()) "" else "；无电力、无工业、无现代器物"
         return when (kind.trim().lowercase()) {
             AssetPromptBuilder.KIND_CHARACTER ->
-                if (isHan) eraPositiveCharacter else
+                if (isHan || isNeutral) eraPositiveCharacter else
                     "【严格历史时代约束】本剧设定为$label，图中人物的服饰形制、发式冠巾、面料质地必须严格符合该时代风貌$noModern。只描绘这一个人本身：不得描绘任何背景、环境、建筑、陈设、器物、火光或其他角色；双手自然垂于身侧且完全空置，不持握任何器物、兵器、刀剑、简牍、书卷、杯盏、杖或其他物件。"
             AssetPromptBuilder.KIND_SCENE ->
-                if (isHan) eraPositiveScene else
+                if (isHan || isNeutral) eraPositiveScene else
                     "【严格历史时代约束】本剧设定为$label，画面中的建筑形制、空间陈设与道具器物必须严格符合该时代风貌$noModern。这是空场空镜，画面中不得出现任何人物。"
             AssetPromptBuilder.KIND_PROP ->
-                if (isHan) eraPositiveProp else
+                if (isHan || isNeutral) eraPositiveProp else
                     "【严格历史时代约束】本剧设定为$label，该器物的形制、材质与工艺必须严格符合该时代风貌$noModern。只描绘这一件器物本身：不得描绘任何人物、服饰、背景、环境、建筑或其他物件。"
             else -> era.positive
         }
@@ -616,8 +618,29 @@ data class StylePreset(
                 "face close-up, expression: sorrowful, slightly lowered brows, downcast eyes, pressed lips, somber demeanor", expression = true),
         )
 
-        /** 默认西汉预设单例。 */
+        /** 默认西汉预设单例（仅显式选择汉朝时使用；检测零命中不再回退到这里）。 */
         val HAN_DEFAULT = StylePreset()
+
+        // ---------------- 中性预设（未指定时代） ----------------
+        const val NEUTRAL_NAME = "neutral"
+        val NEUTRAL_NEGATIVE = listOf(
+            "watermark", "text", "low quality", "speckles", "blurry", "水印", "文字", "低质", "模糊")
+
+        /**
+         * ★去时代锁：剧本没有历史朝代线索 / 检测零命中时的默认预设。
+         * 只保留「单主体、空场、单件器物、可商用画质」约束，服化道一律以剧本描述为准，
+         * 绝不默认任何朝代形制（这正是此前现代剧被要求穿深衣曲裾的根因）。
+         */
+        val NEUTRAL_DEFAULT = StylePreset(
+            name = NEUTRAL_NAME,
+            era = EraSpec(
+                label = "时代未指定（以剧本设定为准）",
+                positive = "【时代约束】本剧未指定具体历史朝代，所有服饰、发式、建筑、器物严格以剧本描述为准；剧本未描述时用现代/通用影视质感，不得默认任何朝代形制。",
+                negative = NEUTRAL_NEGATIVE),
+            eraPositiveCharacter = "只描绘这一个人本身：服饰、发式、装扮与身份严格以剧本描述为准，不默认任何朝代形制；不得描绘任何背景、环境、建筑、陈设、器物、火光或其他角色；双手自然垂于身侧且完全空置，不持握任何器物、兵器、刀剑、简牍、书卷、杯盏、杖或其他物件。",
+            eraPositiveScene = "画面中的建筑形制、空间陈设与道具器物严格以剧本描述为准，不默认任何朝代形制。这是空场空镜，画面中不得出现任何人物。",
+            eraPositiveProp = "该器物的形制、材质与工艺严格以剧本描述为准，不默认任何朝代形制。只描绘这一件器物本身：不得描绘任何人物、服饰、背景、环境、建筑或其他物件。",
+        )
 
         /** 从 style_cinema.json 兼容 dict 构造（MVP 仅取 era 块，其余用默认值）。 */
         fun fromJson(json: Map<String, Any?>): StylePreset {

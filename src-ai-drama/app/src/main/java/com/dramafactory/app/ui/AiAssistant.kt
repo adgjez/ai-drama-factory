@@ -336,7 +336,8 @@ class AiAssistantViewModel : ViewModel() {
                     dao.assetsAllOf(pid).firstOrNull { it.asset_id == cid }
                 } ?: return "（找不到角色 $cid）"
                 if (parent.kind != "character") return "（$cid 不是角色资产，参考图只给角色建）"
-                val preset = com.dramafactory.core.quality.StylePreset.HAN_DEFAULT
+                // ★去时代锁：pose pack 跟随当前项目按剧本检测出的预设
+                val preset = AppGraph.currentPreset()
                 val n = withContext(Dispatchers.IO) {
                     var added = 0
                     for (shot in preset.referenceShots) {
