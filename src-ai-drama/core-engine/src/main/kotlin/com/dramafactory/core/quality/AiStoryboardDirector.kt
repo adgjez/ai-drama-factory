@@ -72,7 +72,11 @@ object AiStoryboardDirector {
 只输出严格 JSON，不要markdown代码块。格式：
 {"shots":[{"shot_no":1,"action":"画面中发生的具体动作（30字内，纯动作描述）","scene_context":"时间+天气+空间位置，第一镜建立基准，后续镜头必须继承或写明变化原因","dialogue":"该镜台词原文（无台词则省略）","narration":"旁白（无则省略）","duration_seconds":6,"characters":["角色名"],"asset_ids":["a_xxx","a_yyy"],"beat_ref":"B01","carry_over":"本镜结束时角色/场景/道具的状态，供下一镜承接"}]}
 规则：
-- 每镜5-10秒；一场戏2-5镜；台词必须与原文逐字一致不得改写；shot_no从1连续递增。
+- 每镜4-10秒（推荐5-8秒）；一场戏2-5镜；台词必须与原文逐字一致不得改写；shot_no从1连续递增。
+- 节奏设计：不要所有镜头一样长。开场钩子4-6秒；场景建立镜头6-8秒；对话正反打5-7秒；冲突/动作/追逐4-5.5秒；情绪停留/沉默/独白8-10秒；每3-4镜至少出现一次明显时长变化。
+- 段落结构：同一场戏先用1个建立镜头交代空间与人物关系，再进入对话或动作；换场时用一个可理解的转场镜（推门/转身/跟拍/空镜）并把转场写进 carry_over。
+- 景别与机位：相邻两镜不要同景别；对话戏用正反打（过肩/近景/特写交替）；冲突高潮用近景+特写；交代空间用全景/中景。
+- 镜头内调度：action 要写清人物在画面哪一侧、朝向谁、与前景/背景的关系（如"林见夕居左，顾沉背身入画右侧"）。
 - 短剧片段通常4-12镜；如果输入是长剧本，必须覆盖提供文本中的全部关键事件，镜头数量可以超过12，绝不能为了满足数量上限而省略后半段。
 - 每镜必须填写 scene_context：明确时间、天气、空间位置（光线/影调交给导演视觉指令，不要在这里重复堆砌）。第一镜建立全局基准；后续镜头默认继承上一镜，只有剧本明确或 carry_over 写明转场原因时才允许改变。
 - 严禁无解释地改变时间、天气、室内外或空间位置。后续镜头必须继承上一镜已明确的环境状态；只有剧本或转场因果明确要求时才允许改变，不得自行补全未提供的时间、天气或光源。
@@ -86,6 +90,7 @@ object AiStoryboardDirector {
 只输出严格 JSON：{"visuals":[{"shot_no":1,"visual":"景别+运镜+构图+光线/影调，30-60字"}]}
 要求：先写机位语言（如"近景缓推，人物居左，背景纵深虚化"），再补充本镜的光线/影调/氛围（如"电脑屏幕蓝光映脸、办公室冷色调"）；必须与 scene_context、剧本及资产描述一致，不得自行新增剧本未写的时间、天气或光源；不要重复动作内容。
 asset_ids 已锁定：写 visual 时必须考虑该镜引用的资产（角色长相/场景/道具），visual_prompt 描述应与资产描述一致（如"近景缓推张角道长"而非"近景缓推一古装男子"）。
+镜头语言要求：每镜画面描述必须包含机位高度（平视/俯拍/仰拍）、景别、运镜，以及光比/色温/景深/前景遮挡中的至少一项；相邻镜头景别必须有变化，不得连续两镜同一景别；对话戏用过肩或正反打，冲突戏用近景+快速运镜，情绪戏用长焦特写+浅景深。
 跨镜连贯：必须继承上一镜的 carry_over、角色/场景资产与动作结果，禁止无因果跳转；通过 beat_ref 控制因果顺序与节奏。"""
 
     /**
@@ -131,6 +136,10 @@ asset_ids 已锁定：写 visual 时必须考虑该镜引用的资产（角色�
         // 模型在长文本中偶尔漏填承接字段；先做确定性归一化，再跑最终硬闸，避免同一错误反复让用户重试。
         shots = if (targetShotNo == null) stabilizeShots(shots, assets.map { it.id }.toSet()) else shots
 
+        // 确定性节奏设计：按镜头功能重排时长（4~10 秒），避免模型把所有镜都写成同一个秒数。
+        // 单镜重生成（targetShotNo != null）时不动时长，保护人工编辑结果。
+        if (targetShotNo == null) shots = ShotDesigner.refine(shots)
+
         // —— 导演：视觉指令 ——
         val visuals: Map<Int, String> = runCatching {
             val brief = shots.joinToString("\n") { s ->
@@ -154,21 +163,24 @@ asset_ids 已锁定：写 visual 时必须考虑该镜引用的资产（角色�
             } ?: emptyMap()
         }.getOrDefault(emptyMap())
 
-        // —— 忠实性粗校验：台词逐字必须在剧本原文中出现（引号边界内）——
+        // 先挂上导演视觉指令，再做校验：景别覆盖类设计软提示需要 visual_prompt 才能判断。
+        val withVisual = shots.map { it.copy(visualPrompt = visuals[it.shotNo]) }
+        // —— 忠实性粗校验（台词逐字）+ 分镜设计软提示（景别/节奏）——
         val gateErrors = mutableMapOf<Int, List<String>>()
-        StoryCoherence.validate(shots, assets.map { it.id }.toSet()).groupBy { it.shotNo }
+        StoryCoherence.validate(withVisual, assets.map { it.id }.toSet()).groupBy { it.shotNo }
             .forEach { (shotNo, issues) -> gateErrors[shotNo] = issues.map { it.code } }
-        for (s in shots) {
+        for (s in withVisual) {
             val errs = mutableListOf<String>()
             s.dialogue?.let { d ->
                 if (d.isNotBlank() && !verbatimIn(d.trim(), script)) errs += "dialogue_not_verbatim"
             }
             if (s.action.isBlank()) errs += "action_empty"
-            if (errs.isNotEmpty()) gateErrors[s.shotNo] = errs
+            // 合并而不是覆盖：台词错误不能把场景/节奏提示吃掉。
+            if (errs.isNotEmpty()) gateErrors[s.shotNo] = gateErrors[s.shotNo].orEmpty() + errs
         }
 
         return Result(
-            shots = shots.map { it.copy(visualPrompt = visuals[it.shotNo]) },
+            shots = withVisual,
             usedLlm = true,
             gateErrors = gateErrors,
             refStats = refStats)
@@ -198,7 +210,7 @@ asset_ids 已锁定：写 visual 时必须考虑该镜引用的资产（角色�
             val errors = issues.joinToString("\n") { "镜头${it.shotNo}: ${it.code} - ${it.message}" }
             val prompt = """你是分镜修复导演。只修复指定镜头，不要重写其他镜头。
 严格只输出 JSON：{"shots":[{"shot_no":2,"action":"...","dialogue":"原台词（无则省略）","narration":"原旁白（无则省略）","scene_context":"...","duration_seconds":6,"characters":["角色名"],"asset_ids":[],"beat_ref":"B02","carry_over":"..."}]}
-要求：scene_context 必须明确继承上一镜的时间、天气、空间、光线；若有变化，carry_over 必须写明转场因果（如推门进入、离开、切换地点）；保持原故事事件不变；dialogue/narration 必须原样照抄【相关镜头】里该镜已有的台词旁白，不得改写、删除或新增；asset_ids 只能使用资产目录中的 id；时长限定5-10秒。
+要求：scene_context 必须明确继承上一镜的时间、天气、空间、光线；若有变化，carry_over 必须写明转场因果（如推门进入、离开、切换地点）；保持原故事事件不变；dialogue/narration 必须原样照抄【相关镜头】里该镜已有的台词旁白，不得改写、删除或新增；asset_ids 只能使用资产目录中的 id；时长限定4-10秒（推荐5-8秒）。
 【错误】
 $errors
 【相关镜头】
@@ -241,7 +253,7 @@ $script"""
         return shots.sortedBy { it.shotNo }.mapIndexed { index, raw ->
             val fixed = raw.copy(
                 shotNo = index + 1,
-                durationSeconds = raw.durationSeconds.coerceIn(5.0, 10.0),
+                durationSeconds = raw.durationSeconds.coerceIn(ShotDesigner.MIN_SECONDS, ShotDesigner.MAX_SECONDS),
                 assetIds = if (approvedAssetIds.isEmpty()) raw.assetIds else raw.assetIds.filter { it in approvedAssetIds }.distinct(),
                 carryOver = if (index == 0) raw.carryOver else raw.carryOver
                     ?.takeIf { it.isNotBlank() }

@@ -560,7 +560,9 @@ class AgnesProvider(
         repeat(SUBMIT_MAX_ATTEMPTS) { attempt ->
             try {
                 // maxRetries语义=1：本层不做HTTP快重试，429/5xx全走长退避
-                val out = postJson("/videos", body)
+                // maxRetries = 1：外层已有 SUBMIT_MAX_ATTEMPTS 长退避，这里绝不能再叠 postJson 的默认 HTTP 重试，
+                // 否则一次提交最多 3×3=9 次 POST，失败时重复扣费。
+                val out = postJson("/videos", body, maxRetries = 1)
                 val videoId = out["video_id"]?.jsonPrimitive?.content
                     ?: throw ProviderError.ReconcileRequired(
                         rawBody = out.toString().take(400),

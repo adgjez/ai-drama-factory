@@ -63,4 +63,30 @@ class StoryCoherenceTest {
         )
         assertTrue("scene_context_missing" in StoryCoherence.validate(shots).map { it.code })
     }
+
+    @Test
+    fun 连续同景别与连续同时长给设计软提示() {
+        // 4 镜都写「中景」且都是 6 秒：应同时给出 rhythm_monotone 与 rhythm_flat（软提示，不进自动修复）。
+        val shots = (1..4).map {
+            AiStoryboardDirector.Shot(it, "她在办公室里走动", durationSeconds = 6.0,
+                carryOver = if (it == 1) null else "保持当前状态",
+                sceneContext = "夜晚，办公室内", visualPrompt = "中景，平视")
+        }
+        val codes = StoryCoherence.validate(shots).map { it.code }
+        assertTrue("rhythm_monotone" in codes, "连续同景别应给软提示，实际：$codes")
+        assertTrue("rhythm_flat" in codes, "连续同时长应给软提示，实际：$codes")
+    }
+
+    @Test
+    fun 场次切换后缺少建立镜头给设计软提示() {
+        val shots = listOf(
+            AiStoryboardDirector.Shot(1, "她在办公室收拾文件", durationSeconds = 6.0,
+                sceneContext = "夜晚，办公室内", visualPrompt = "中景，平视"),
+            AiStoryboardDirector.Shot(2, "她推门走到院子里", durationSeconds = 7.0,
+                carryOver = "她推门离开办公室，走进院子",
+                sceneContext = "夜晚，院门外，下着小雨", visualPrompt = "特写，仰拍"),
+        )
+        val codes = StoryCoherence.validate(shots).map { it.code }
+        assertTrue("establishing_missing" in codes, "换场后首镜用特写应给建立镜头提示，实际：$codes")
+    }
 }

@@ -247,15 +247,36 @@ class DefaultAiOrchestrator(
                 var auditedOk = 0
                 for ((i, a) in assets.withIndex()) {
                     var passed = false
-                    for (attempt in 0..1) {
+                    var regenerated = 0
+                    // 审计闭环：不过 → 重新生成一张 → 再审；最多重生成 2 次（共审 3 张），仍不过才标红。
+                    // 旧实现只是把同一张图连审两次，等于没重试。
+                    while (true) {
                         val r = auditAsset(a)
-                        if (r.isSuccess && r.getOrNull()?.passed == true) { passed = true }
-                        if (passed) break
+                        if (r.isSuccess && r.getOrNull()?.passed == true) { passed = true; break }
+                        if (regenerated >= 2) break
+                        val reason = r.exceptionOrNull()?.message ?: r.getOrNull()?.reason ?: "未达质量线"
+                        val regen = try {
+                            generateImage(a)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (t: Throwable) {
+                            Result.failure<String>(t)
+                        }
+                        if (regen.isFailure) {
+                            emit(PipelineStage5.AUDIT, i + 1,
+                                "资产${i + 1}审计未过且重生成失败：${(regen.exceptionOrNull()?.message ?: "unknown").take(80)}",
+                                stA, ProgressEvent.Level.WARN)
+                            break
+                        }
+                        regenerated++
+                        emit(PipelineStage5.AUDIT, i + 1,
+                            "资产${i + 1}审计未过（${reason.take(60)}），已重新生成第 ${regenerated} 次",
+                            stA, ProgressEvent.Level.WARN)
                     }
                     if (passed) auditedOk++
-                    else emit(PipelineStage5.AUDIT, i + 1, "资产${i + 1}审计未过：已标记 rejected，渲染侧不再引用", stA, ProgressEvent.Level.WARN)
+                    else emit(PipelineStage5.AUDIT, i + 1, "资产${i + 1}审计 3 次仍未过：已标记 rejected，渲染侧不再引用", stA, ProgressEvent.Level.WARN)
                 }
-                emit(PipelineStage5.AUDIT, assets.size, "审计通过 ${auditedOk}/${assets.size}，未过已标红放行", stA)
+                emit(PipelineStage5.AUDIT, assets.size, "审计通过 ${auditedOk}/${assets.size}，未过已标红（不进入渲染）", stA)
                 writeCheckpoint(episodeId, PipelineStage5.AUDIT, assetCount, 0, false, null)
 
                 // ---- ④ generateStoryboard ----

@@ -20,10 +20,11 @@ object StoryCoherence {
                 issues += Issue("scene_context_conflict", shot.shotNo, "跨镜时间/天气/空间位置发生变化但缺少转场依据")
             if (approvedAssetIds.isNotEmpty() && shot.assetIds.any { it !in approvedAssetIds })
                 issues += Issue("asset_unbound", shot.shotNo, "镜头包含未批准资产")
-            if (shot.durationSeconds !in 5.0..10.0)
-                issues += Issue("rhythm_duration", shot.shotNo, "单镜时长应为5-10秒")
+            if (shot.durationSeconds !in 4.0..10.0)
+                issues += Issue("rhythm_duration", shot.shotNo, "单镜时长应为4-10秒")
             previous = shot
         }
+        issues += designIssues(shots.sortedBy { it.shotNo })
         return issues
     }
 
@@ -102,5 +103,58 @@ object StoryCoherence {
         if (weatherChanged && !placeChanged && WEATHER_SHIFT.containsMatchIn(evidence)) return false
         // 同一地点、同一时间段内的明暗/光源差异不判冲突。
         return true
+    }
+
+    // ---------------------------------------------------------------------
+    // 分镜设计软提示（只提示、不自动修复）：
+    //   rhythm_monotone      连续 3 镜以上同景别 → 空间层次丢失
+    //   rhythm_flat          连续 4 镜以上同时长 → 成片匀速像 PPT
+    //   establishing_missing 场次切换后的首镜不是全景/中景 → 空间没交代
+    // 这些码不在 AiStoryboardDirector 的修复清单里，分镜页按软提示显示，不阻断渲染。
+    // ---------------------------------------------------------------------
+    private fun designIssues(shots: List<AiStoryboardDirector.Shot>): List<Issue> {
+        if (shots.isEmpty()) return emptyList()
+        val issues = mutableListOf<Issue>()
+
+        var sizeStart = 0
+        for (i in 1..shots.size) {
+            val size = ShotDesigner.shotSizeOf(shots[i - 1])
+            val nextSize = if (i < shots.size) ShotDesigner.shotSizeOf(shots[i]) else null
+            val same = i < shots.size && size != null && size == nextSize
+            if (!same) {
+                val run = i - sizeStart
+                if (run >= 3 && size != null)
+                    issues += Issue("rhythm_monotone", shots[sizeStart].shotNo, "连续${run}镜同一景别（${size}），建议拉开景别层次")
+                sizeStart = i
+            }
+        }
+
+        var durationStart = 0
+        for (i in 1..shots.size) {
+            val same = i < shots.size && shots[i].durationSeconds == shots[i - 1].durationSeconds
+            if (!same) {
+                val run = i - durationStart
+                if (run >= 4)
+                    issues += Issue("rhythm_flat", shots[durationStart].shotNo, "连续${run}镜同为${shots[durationStart].durationSeconds}秒，节奏偏平")
+                durationStart = i
+            }
+        }
+
+        for (i in 1 until shots.size) {
+            val before = envStateOf(shots[i - 1].sceneContext?.trim().orEmpty())
+            val after = envStateOf(shots[i].sceneContext?.trim().orEmpty())
+            if (!envChanged(before, after)) continue
+            val size = ShotDesigner.shotSizeOf(shots[i])
+            if (size == null || size == "特写" || size == "大特写" || size == "近景")
+                issues += Issue("establishing_missing", shots[i].shotNo, "场次切换后首镜缺少全景/中景建立镜头")
+        }
+        return issues
+    }
+
+    private fun envChanged(before: EnvState, after: EnvState): Boolean {
+        val placeChanged = (before.indoor && after.outdoor) || (before.outdoor && after.indoor)
+        val weatherChanged = before.weather.isNotEmpty() && after.weather.isNotEmpty() && before.weather != after.weather
+        val timeChanged = before.timeSlot != null && after.timeSlot != null && before.timeSlot != after.timeSlot
+        return placeChanged || weatherChanged || timeChanged
     }
 }

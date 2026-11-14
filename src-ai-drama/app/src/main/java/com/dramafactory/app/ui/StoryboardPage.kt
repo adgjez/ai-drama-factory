@@ -54,7 +54,10 @@ private fun storyboardCheckLabel(code: String): String = when (code) {
     "carry_over_missing" -> "缺少前后镜头承接：请补充角色、场景、道具状态或转场动作"
     "shot_order_gap" -> "镜号不连续：前后镜头存在顺序断点"
     "asset_unbound" -> "引用了未批准资产：请重新选择资产库中的素材"
-    "rhythm_duration" -> "镜头时长不在5–10秒建议范围"
+    "rhythm_duration" -> "镜头时长不在4–10秒建议范围"
+    "rhythm_monotone" -> "连续多镜同一景别（建议拉开景别层次，仅提示）"
+    "rhythm_flat" -> "连续多镜同一时长（建议做节奏变化，仅提示）"
+    "establishing_missing" -> "场次切换后缺少建立镜头（建议先给全景/中景，仅提示）"
     "dialogue_not_verbatim" -> "台词与剧本原文不一致"
     "action_empty" -> "动作描述为空"
     "scene_context_conflict" -> "画面描述与上一镜场景不连续（仅提示，不阻断渲染）"
@@ -69,6 +72,20 @@ private fun storyboardCheckLabel(code: String): String = when (code) {
 /** 兼容旧数据：历史版本把视觉指令拼进了 action（"动作；［视觉指令］"），显示/编辑时剥掉，避免重复。 */
 private fun displayAction(shot: com.dramafactory.app.data.ShotEntity): String =
     cleanShotAction(shot.action, shot.visual_prompt)
+
+/** 从视觉指令/动作解析景别（顺序与 core 的 ShotDesigner.SIZE_RULES 一致），用于分镜页节奏摘要。 */
+internal fun storyboardSizeLabelOf(text: String?): String? {
+    val s = text?.trim().orEmpty()
+    if (s.isEmpty()) return null
+    return when {
+        s.contains("大特写") || s.contains("极特写") -> "大特写"
+        s.contains("中近景") || s.contains("中景") -> "中景"
+        s.contains("全景") || s.contains("远景") -> "全景"
+        s.contains("近景") -> "近景"
+        s.contains("特写") -> "特写"
+        else -> null
+    }
+}
 
 /** 将 error:code,code 渲染成自然语言，避免把内部错误码直接暴露给用户。 */
 private fun storyboardCheckSummary(raw: String): String = raw.removePrefix("error:").removePrefix("warn:")
@@ -208,6 +225,31 @@ fun StoryboardPage(
             }
         }
         if (st.shots.isNotEmpty()) {
+            item {
+                // 节奏摘要：让用户在渲染前一眼看到「总时长 / 平均镜长 / 景别分布」是否失衡。
+                val totalSeconds = st.shots.sumOf { it.duration_seconds }
+                val average = if (st.shots.isEmpty()) 0.0 else totalSeconds / st.shots.size
+                val sizeCounts = st.shots
+                    .mapNotNull { storyboardSizeLabelOf(it.visual_prompt ?: it.action) }
+                    .groupingBy { it }.eachCount()
+                    .entries.sortedByDescending { it.value }
+                    .joinToString(" · ") { "${it.key}×${it.value}" }
+                DramaCard(Modifier.fillMaxWidth()) {
+                    Column(Modifier, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            "分镜设计：${st.shots.size} 镜 · 总 ${totalSeconds.toInt()} 秒 · 平均 ${((average * 10).toInt() / 10.0)} 秒",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            if (sizeCounts.isBlank()) "景别：视觉指令可补充景别/机位，让节奏更有层次"
+                            else "景别分布：${sizeCounts}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.secondary,
+                        )
+                    }
+                }
+            }
             item {
                 PrimaryButton(
                     text = "渲染本集全部 ${st.shots.size} 镜",

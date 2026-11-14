@@ -333,8 +333,13 @@ private fun QueueActionButton(
     }
 }
 
-/** 只提示、不阻断渲染的软校验码：场景/光线差异属于画面描述问题，不该挡住整集渲染。 */
-internal val SOFT_SB_CHECK_CODES = setOf("scene_context_conflict")
+/** 只提示、不阻断渲染的软校验码：场景/光线/节奏差异属于画面设计问题，不该挡住整集渲染。 */
+internal val SOFT_SB_CHECK_CODES = setOf(
+    "scene_context_conflict",
+    "rhythm_monotone",
+    "rhythm_flat",
+    "establishing_missing",
+)
 
 /** gateErrors → sb_check 持久化值：硬错误写 error:（渲染闸拦截），软提示写 warn:（界面黄色提示）。 */
 internal fun sbCheckFromResult(codes: List<String>?): String {
@@ -361,7 +366,10 @@ internal fun sbCheckLabel(code: String) = when (code) {
     "carry_over_missing" -> "缺少前后镜头承接：请补充角色、场景、道具状态或转场动作"
     "shot_order_gap" -> "镜号不连续：前后镜头存在顺序断点"
     "asset_unbound", "missing_asset" -> "引用了未批准资产：请重新选择资产库中的素材"
-    "rhythm_duration" -> "镜头时长不在5–10秒建议范围"
+    "rhythm_duration" -> "镜头时长不在4–10秒建议范围"
+    "rhythm_monotone" -> "连续多镜同一景别（建议拉开景别层次，仅提示）"
+    "rhythm_flat" -> "连续多镜同一时长（建议做节奏变化，仅提示）"
+    "establishing_missing" -> "场次切换后缺少建立镜头（建议先给全景/中景，仅提示）"
     "scene_context_conflict" -> "画面描述与上一镜场景不连续（仅提示，不阻断渲染）"
     "scene_context_missing" -> "缺少场景上下文：请补充时间、空间、天气"
     "beat_ref_missing" -> "缺少剧本节拍来源"
