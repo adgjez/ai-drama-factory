@@ -43,7 +43,7 @@ object RenderRuntime {
                 shotPromptResolver = { shotId ->
                     val shot = runCatching { AppGraph.dao.shotKeyframes(shotId) }.getOrNull()
                     // ★质量修复 B：scene_context 改由 shotSceneContextProvider 单独传递（避免重复拼接）
-                    Triple(shot?.dialogue ?: "", shot?.narration ?: "", shot?.action ?: "")
+                    Triple(shot?.dialogue ?: "", shot?.narration ?: "", cleanShotAction(shot?.action, shot?.visual_prompt))
                 },
                 // v1.7.18：视频参数透传（设置页可调；每镜提交前读取，改参数即时生效）
                 videoParamsProvider = { _ -> AppGraph.videoParams },

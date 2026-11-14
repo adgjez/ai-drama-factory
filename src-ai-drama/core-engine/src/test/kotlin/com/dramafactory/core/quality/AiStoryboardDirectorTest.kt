@@ -85,7 +85,7 @@ class AiStoryboardDirectorTest {
     fun generate_连贯性错误会定向修复并保留其他镜头() = kotlinx.coroutines.runBlocking {
         val responses = ArrayDeque(listOf(
             com.dramafactory.core.model.ChatResponse(
-                """{"shots":[{"shot_no":1,"action":"翻墙入院","duration_seconds":6},{"shot_no":2,"action":"密函静置","duration_seconds":5}]}""", ""),
+                """{"shots":[{"shot_no":1,"action":"翻墙入院","duration_seconds":6},{"shot_no":2,"action":"密函静置","narration":"堂屋内一片寂静","duration_seconds":5}]}""", ""),
             com.dramafactory.core.model.ChatResponse(
                 """{"shots":[{"shot_no":2,"action":"推门进入堂屋，目光锁定密函","duration_seconds":5,"carry_over":"女刺客从庭院进入堂屋，视线锁定密函"}]}""", ""),
             com.dramafactory.core.model.ChatResponse("""{"visuals":[]}""", "")
@@ -94,6 +94,7 @@ class AiStoryboardDirectorTest {
             responses.removeFirst()
         })
         assertEquals("推门进入堂屋，目光锁定密函", result.shots[1].action)
+        assertEquals("堂屋内一片寂静", result.shots[1].narration, "修复连贯性时不得清空原旁白")
         assertTrue(result.gateErrors.isEmpty())
     }
 

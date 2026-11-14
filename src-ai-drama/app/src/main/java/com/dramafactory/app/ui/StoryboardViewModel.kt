@@ -120,11 +120,11 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
                         shot_id = "${episodeId}_shot${s.shotNo}",
                         episode_id = episodeId, project_id = projectId, shot_no = s.shotNo,
                         dialogue = s.dialogue, narration = s.narration,
-                        action = listOfNotNull(s.action, s.visualPrompt?.let { "［$it］" }).joinToString("；"),
+                        action = s.action,
                         beat_ref = s.beatRef, carry_over = s.carryOver, scene_context = s.sceneContext,
                         first_asset_ids = AssetCatalog.encodeRefIds(s.assetIds), last_asset_ids = "[]",
                         visual_prompt = s.visualPrompt, duration_seconds = s.durationSeconds,
-                        sb_check = if (result.gateErrors[s.shotNo].isNullOrEmpty()) "pass" else "error:${result.gateErrors[s.shotNo]!!.joinToString(",")}"
+                        sb_check = sbCheckFromResult(result.gateErrors[s.shotNo])
                     )
                 }
             }
@@ -136,7 +136,8 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
             return@launch
         }
         refresh()
-        val errCount = result.gateErrors.size
+        val errCount = result.gateErrors.count { (_, codes) -> codes.any { it !in SOFT_SB_CHECK_CODES } }
+        val softCount = result.gateErrors.count { (_, codes) -> codes.isNotEmpty() && codes.all { it in SOFT_SB_CHECK_CODES } }
         // v1.9.17：用 refStats 精确定位「分镜没引用资产」断在哪一环，不再只给一句笼统警告
         val st = result.refStats
         val noAssetNote = when {
@@ -156,7 +157,8 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
             else -> ""
         }
         _state.value = _state.value.copy(generating = false, message =
-            "已生成${result.shots.size}镜" + (if (errCount > 0) "（其中${errCount}镜校验有误，见列表标记）" else "，全部通过校验✓") + noAssetNote)
+            "已生成${result.shots.size}镜" + (if (errCount > 0) "（其中${errCount}镜校验有误，见列表标记）" else "，全部通过校验✓") +
+                (if (softCount > 0) "（${softCount}镜有画面描述提示，不阻断渲染）" else "") + noAssetNote)
     }
 
     /** 单镜重新生成：只生成指定镜头；已校验通过的镜头不允许覆盖。 */
@@ -190,11 +192,11 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
         }
         val updated = old.copy(
             dialogue = s.dialogue, narration = s.narration,
-            action = listOfNotNull(s.action, s.visualPrompt?.let { "［$it］" }).joinToString("；"),
+            action = s.action,
             beat_ref = s.beatRef, carry_over = s.carryOver, scene_context = s.sceneContext,
             first_asset_ids = AssetCatalog.encodeRefIds(s.assetIds),
             visual_prompt = s.visualPrompt, duration_seconds = s.durationSeconds,
-            sb_check = if (result.gateErrors[s.shotNo].isNullOrEmpty()) "pass" else "error:${result.gateErrors[s.shotNo]!!.joinToString(",")}"
+            sb_check = sbCheckFromResult(result.gateErrors[s.shotNo])
         )
         runCatching {
             withContext(Dispatchers.IO) {
@@ -216,6 +218,7 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
     fun updateShot(
         shotId: String, action: String, dialogue: String?, narration: String?,
         visualPrompt: String?, durationSeconds: Double,
+        sceneContext: String? = null, carryOver: String? = null,
     ) = viewModelScope.launch {
         val failure = runCatching {
             withContext(Dispatchers.IO) {
@@ -224,6 +227,8 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
                 AppGraph.dao.upsertShot(row.copy(
                     action = action.trim(), dialogue = dialogue?.trim()?.ifBlank { null },
                     narration = narration?.trim()?.ifBlank { null }, visual_prompt = visualPrompt?.trim()?.ifBlank { null },
+                    scene_context = sceneContext?.trim()?.ifBlank { null },
+                    carry_over = carryOver?.trim()?.ifBlank { null },
                     duration_seconds = durationSeconds.coerceIn(1.0, 60.0)))
                 val back = AppGraph.dao.shotKeyframes(shotId)
                 check(back?.action == action.trim()) { "分镜编辑后读回不一致：$shotId" }
@@ -255,9 +260,10 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
         val metas: List<com.dramafactory.core.model.ShotMeta> = shots.map { row ->
             val visual: String = row.visual_prompt?.let { "[$it]" } ?: ""
             val dlg: String = row.dialogue?.let { "「$it」" } ?: ""
+            val action = cleanShotAction(row.action, row.visual_prompt)
             com.dramafactory.core.model.ShotMeta(
                 shotId = row.shot_id, episodeId = episodeId,
-                prompt = "$dlg${row.action ?: ""}$visual")
+                prompt = "$dlg$action$visual")
         }
         runCatching { queue.enqueueEpisode(episodeId, metas) }
             .onSuccess { onQueued(metas.size) }

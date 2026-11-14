@@ -57,6 +57,8 @@ private fun storyboardCheckLabel(code: String): String = when (code) {
     "rhythm_duration" -> "镜头时长不在5–10秒建议范围"
     "dialogue_not_verbatim" -> "台词与剧本原文不一致"
     "action_empty" -> "动作描述为空"
+    "scene_context_conflict" -> "画面描述与上一镜场景不连续（仅提示，不阻断渲染）"
+    "scene_context_missing" -> "缺少场景上下文：请补充时间、空间、天气"
     "beat_ref_missing" -> "缺少剧本节拍来源"
     "beat_index_invalid" -> "剧本节拍顺序无效"
     "beat_out_of_order" -> "剧本节拍顺序回退"
@@ -64,8 +66,12 @@ private fun storyboardCheckLabel(code: String): String = when (code) {
     else -> code
 }
 
+/** 兼容旧数据：历史版本把视觉指令拼进了 action（"动作；［视觉指令］"），显示/编辑时剥掉，避免重复。 */
+private fun displayAction(shot: com.dramafactory.app.data.ShotEntity): String =
+    cleanShotAction(shot.action, shot.visual_prompt)
+
 /** 将 error:code,code 渲染成自然语言，避免把内部错误码直接暴露给用户。 */
-private fun storyboardCheckSummary(raw: String): String = raw.removePrefix("error:")
+private fun storyboardCheckSummary(raw: String): String = raw.removePrefix("error:").removePrefix("warn:")
     .split(",").map { it.trim() }.filter { it.isNotEmpty() }
     .joinToString("；") { storyboardCheckLabel(it) }
 
@@ -268,13 +274,16 @@ fun StoryboardPage(
                             shot.sb_check == "pending" -> StatusChip(
                                 icon = Icons.Default.DateRange, text = "待生成",
                                 tint = MaterialTheme.colorScheme.outline)
+                            shot.sb_check.startsWith("warn:") -> StatusChip(
+                                icon = Icons.Default.Info, text = storyboardCheckSummary(shot.sb_check),
+                                tint = MaterialTheme.colorScheme.tertiary)
                             else -> StatusChip(
                                 icon = Icons.Default.Warning,
                                 text = storyboardCheckSummary(shot.sb_check),
                                 tint = MaterialTheme.colorScheme.error)
                         }
                     }
-                    shot.action?.let { Text("动作：$it", style = MaterialTheme.typography.bodyMedium) }
+                    shot.action?.let { Text("动作：${displayAction(shot)}", style = MaterialTheme.typography.bodyMedium) }
                     shot.visual_prompt?.let {
                         Row(
                             verticalAlignment = androidx.compose.ui.Alignment.Top,
@@ -285,6 +294,18 @@ fun StoryboardPage(
                             Text(it, style = MaterialTheme.typography.bodySmall,
                                 modifier = Modifier.weight(1f),
                                 color = MaterialTheme.colorScheme.secondary)
+                        }
+                    }
+                    shot.scene_context?.takeIf { it.isNotBlank() }?.let {
+                        Row(
+                            verticalAlignment = androidx.compose.ui.Alignment.Top,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Icon(painterResource(R.drawable.ic_image), contentDescription = "场景上下文",
+                                tint = MaterialTheme.colorScheme.outline, modifier = Modifier.size(16.dp))
+                            Text("场景：$it", style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.weight(1f),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
                     // v1.7.17：把「本镜引用了哪些资产」显式摆出来。
@@ -370,14 +391,19 @@ fun StoryboardPage(
                             Icons.Default.CheckCircle, "校验通过", MaterialTheme.colorScheme.primary)
                         viewingShot.sb_check == "pending" -> StatusChip(
                             Icons.Default.DateRange, "待生成", MaterialTheme.colorScheme.outline)
+                        viewingShot.sb_check.startsWith("warn:") -> StatusChip(
+                            Icons.Default.Info, storyboardCheckSummary(viewingShot.sb_check),
+                            MaterialTheme.colorScheme.tertiary)
                         else -> StatusChip(
                             Icons.Default.Warning,
                             storyboardCheckSummary(viewingShot.sb_check),
                             MaterialTheme.colorScheme.error)
                     }
-                    viewingShot.action?.let { DetailLine("动作", it) }
+                    viewingShot.action?.let { DetailLine("动作", displayAction(viewingShot)) }
                     viewingShot.visual_prompt?.let {
-                        DetailLine("视觉指令", it, MaterialTheme.colorScheme.secondary) }
+                        DetailLine("画面描述", it, MaterialTheme.colorScheme.secondary) }
+                    viewingShot.scene_context?.takeIf { it.isNotBlank() }?.let {
+                        DetailLine("场景上下文", it, MaterialTheme.colorScheme.onSurfaceVariant) }
                     viewingShot.dialogue?.let { DetailLine("台词", "「$it」") }
                     viewingShot.narration?.let { DetailLine("旁白", it) }
                     viewingShot.carry_over?.let {
@@ -450,10 +476,12 @@ fun StoryboardPage(
     // ---- 单镜编辑对话框（LazyColumn 外，composable 上下文）----
     val editingShot = editingShotId?.let { id -> st.shots.firstOrNull { it.shot_id == id } }
     if (editingShot != null) {
-        var eAction by remember(editingShot.shot_id) { mutableStateOf(editingShot.action ?: "") }
+        var eAction by remember(editingShot.shot_id) { mutableStateOf(displayAction(editingShot)) }
         var eDialogue by remember(editingShot.shot_id) { mutableStateOf(editingShot.dialogue ?: "") }
         var eNarration by remember(editingShot.shot_id) { mutableStateOf(editingShot.narration ?: "") }
         var eVisual by remember(editingShot.shot_id) { mutableStateOf(editingShot.visual_prompt ?: "") }
+        var eScene by remember(editingShot.shot_id) { mutableStateOf(editingShot.scene_context ?: "") }
+        var eCarry by remember(editingShot.shot_id) { mutableStateOf(editingShot.carry_over ?: "") }
         var eDur by remember(editingShot.shot_id) {
             mutableStateOf(editingShot.duration_seconds.toInt().toString())
         }
@@ -469,7 +497,11 @@ fun StoryboardPage(
                     OutlinedTextField(value = eNarration, onValueChange = { eNarration = it },
                         label = { Text("旁白（留空删除）") }, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(value = eVisual, onValueChange = { eVisual = it },
-                        label = { Text("视觉指令（运镜/景别）") }, modifier = Modifier.fillMaxWidth())
+                        label = { Text("画面描述（景别/运镜/光线/影调）") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
+                    OutlinedTextField(value = eScene, onValueChange = { eScene = it },
+                        label = { Text("场景上下文（时间/空间/天气）") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
+                    OutlinedTextField(value = eCarry, onValueChange = { eCarry = it },
+                        label = { Text("承接（上一镜结束状态/转场）") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
                     OutlinedTextField(value = eDur,
                         onValueChange = { txt -> eDur = txt.filter(Char::isDigit) },
                         label = { Text("时长（秒，1-60）") }, singleLine = true,
@@ -480,7 +512,8 @@ fun StoryboardPage(
                 Button(onClick = {
                     vm.updateShot(editingShot.shot_id, eAction,
                         eDialogue.ifBlank { null }, eNarration.ifBlank { null },
-                        eVisual.ifBlank { null }, (eDur.toIntOrNull() ?: 6).toDouble())
+                        eVisual.ifBlank { null }, (eDur.toIntOrNull() ?: 6).toDouble(),
+                        eScene.ifBlank { null }, eCarry.ifBlank { null })
                     editingShotId = null
                 }) { Text("保存") }
             },

@@ -333,6 +333,28 @@ private fun QueueActionButton(
     }
 }
 
+/** 只提示、不阻断渲染的软校验码：场景/光线差异属于画面描述问题，不该挡住整集渲染。 */
+internal val SOFT_SB_CHECK_CODES = setOf("scene_context_conflict")
+
+/** gateErrors → sb_check 持久化值：硬错误写 error:（渲染闸拦截），软提示写 warn:（界面黄色提示）。 */
+internal fun sbCheckFromResult(codes: List<String>?): String {
+    if (codes.isNullOrEmpty()) return "pass"
+    val hard = codes.filter { it !in SOFT_SB_CHECK_CODES }
+    val soft = codes.filter { it in SOFT_SB_CHECK_CODES }
+    return when {
+        hard.isNotEmpty() -> "error:" + hard.joinToString(",")
+        soft.isNotEmpty() -> "warn:" + soft.joinToString(",")
+        else -> "pass"
+    }
+}
+
+/** 旧数据兼容：历史版本把视觉指令拼进 action（"动作；［画面描述］"），渲染/显示前剥掉，避免运镜重复。 */
+internal fun cleanShotAction(action: String?, visual: String?): String {
+    val raw = action.orEmpty()
+    val v = visual?.takeIf { it.isNotBlank() } ?: return raw
+    return raw.replace("；［$v］", "").replace("［$v］", "").trim().ifBlank { raw }
+}
+
 /** 分镜 sb_check 错误码 → 中文可读（对齐 AiStoryboardDirector 六铁律忠实性校验） */
 internal fun sbCheckLabel(code: String) = when (code) {
     "dialogue_not_verbatim" -> "台词未逐字出现在剧本原文"
@@ -340,6 +362,8 @@ internal fun sbCheckLabel(code: String) = when (code) {
     "shot_order_gap" -> "镜号不连续：前后镜头存在顺序断点"
     "asset_unbound", "missing_asset" -> "引用了未批准资产：请重新选择资产库中的素材"
     "rhythm_duration" -> "镜头时长不在5–10秒建议范围"
+    "scene_context_conflict" -> "画面描述与上一镜场景不连续（仅提示，不阻断渲染）"
+    "scene_context_missing" -> "缺少场景上下文：请补充时间、空间、天气"
     "beat_ref_missing" -> "缺少剧本节拍来源"
     "beat_index_invalid" -> "剧本节拍顺序无效"
     "beat_out_of_order" -> "剧本节拍顺序回退"

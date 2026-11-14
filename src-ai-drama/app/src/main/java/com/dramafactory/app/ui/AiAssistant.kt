@@ -396,13 +396,12 @@ class AiAssistantViewModel : ViewModel() {
                     com.dramafactory.app.data.ShotEntity(
                         shot_id = "${e}_shot${s.shotNo}", episode_id = e, project_id = pid,
                         shot_no = s.shotNo, dialogue = s.dialogue, narration = s.narration,
-                        action = listOfNotNull(s.action, s.visualPrompt?.let { "［$it］" }).joinToString("；"),
+                        action = s.action,
                         beat_ref = s.beatRef, carry_over = s.carryOver, scene_context = s.sceneContext,
                         first_asset_ids = AssetCatalog.encodeRefIds(s.assetIds),
                         last_asset_ids = "[]",
                         visual_prompt = s.visualPrompt, duration_seconds = s.durationSeconds,
-                        sb_check = if (result.gateErrors[s.shotNo].isNullOrEmpty()) "pass"
-                                    else "error:${result.gateErrors[s.shotNo]!!.joinToString(",")}")
+                        sb_check = sbCheckFromResult(result.gateErrors[s.shotNo]))
                 }
                 PersistenceActionExecutor.writeShotsBatch(dao, AppGraph.storageGuard, e, newShots, "gen_shots")
                 val noAssetNote = if (catalog.isEmpty())

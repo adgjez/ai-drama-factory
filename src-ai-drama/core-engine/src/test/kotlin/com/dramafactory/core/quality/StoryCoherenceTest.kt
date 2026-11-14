@@ -33,6 +33,29 @@ class StoryCoherenceTest {
     }
 
     @Test
+    fun 旁白交代时间推移或同场景换光源不误报() {
+        // 用户实际遇到的误报：同一间办公室，傍晚→夜晚已由旁白交代，电脑蓝光换成手机光不应再报冲突。
+        val shots = listOf(
+            AiStoryboardDirector.Shot(1, "女秘书敲键盘", durationSeconds = 8.0,
+                narration = "时间一分一秒地过去，不知不觉已经到晚上。",
+                sceneContext = "傍晚，办公室内，电脑屏幕蓝光映脸"),
+            AiStoryboardDirector.Shot(2, "手机屏幕亮起", durationSeconds = 6.0,
+                carryOver = "女秘书手持手机，屏幕显示信息，办公室环境不变",
+                sceneContext = "夜晚，办公室内，手机屏幕亮光")
+        )
+        val codes = StoryCoherence.validate(shots).map { it.code }
+        assertTrue("scene_context_conflict" !in codes, "旁白已明确交代时间流逝，不应误报")
+
+        // 同一时间段、同一地点，只是光源从电脑屏换成手机屏：不是场景冲突。
+        val sameTime = listOf(
+            shots[0],
+            shots[1].copy(sceneContext = "傍晚，办公室内，手机屏幕亮光")
+        )
+        assertTrue("scene_context_conflict" !in StoryCoherence.validate(sameTime).map { it.code },
+            "同一场景换光源属于正常拍法，不应报冲突")
+    }
+
+    @Test
     fun 跨镜缺少场景上下文应报错() {
         val shots = listOf(
             AiStoryboardDirector.Shot(1, "站在门外", durationSeconds = 6.0, sceneContext = "雨夜，院门外，昏暗"),
