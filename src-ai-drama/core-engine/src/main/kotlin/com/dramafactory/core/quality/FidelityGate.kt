@@ -71,6 +71,8 @@ object FidelityGate {
         expectedIndex: Int? = null,
         baselineState: Map<String, String>? = null,
         visual: Boolean = false,
+        /** ★第二批 P0（B-G1）：生产端置 true——空 catalog 不再放行资产校验，改为「有绑定资产即报错」 */
+        requireCatalog: Boolean = false,
     ): GateReport {
         val sid = entry.shotId
         val report = mutableListOf<Issue>()
@@ -86,7 +88,7 @@ object FidelityGate {
             add("error", "gate_no_asset_bound", "该镜没有绑定任何资产：首尾帧无法做图像条件绑定")
         } else {
             for (aid in entry.associateAssetIds) {
-                if (catalogApprovedIds.isNotEmpty() && aid !in catalogApprovedIds) {
+                if ((requireCatalog || catalogApprovedIds.isNotEmpty()) && aid !in catalogApprovedIds) {
                     add("error", "gate_asset_not_real", "绑定资产 $aid 不在 catalog['approved'] 中：禁止编造资产 ID")
                 }
             }

@@ -367,7 +367,9 @@ class QueueViewModel(private val episodeId: String) : ViewModel() {
                 runCatching {
                     val shot = AppGraph.dao.shotKeyframes(shotId) ?: AppGraph.dao.shotsOf(epId).firstOrNull { it.shot_id == shotId }
                     val refIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
+                    // ★第二批 P0：被 QC 判 rejected 的资产不得进参考图（与渲染侧 approved 过滤口径一致）
                     val all = AppGraph.dao.assetsAllOf(projectId)
+                        .filter { it.audit_state != "rejected" }
                     // v1.7.21：改走 AssetCatalog.resolveRefUris —— 引用母卡时展开其参考图套装
                     // （front_bust 优先、单角色最多 2 张），否则 v1.7.20 生成的 4 张参考图
                     // 一张都进不了渲染，锁脸还是只靠母卡那一张图。

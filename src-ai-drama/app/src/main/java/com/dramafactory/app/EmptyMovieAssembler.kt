@@ -16,6 +16,9 @@ internal object EmptyMovieAssembler : MovieAssembler {
     override suspend fun assemble(
         clips: List<File>, output: File,
         grade: MovieAssembler.ColorGradePreset,
+        subtitles: List<MovieAssembler.SubtitleCue>,
+        bgm: File?,
+        loudnessNormalize: Boolean,
     ): MovieAssembler.AssembleResult =
         MovieAssembler.AssembleResult.Failure(
             MovieAssembler.Strategy.CONCAT_COPY, "ffmpeg-kit 未初始化，请使用云端合成")

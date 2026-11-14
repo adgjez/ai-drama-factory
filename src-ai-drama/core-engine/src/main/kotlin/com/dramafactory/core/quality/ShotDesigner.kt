@@ -22,6 +22,13 @@ object ShotDesigner {
     const val MIN_SECONDS = 4.0
     const val MAX_SECONDS = 10.0
 
+    /** 中文台词平均语速（字/秒，含标点停顿的保守值）。 */
+    private const val CHARS_PER_SECOND = 4.8
+    /** 英文单词平均朗读时长（秒/词）。 */
+    private const val SECONDS_PER_WORD = 0.35
+    /** 开口前的换气/起句余量。 */
+    private const val SPEECH_LEAD_SECONDS = 0.4
+
     private fun durationFor(function: ShotFunction): Double = when (function) {
         ShotFunction.HOOK -> 6.0
         ShotFunction.ESTABLISHING -> 7.0
@@ -43,6 +50,25 @@ object ShotDesigner {
         "近景" to Regex("近景"),
         "特写" to Regex("特写"),
     )
+
+    /**
+     * 估算台词/旁白的朗读时长（秒）：中文按 4.8 字/秒，英文单词按 0.35 秒/词，另加 0.4 秒起句余量。
+     * 用于两处：分镜时长至少能容纳台词；StoryCoherence 提示「台词塞不进去」的镜头。
+     */
+    fun spokenSeconds(vararg texts: String?): Double {
+        var cjk = 0
+        var words = 0
+        for (text in texts) {
+            val s = text?.trim().orEmpty()
+            if (s.isEmpty()) continue
+            for (ch in s) {
+                if (ch.isWhitespace() || ch in "，。！？、；：“”‘’《》…—,.!?;:\"'()（）") continue
+                if (ch.code in 0x4E00..0x9FFF || ch.code in 0x3400..0x4DBF) cjk++ else words++
+            }
+        }
+        if (cjk == 0 && words == 0) return 0.0
+        return cjk / CHARS_PER_SECOND + words * SECONDS_PER_WORD + SPEECH_LEAD_SECONDS
+    }
 
     /** 从视觉指令/动作里解析景别；解析不到返回 null。 */
     fun shotSizeOf(shot: AiStoryboardDirector.Shot): String? =
@@ -76,7 +102,12 @@ object ShotDesigner {
                 else -> ShotFunction.DEFAULT
             }
         }
-        val durations = avoidMonotony(functions.map { durationFor(it) })
+        val durations = avoidMonotony(ordered.mapIndexed { index, shot ->
+            val base = durationFor(functions[index])
+            // 台词/旁白长的镜头不能按固定秒数切：至少给足朗读时长，否则成片会加速或截断台词。
+            val spoken = spokenSeconds(shot.dialogue, shot.narration)
+            (if (spoken > 0.0) maxOf(base, spoken) else base).coerceIn(MIN_SECONDS, MAX_SECONDS)
+        })
         return ordered.mapIndexed { index, shot -> shot.copy(durationSeconds = durations[index]) }
     }
 

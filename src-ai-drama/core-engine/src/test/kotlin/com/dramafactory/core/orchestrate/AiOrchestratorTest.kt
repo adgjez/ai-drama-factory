@@ -1,6 +1,7 @@
 package com.dramafactory.core.orchestrate
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlin.test.*
 
 /**
@@ -10,9 +11,9 @@ import kotlin.test.*
  */
 class AiOrchestratorTest {
 
+    /** 断言必须冒泡：旧实现用 Thread + join，失败只进 system-err，JUnit 仍报 PASSED（假通过）。 */
     private fun runSuspend(block: suspend () -> Unit) {
-        val t = Thread { runBlocking { block() } }
-        t.start(); t.join(15_000)
+        runBlocking { withTimeout(15_000) { block() } }
     }
 
     private fun makeOkOrchestrator(): DefaultAiOrchestrator {

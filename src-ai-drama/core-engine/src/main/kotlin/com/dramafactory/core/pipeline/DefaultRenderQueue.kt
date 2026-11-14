@@ -62,6 +62,10 @@ class DefaultRenderQueue(
     var fidelityGateEntryProvider: suspend (shotId: String) -> StoryboardGate.Entry? = { _ -> null },
     /** catalog 已批准资产集合（FidelityGate A.1 资产真实校验用） */
     var catalogApprovedIdsProvider: suspend (episodeId: String) -> Set<String> = { _ -> emptySet() },
+    /** ★第二批 P0（B-G1）：严格目录模式。批准集合为空时也逐资产校验（fail-closed），
+     *  防止「没有任何已批准资产」时整条资产校验被短路跳过。生产端（AppGraph 接线）置 true；
+     *  默认 false 保持既有单测/旧调用行为。 */
+    var catalogStrict: Boolean = false,
     /** 整集六铁律是否未通过（读 shots.sb_check；有 error → 整集中止）。null=未配置(放行) */
     var storyboardBlockedProvider: suspend (episodeId: String) -> Boolean? = { _ -> null },
     /** 开场帧重渲染（不去头改重渲染）：返回重渲染后首帧 URI；null=用原始 first（逃生开关） */
@@ -223,6 +227,7 @@ class DefaultRenderQueue(
                     catalogApprovedIds = catIds,
                     submittedDuration = if (shotDuration > 0.0) shotDuration else gateEntry.panel.duration,
                     expectedIndex = gateEntry.index,
+                    requireCatalog = catalogStrict,
                 )
                 if (gr.blocked) {
                     val reason = gr.issues.filter { it.severity == "error" }

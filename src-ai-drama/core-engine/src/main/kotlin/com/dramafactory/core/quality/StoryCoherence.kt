@@ -110,6 +110,7 @@ object StoryCoherence {
     //   rhythm_monotone      连续 3 镜以上同景别 → 空间层次丢失
     //   rhythm_flat          连续 4 镜以上同时长 → 成片匀速像 PPT
     //   establishing_missing 场次切换后的首镜不是全景/中景 → 空间没交代
+    //   dialogue_pace        台词/旁白朗读时长超过镜头时长 → 成片会被加速或截断
     // 这些码不在 AiStoryboardDirector 的修复清单里，分镜页按软提示显示，不阻断渲染。
     // ---------------------------------------------------------------------
     private fun designIssues(shots: List<AiStoryboardDirector.Shot>): List<Issue> {
@@ -137,6 +138,18 @@ object StoryCoherence {
                 if (run >= 4)
                     issues += Issue("rhythm_flat", shots[durationStart].shotNo, "连续${run}镜同为${shots[durationStart].durationSeconds}秒，节奏偏平")
                 durationStart = i
+            }
+        }
+
+        for (shot in shots) {
+            val spoken = ShotDesigner.spokenSeconds(shot.dialogue, shot.narration)
+            if (spoken > 0.0 && shot.durationSeconds > 0.0 && shot.durationSeconds < spoken - 0.8) {
+                issues += Issue(
+                    "dialogue_pace",
+                    shot.shotNo,
+                    "台词/旁白约" + String.format(java.util.Locale.US, "%.1f", spoken) +
+                        "秒，镜头仅" + String.format(java.util.Locale.US, "%.1f", shot.durationSeconds) + "秒，建议加长或拆镜",
+                )
             }
         }
 

@@ -89,4 +89,16 @@ class StoryCoherenceTest {
         val codes = StoryCoherence.validate(shots).map { it.code }
         assertTrue("establishing_missing" in codes, "换场后首镜用特写应给建立镜头提示，实际：$codes")
     }
+
+    @Test
+    fun 台词塞不进镜头时长时给语义节奏软提示() {
+        val longLine = "你早就知道这间办公室的每一份合同都经不起查，对吗？我给了你三年时间"
+        val tight = AiStoryboardDirector.Shot(1, "她坐着", durationSeconds = 5.0,
+            dialogue = longLine, sceneContext = "夜晚，办公室内")
+        val codes = StoryCoherence.validate(listOf(tight)).map { it.code }
+        assertTrue("dialogue_pace" in codes, "台词约 7 秒但镜头只有 5 秒，应给软提示，实际：$codes")
+        val roomy = tight.copy(durationSeconds = 10.0)
+        assertTrue("dialogue_pace" !in StoryCoherence.validate(listOf(roomy)).map { it.code },
+            "镜头给到 10 秒足够容纳台词，不应提示")
+    }
 }

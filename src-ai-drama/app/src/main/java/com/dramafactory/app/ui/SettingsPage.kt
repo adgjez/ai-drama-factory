@@ -545,17 +545,19 @@ fun VideoParamsBlock(vm: SettingsViewModel) {
                 .indexOfFirst { it.second == (p.width ?: 448) && it.third == (p.height ?: 832) }
                 .takeIf { it >= 0 } ?: 0)
     }
-    var frames by remember(p.numFrames) { mutableStateOf((p.numFrames ?: 121).toString()) }
+    // ★第二批 P0（C-G1）：空 = 跟随分镜逐镜时长；旧实现保存时无条件写 121 帧，把所有镜钉死 5.04s。
+    var frames by remember(p.numFrames) { mutableStateOf(p.numFrames?.toString() ?: "") }
     var fps by remember(p.frameRate) { mutableStateOf((p.frameRate ?: 24f).toString()) }
     var savedTip by remember { mutableStateOf(false) }
 
     fun save() {
         val (_, w, h) = com.dramafactory.core.model.VideoParams.PRESETS[presetIdx]
-        val nf = frames.trim().toIntOrNull()
+        // 帧数留空 = 不覆盖逐镜时长（DefaultRenderQueue 用 numFramesForDuration 按 shot.duration_seconds 算 8n+1）
+        val nf = frames.trim().takeIf { it.isNotEmpty() }?.toIntOrNull()
         val fr = fps.trim().toFloatOrNull()
         vm.setVideoParams(com.dramafactory.core.model.VideoParams(
             width = w, height = h,
-            numFrames = nf?.coerceIn(17, 441),
+            numFrames = nf?.coerceIn(9, 441),
             frameRate = fr?.coerceIn(1f, 60f)))
         vm.saveVideoParams()
         savedTip = true
@@ -579,7 +581,7 @@ fun VideoParamsBlock(vm: SettingsViewModel) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 OutlinedTextField(
                     value = frames, onValueChange = { frames = it; savedTip = false },
-                    label = { Text("时长帧数 (8n+1)") }, singleLine = true,
+                    label = { Text("时长帧数 (8n+1，留空=按分镜)") }, singleLine = true,
                     modifier = Modifier.weight(1f),
                 )
                 OutlinedTextField(

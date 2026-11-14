@@ -55,6 +55,27 @@ class ShotDesignerTest {
     }
 
     @Test
+    fun refine_长台词镜头会被加长到容纳朗读时长() {
+        val longLine = "时间一分一秒地过去，不知不觉已经到晚上，窗外最后一点天光也沉了下去，办公室里只剩下键盘的声音"
+        val shots = listOf(shot(1, "她坐在办公桌前，看着屏幕", dialogue = longLine))
+        val refined = ShotDesigner.refine(shots)
+        val seconds = refined.single().durationSeconds
+        val spoken = ShotDesigner.spokenSeconds(longLine)
+        assertTrue(spoken >= 8.0, "长台词朗读时长应超过 8 秒：$spoken")
+        assertTrue(seconds >= 8.0, "镜头时长必须容纳台词朗读（实际 ${seconds}s，朗读 ${spoken}s）")
+        assertTrue(seconds <= ShotDesigner.MAX_SECONDS, "不能超过 10 秒上限")
+    }
+
+    @Test
+    fun spokenSeconds_按中英文与空值估算() {
+        assertEquals(0.0, ShotDesigner.spokenSeconds(null, "  "))
+        val twentyFour = "一二三四五六七八九十一二三四五六七八九十一二三四"
+        assertEquals(5.4, ShotDesigner.spokenSeconds(twentyFour), 0.01)
+        assertTrue(ShotDesigner.spokenSeconds("Hello world") > 0.0)
+        assertTrue(ShotDesigner.spokenSeconds(twentyFour, "Hello") > ShotDesigner.spokenSeconds(twentyFour))
+    }
+
+    @Test
     fun shotSizeOf_按顺序解析景别() {
         assertEquals("大特写", ShotDesigner.shotSizeOf("大特写，瞳孔收缩"))
         assertEquals("中景", ShotDesigner.shotSizeOf("中景缓推，人物居左"))

@@ -17,6 +17,7 @@ import com.dramafactory.app.storage.StorageState
 import com.dramafactory.core.assemble.MovieAssembler
 import com.dramafactory.core.assemble.MovieAssemblerImpl
 import com.dramafactory.core.assemble.androidFfmpegKitExecutor
+import com.dramafactory.core.assemble.androidFfmpegKitProbe
 import com.dramafactory.core.model.ChatRequest
 import com.dramafactory.core.pipeline.DefaultBudgetGuard
 import com.dramafactory.core.provider.AgnesProvider
@@ -314,33 +315,88 @@ object AppGraph {
         // v1.6.9 修：assemble 内部 executor 用 CountDownLatch.await 阻塞等 ffmpeg，
         // 必须在 IO 线程跑，否则在 Dispatchers.Main 上调用会 ANR/闪退。
         val res = runCatching {
+            // ★第二批 P0-D1：按数字 shot_no 排序（shot_id 字典序会把 shot10 排到 shot2 前）。
+            val shotNoById = runCatching {
+                dao.shotsOf(episodeId).associate { it.shot_id to it.shot_no }
+            }.getOrDefault(emptyMap())
             val tasks = dao.renderTasksOf(episodeId)
                 .filter { it.state == "COMPLETED" && !it.local_file_uri.isNullOrBlank() }
-                .sortedBy { it.shot_id }
-            val clips = tasks.mapNotNull { java.io.File(it.local_file_uri ?: "") }
-                .filter { it.exists() && it.length() > 0L }
-            if (clips.isEmpty()) return@runCatching null
-            val outDir = java.io.File(ctx.cacheDir, "movies")
-            if (!outDir.exists()) outDir.mkdirs()
-            val out = java.io.File(outDir, "$episodeId.mp4")
-            withContext(kotlinx.coroutines.Dispatchers.IO) { composer.assemble(clips, out) } to out
+                .sortedWith(
+                    compareBy<com.dramafactory.app.data.RenderTaskEntity> {
+                        shotNoById[it.shot_id] ?: Int.MAX_VALUE
+                    }.thenBy { it.shot_id })
+            val entries = tasks.mapNotNull { t ->
+                val f = java.io.File(t.local_file_uri ?: "")
+                if (f.exists() && f.length() > 0L) t to f else null
+            }
+            if (entries.isEmpty()) return@runCatching null
+            val clips = entries.map { it.second }
+            // ★第二批 P0：按镜头真实时长/台词生成 sidecar 字幕轨；成片统一做响度归一化。
+            val shotsById = runCatching { dao.shotsOf(episodeId).associateBy { it.shot_id } }
+                .getOrDefault(emptyMap())
+            val transitionSeconds = 0.30
+            var cursorMs = 0L
+            val cues = mutableListOf<com.dramafactory.core.assemble.MovieAssembler.SubtitleCue>()
+            entries.forEachIndexed { index, (task, clip) ->
+                val shot = shotsById[task.shot_id]
+                // ★第二批 P0-D2：优先用 MediaMetadataRetriever 读到的真实镜长，DB 的 duration_seconds 仅兜底
+                val durMs = com.dramafactory.app.videoDurationMs(clip)
+                    ?: (((shot?.duration_seconds?.takeIf { it > 0.0 } ?: 5.0) * 1000).toLong())
+                val text = listOfNotNull(
+                    shot?.dialogue?.takeIf { it.isNotBlank() },
+                    shot?.narration?.takeIf { it.isNotBlank() },
+                ).joinToString(" / ")
+                if (text.isNotBlank() && durMs > 250L) {
+                    // 转场区间会让两句字幕打架：后一镜起点让出前一次重叠，避免字幕叠字。
+                    val start = (cursorMs + 150L).coerceAtLeast(0L)
+                    val end = (cursorMs + durMs - 100L -
+                        (if (index > 0) (transitionSeconds * 1000).toLong() else 0L))
+                        .coerceAtLeast(start + 1L)
+                    cues += com.dramafactory.core.assemble.MovieAssembler.SubtitleCue(
+                        text = text, startMs = start, endMs = end)
+                }
+                cursorMs += durMs
+            }
+            // ★第二批 P0-D2：成片统一落 filesDir/movies（cacheDir 会被系统清理）
+            val out = FilmPaths.film(ctx, episodeId)
+            withContext(kotlinx.coroutines.Dispatchers.IO) {
+                composer.assemble(
+                    clips, out,
+                    com.dramafactory.core.assemble.MovieAssembler.AssembleOptions(
+                        subtitles = cues,
+                        loudnessNormalize = true,
+                        transition = com.dramafactory.core.assemble.MovieAssembler.Transition.FADE,
+                        transitionSeconds = transitionSeconds,
+                    ),
+                )
+            } to out
         }.getOrNull() ?: return null
-        val out = res.second
         return runCatching {
             when (val r = res.first) {
                 is com.dramafactory.core.assemble.MovieAssembler.AssembleResult.Success -> {
-                    if (r.output.exists()) {
+                    // ★第二批 P0-D3/D2：Success.output 才是真实成片（可能是 _norm.mp4），统一落库到 films/movies。
+                    val finalFilm = FilmPaths.persistFilm(ctx, episodeId, r.output) ?: return@runCatching null
+                    r.subtitleFile?.takeIf { it.exists() }?.let { srt ->
+                        runCatching {
+                            val dst = FilmPaths.subtitle(ctx, episodeId)
+                            if (srt.absolutePath != dst.absolutePath) srt.copyTo(dst, overwrite = true)
+                        }
+                    }
+                    if (r.warnings.isNotEmpty()) {
+                        Log.w("AppGraph", "composeFilmIfReady warnings: " + r.warnings.joinToString("; "))
+                    }
+                    if (finalFilm.exists() && finalFilm.length() > 0L) {
                         runCatching {
                             movieLibraryDao.upsertFilmOf(
                                 com.dramafactory.app.data.FinishedFilmEntity(
                                     film_id = episodeId, episode_id = episodeId,
                                     project_id = episodeId.substringBefore("_ep"),
-                                    filePath = out.absolutePath, fileSize = out.length(),
+                                    filePath = finalFilm.absolutePath, fileSize = finalFilm.length(),
                                     durationMs = (r.durationSeconds * 1000).toLong(),
                                     createdAt = System.currentTimeMillis(),
                                 ))
                         }
-                        out
+                        finalFilm
                     } else null
                 }
                 else -> null
@@ -595,7 +651,10 @@ object AppGraph {
             // 保证 initialized=true 之前内存已是持久值，避免任何 UI 首帧读到默认 agnes 再跳变。
 
             try {
-                movieAssembler = MovieAssemblerImpl(executor = androidFfmpegKitExecutor())
+                movieAssembler = MovieAssemblerImpl(
+                    executor = androidFfmpegKitExecutor(),
+                    probe = androidFfmpegKitProbe(),
+                )
             } catch (t: Throwable) {
                 Log.e("AppGraph", "movieAssembler init failed", t)
             }
@@ -609,6 +668,64 @@ object AppGraph {
     /** T014：Room 初始化失败时的空 MovieAssembler 兜底。 */
     var roomInitError: String? = null; private set
 
+}
+
+/**
+ * ★第二批 P0-D2：成片与字幕的唯一落盘路径（filesDir/movies）。
+ *
+ * 之前自动合成写 cacheDir/movies、手动合成写 filesDir/movies、预览/分享又读 cacheDir/{ep}.mp4，
+ * 三处不一致导致「自动合成后预览/分享报未合成」，且 cacheDir 被系统清理后成片直接丢失。
+ * 这里统一为 filesDir/movies，分享时再复制到 cacheDir（FileProvider 白名单走 cache）。
+ */
+internal object FilmPaths {
+    fun moviesDir(ctx: Context): java.io.File =
+        java.io.File(ctx.filesDir, "movies").also { if (!it.exists()) it.mkdirs() }
+
+    fun film(ctx: Context, episodeId: String): java.io.File =
+        java.io.File(moviesDir(ctx), "$episodeId.mp4")
+
+    fun subtitle(ctx: Context, episodeId: String): java.io.File =
+        java.io.File(moviesDir(ctx), "$episodeId.srt")
+
+    /** 兼容历史版本：先找 filesDir/movies，再回退旧的 cacheDir 位置。 */
+    fun resolveExisting(ctx: Context, episodeId: String): java.io.File? =
+        listOf(
+            film(ctx, episodeId),
+            java.io.File(ctx.cacheDir, "movies/$episodeId.mp4"),
+            java.io.File(ctx.cacheDir, "$episodeId.mp4"),
+        ).firstOrNull { it.exists() && it.length() > 0L }
+
+    /** 把 assembler 的真实输出（可能是 _norm.mp4）落到约定路径；返回最终成片。 */
+    fun persistFilm(ctx: Context, episodeId: String, src: java.io.File): java.io.File? {
+        if (!src.exists() || src.length() <= 0L) return null
+        val dst = film(ctx, episodeId)
+        if (src.absolutePath == dst.absolutePath) return dst
+        return runCatching {
+            val tmp = java.io.File(dst.parentFile, dst.name + ".tmp")
+            src.copyTo(tmp, overwrite = true)
+            if (dst.exists()) dst.delete()
+            if (!tmp.renameTo(dst)) {
+                tmp.copyTo(dst, overwrite = true)
+                tmp.delete()
+            }
+            if (dst.exists() && dst.length() > 0L) dst else src
+        }.getOrElse { src }
+    }
+}
+
+/** ★第二批 P0：用系统 MediaMetadataRetriever 读视频真实时长（毫秒），失败返回 null。 */
+internal fun videoDurationMs(file: java.io.File): Long? {
+    if (!file.exists() || file.length() <= 0L) return null
+    val retriever = android.media.MediaMetadataRetriever()
+    return try {
+        retriever.setDataSource(file.absolutePath)
+        retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
+            ?.toLongOrNull()?.takeIf { it > 0L }
+    } catch (t: Throwable) {
+        null
+    } finally {
+        runCatching { retriever.release() }
+    }
 }
 
 // ---- 文本 Provider 解析（文件级纯函数，便于 JVM 单测，不触发 object AppGraph 的 init）----

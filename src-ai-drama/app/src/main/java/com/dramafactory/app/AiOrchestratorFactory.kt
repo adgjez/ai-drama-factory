@@ -21,6 +21,18 @@ import com.dramafactory.core.orchestrate.PipelineStage5
  * 写后按精确 ID 读回并比对关键字段，任一步失败抛 [PersistenceWriteException] 使
  * [DefaultAiOrchestrator] 的 PipelineRun 进入失败契约（success=false），禁止半成功报告。
  */
+/** ★第二批 P0（B-G5）：审计早退（无图/无 Key/取图解码失败/异常）也必须把结论落库，
+ *  否则上一轮可能残留的 approved 会继续让脏图进渲染参考。 */
+private suspend fun AppGraph.markAssetAuditPending(assetId: String, reason: String) {
+    runCatching {
+        dao.setAssetQuality(
+            assetId = assetId, qualityScore = null, auditState = "pending",
+            defectsJson = null, rejectReason = reason, g1ErrorCode = null,
+            faceRatio = null, poseRole = null, updatedAt = System.currentTimeMillis(),
+        )
+    }
+}
+
 internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
     DefaultAiOrchestrator(
         activeTextModelIdProvider = { textModelRouter.activeTextModelId() },
@@ -112,19 +124,31 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
         auditAsset = { asset ->
             // ★F2 修复：真实质量审计——调用 AssetAuditor.audit（G1 文件级硬校验 + G2 多模态打分），
             // 替换原直接返回 passed=true 的「假通过」（原实现关闭了 PRD F03 两层闸门）。
-            // 未生成图像/未配置 Key 时不阻断流水线，但明确标注未审计（audit_skipped_*）。
+            // ★第二批 P0 fail-closed：未生成图像/未配置 Key/取图解码失败 = 审核未通过（passed=false），
+            // 由编排器重新生成后再审；不再静默放行。
             // 注意：λ 返回类型必须是 Result<AuditResult>，故整体包在 runCatching 内；
             // 异常会变为 Result.failure，由编排器 AUDIT 阶段按「未过」处理（WARN 标红放行）。
             runCatching {
                 val remoteUrl = runCatching { dao.assetRemoteUrl(asset.assetId) }.getOrNull()
-                val llmReady = agnesKeyReady()
-                if (remoteUrl.isNullOrBlank() || !llmReady) {
-                    return@runCatching DefaultAiOrchestrator.AuditResult(passed = true, reason = "audit_skipped_no_image_or_key")
+                // ★第二批 P0 fail-closed："没法审" 不再等于 "通过"。
+                // 旧实现无图/无 Key/取图失败/解码失败一律 passed=true，等于关掉质量闸；
+                // 现在一律 passed=false，由编排器走「重新生成→再审」循环；仍不过则 rejected，渲染永不引用。
+                if (remoteUrl.isNullOrBlank()) {
+                    markAssetAuditPending(asset.assetId, "audit_no_image")
+                    return@runCatching DefaultAiOrchestrator.AuditResult(passed = false, reason = "audit_no_image")
+                }
+                if (!agnesKeyReady()) {
+                    markAssetAuditPending(asset.assetId, "audit_no_key")
+                    return@runCatching DefaultAiOrchestrator.AuditResult(passed = false, reason = "audit_no_key")
                 }
                 val bytes = MediaHelpers.fetchImageBytes(remoteUrl)
-                    ?: return@runCatching DefaultAiOrchestrator.AuditResult(passed = true, reason = "audit_image_fetch_failed")
+                    ?: return@runCatching DefaultAiOrchestrator.AuditResult(passed = false, reason = "audit_image_fetch_failed").also {
+                        markAssetAuditPending(asset.assetId, "audit_image_fetch_failed")
+                    }
                 val dataUri = MediaHelpers.downscaleToDataUri(bytes)
-                    ?: return@runCatching DefaultAiOrchestrator.AuditResult(passed = true, reason = "audit_image_decode_failed")
+                    ?: return@runCatching DefaultAiOrchestrator.AuditResult(passed = false, reason = "audit_image_decode_failed").also {
+                        markAssetAuditPending(asset.assetId, "audit_image_decode_failed")
+                    }
                 val describer = com.dramafactory.core.quality.AssetAuditor.agnesDescriber(agnes, "")
                 val engine = com.dramafactory.app.ui.QualityEngine()
                 val outcome = engine.auditAsset(
@@ -152,7 +176,7 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                     score = outcome.qualityScore,
                     reason = outcome.rejectReason,
                 )
-            }
+            }.onFailure { markAssetAuditPending(asset.assetId, it.message ?: "audit_exception") }
         },
         generateShots = { pid, script, _ ->
             runCatching {
@@ -161,7 +185,8 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                 // 第十五轮：从 DB 拉本项目已抽取/已生成的资产注入 LLM，让分镜用 asset_id 引用
                 val assets = runCatching { dao.assetsAllOf(pid) }.getOrDefault(emptyList())
                 // v1.7.17：与 StoryboardViewModel 共用同一套目录构造规则
-                val catalog = com.dramafactory.app.ui.AssetCatalog.build(assets)
+                // ★第二批 P0：AI 流水线的分镜目录只用已获批资产（审计阶段先于分镜）
+                val catalog = com.dramafactory.app.ui.AssetCatalog.build(assets, onlyApproved = true)
                 val r = com.dramafactory.core.quality.AiStoryboardDirector.generate(
                     script, chat = { req -> tp.chat(req) }, assets = catalog)
                 r.shots.map { s ->
@@ -179,6 +204,17 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                         durationSeconds = s.durationSeconds,
                     )
                 }
+            }
+        },
+        // ★第二批 P0：自动关键帧阶段——分镜落库后逐镜合成首帧并做尾帧接力。
+        // 失败/无参考图时返回 0，编排器只发 WARN，渲染侧回落原始首帧逻辑。
+        generateKeyframes = { episodeId, shots ->
+            try {
+                com.dramafactory.app.ui.RenderRuntime.synthesizeEpisodeKeyframes(episodeId, shots.size)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                0
             }
         },
         enqueueRender = { episodeId, shots ->

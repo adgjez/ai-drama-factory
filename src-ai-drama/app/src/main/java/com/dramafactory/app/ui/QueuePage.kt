@@ -339,6 +339,7 @@ internal val SOFT_SB_CHECK_CODES = setOf(
     "rhythm_monotone",
     "rhythm_flat",
     "establishing_missing",
+    "dialogue_pace",
 )
 
 /** gateErrors → sb_check 持久化值：硬错误写 error:（渲染闸拦截），软提示写 warn:（界面黄色提示）。 */
@@ -370,6 +371,7 @@ internal fun sbCheckLabel(code: String) = when (code) {
     "rhythm_monotone" -> "连续多镜同一景别（建议拉开景别层次，仅提示）"
     "rhythm_flat" -> "连续多镜同一时长（建议做节奏变化，仅提示）"
     "establishing_missing" -> "场次切换后缺少建立镜头（建议先给全景/中景，仅提示）"
+    "dialogue_pace" -> "台词/旁白朗读时长超过镜头（建议加长或拆镜，仅提示）"
     "scene_context_conflict" -> "画面描述与上一镜场景不连续（仅提示，不阻断渲染）"
     "scene_context_missing" -> "缺少场景上下文：请补充时间、空间、天气"
     "beat_ref_missing" -> "缺少剧本节拍来源"

@@ -204,8 +204,16 @@ interface DramaDao {
     @Query("UPDATE assets SET prompt=:prompt, updated_at=:updatedAt WHERE asset_id=:assetId")
     suspend fun updateAssetPrompt(assetId: String, prompt: String, updatedAt: Long)
 
-    /** 第十一轮：生成结果落盘（remote_url + file_uri 预留本地路径） */
-    @Query("UPDATE assets SET remote_url=:remoteUrl, updated_at=:updatedAt WHERE asset_id=:assetId")
+    /** 第十一轮：生成结果落盘（remote_url + file_uri 预留本地路径）。
+     *  ★第二批 P0（B-G7）：重生成会换图，旧图的审计结论必须同步作废，
+     *  否则新图审计失败/未审时仍带 approved 被渲染引用。 */
+    @Query("""
+        UPDATE assets SET remote_url=:remoteUrl, audit_state='pending', quality_score=NULL,
+        defects_json=NULL, q_reject_reason=NULL, g1_error_code=NULL, face_ratio=NULL,
+        g1_state='none', g2_score=NULL, g2_defects=NULL, review_state='none', reject_reason=NULL,
+        updated_at=:updatedAt
+        WHERE asset_id=:assetId
+    """)
     suspend fun setAssetRemoteUrl(assetId: String, remoteUrl: String, updatedAt: Long)
 
     /** ★F2 修复：读单资产的生成图 remote_url，供 AI 管线质量审计（AssetAuditor.audit）下载多模态打分。 */

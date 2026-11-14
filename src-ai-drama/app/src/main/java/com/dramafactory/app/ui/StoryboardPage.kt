@@ -58,6 +58,7 @@ private fun storyboardCheckLabel(code: String): String = when (code) {
     "rhythm_monotone" -> "连续多镜同一景别（建议拉开景别层次，仅提示）"
     "rhythm_flat" -> "连续多镜同一时长（建议做节奏变化，仅提示）"
     "establishing_missing" -> "场次切换后缺少建立镜头（建议先给全景/中景，仅提示）"
+    "dialogue_pace" -> "台词/旁白朗读时长超过镜头（建议加长或拆镜，仅提示）"
     "dialogue_not_verbatim" -> "台词与剧本原文不一致"
     "action_empty" -> "动作描述为空"
     "scene_context_conflict" -> "画面描述与上一镜场景不连续（仅提示，不阻断渲染）"

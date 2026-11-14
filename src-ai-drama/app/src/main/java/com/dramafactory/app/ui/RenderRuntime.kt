@@ -93,10 +93,12 @@ object RenderRuntime {
                     val pid = epId.substringBeforeLast("_ep")
                     runCatching { AppGraph.dao.assetsAllOf(pid) }.getOrNull()
                         // ★质量修复 G：被 QC 拒绝(REJECTED)的资产不算「已批准」，否则差图照样进保真闸/参考图
-                        ?.filter { it.audit_state != "rejected" }
+                        ?.filter { it.audit_state == "approved" }
                         ?.filter { !it.remote_url.isNullOrBlank() || !it.image_uri.isNullOrBlank() }
                         ?.map { it.asset_id }?.toSet() ?: emptySet()
                 },
+                // ★第二批 P0（B-G1）：严格目录模式——批准集合为空也必须逐资产校验，不再 fail-open
+                catalogStrict = true,
                 // 整集六铁律：任一镜 sb_check 含 error → 整集中止（fail-closed）
                 storyboardBlockedProvider = { epId ->
                     runCatching { AppGraph.dao.shotsOf(epId) }.getOrNull()?.let { shots ->
@@ -122,7 +124,7 @@ object RenderRuntime {
                             ?: AppGraph.dao.shotsOf(epId).firstOrNull { it.shot_id == shotId }
                         val refIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
                         // ★质量修复 G：拒绝态资产不再作为逐镜参考图（旧实现只看 URL 非空）
-                        val all = AppGraph.dao.assetsAllOf(projectId).filter { it.audit_state != "rejected" }
+                        val all = AppGraph.dao.assetsAllOf(projectId).filter { it.audit_state == "approved" }
                         AssetCatalog.resolveRefUris(all, refIds)
                             .ifEmpty { AssetCatalog.fallbackUris(all) }
                     }.getOrDefault(emptyList())
@@ -149,14 +151,14 @@ object RenderRuntime {
      * 这里在提交前用「场景底图 + 角色参考图」做一次 img2img，把电影开场静帧写回 first_image_uri
      * 以便复用与审计；任何一步失败返回 null，队列自动回落到原始 first 逻辑（绝不阻断渲染）。
      */
-    private suspend fun synthesizeOpeningFrame(shotId: String): String? = runCatching {
+    private suspend fun synthesizeOpeningFrame(shotId: String): String? = try {
         val dao = AppGraph.dao
         val epId = shotId.substringBeforeLast("_shot").takeIf { it.contains("_ep") } ?: shotId
         val shot = dao.shotKeyframes(shotId) ?: dao.shotsOf(epId).firstOrNull { it.shot_id == shotId }
         val existing = shot?.first_image_uri?.takeIf { it.isNotBlank() }
         if (existing != null) return@runCatching existing
         val projectId = epId.substringBeforeLast("_ep").ifBlank { epId }
-        val all = dao.assetsAllOf(projectId).filter { it.audit_state != "rejected" }
+        val all = dao.assetsAllOf(projectId).filter { it.audit_state == "approved" }
         val refIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
         val refUris = AssetCatalog.resolveRefUris(all, refIds)
             .ifEmpty { AssetCatalog.fallbackUris(all) }
@@ -193,9 +195,67 @@ object RenderRuntime {
                 prompt = prompt, inputImages = inputs))
         }
         val publicUrl = AppGraph.uploadImageToCloud(url)
-        runCatching { dao.setShotKeyframes(shotId, publicUrl, shot?.last_image_uri) }
+        try {
+            dao.setShotKeyframes(shotId, publicUrl, shot?.last_image_uri)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            // 单镜写库失败不阻断整集，返回 URL 供本次渲染兜底使用
+        }
         publicUrl
-    }.getOrNull()
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
+    } catch (_: Throwable) {
+        null
+    }
+
+    /**
+     * ★第二批 P0：编排器分镜落库后自动合成整集关键帧。
+     * 逐镜生成首帧（i2i，复用 [synthesizeOpeningFrame]），再做尾帧接力：
+     * 镜 N 的尾帧 = 镜 N+1 的首帧，保证图生视频首尾连续。
+     * 任何一镜失败只跳过该镜，绝不阻断流水线；返回成功合成的镜数。
+     */
+    suspend fun synthesizeEpisodeKeyframes(episodeId: String, maxShots: Int = 24): Int = try {
+        // 无可用图像 Key 时直接跳过：否则会逐镜走到 Provider 才失败，白跑 24 次（A-G4）
+        if (!AppGraph.agnesKeyReady()) return 0
+        val dao = AppGraph.dao
+        val shots = dao.shotsOf(episodeId).sortedBy { it.shot_no }
+            .take(maxShots.coerceAtLeast(1))
+        if (shots.isEmpty()) return 0
+        val byId = shots.associateBy { it.shot_id }
+        val firsts = LinkedHashMap<String, String>()
+        val freshlySynthesized = LinkedHashSet<String>()
+        for (shot in shots) {
+            val hadFirst = !shot.first_image_uri.isNullOrBlank()
+            val uri = synthesizeOpeningFrame(shot.shot_id)
+            if (!uri.isNullOrBlank()) {
+                firsts[shot.shot_id] = uri
+                if (!hadFirst) freshlySynthesized += shot.shot_id
+            }
+        }
+        val ids = shots.map { it.shot_id }
+        var written = 0
+        ids.forEachIndexed { i, sid ->
+            val first = firsts[sid] ?: return@forEachIndexed
+            // 尾帧接力：下一镜首帧优先；下一镜失败或末镜时保留本镜已有尾帧，
+            // 绝不把人工设置的尾帧覆盖成 null（A-G2）。
+            val nextFirst = ids.getOrNull(i + 1)?.let { firsts[it] }
+            val lastToUse = nextFirst ?: byId[sid]?.last_image_uri
+            try {
+                dao.setShotKeyframes(sid, first, lastToUse)
+                if (sid in freshlySynthesized) written++
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                // 写库失败即视为未合成，不虚报成功（A-G3）
+            }
+        }
+        written
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
+    } catch (_: Throwable) {
+        0
+    }
 
     /** UI/Service便捷入口 */
     fun queue(): DefaultRenderQueue = queueFor("default")

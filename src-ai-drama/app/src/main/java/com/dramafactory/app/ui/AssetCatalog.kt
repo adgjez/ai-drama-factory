@@ -33,13 +33,20 @@ object AssetCatalog {
      * - 排除判了重生成的卡：review_state == "regen"（用户已否决这张图）；
      * - kind 归一化：仅保留 character / scene / prop / local，未知值当 local。
      */
-    fun build(rows: List<AssetEntity>): List<com.dramafactory.core.quality.AiStoryboardDirector.AssetSnapshot> {
+    fun build(
+        rows: List<AssetEntity>,
+        /** ★第二批 P0：true 时只保留 audit_state=approved（AI 流水线，审计先于分镜）；false 时仍排除 rejected。 */
+        onlyApproved: Boolean = false,
+    ): List<com.dramafactory.core.quality.AiStoryboardDirector.AssetSnapshot> {
+        // ★第二批 P0：给 LLM 的目录不得包含被 QC 判 rejected 的资产
+        val usableRows = rows.filter { it.audit_state != "rejected" }
+            .let { list -> if (onlyApproved) list.filter { it.audit_state == "approved" } else list }
         // v1.7.21：「参考图已出图」的母卡——这些母卡即使自身无图也该进目录
-        val mothersBackedByRefs = rows.asSequence()
+        val mothersBackedByRefs = usableRows.asSequence()
             .filter { !it.parent_id.isNullOrBlank() && it.review_state != "regen" && uriOf(it) != null }
             .mapNotNull { it.parent_id }
             .toSet()
-        return rows.asSequence()
+        return usableRows.asSequence()
             .filter { it.asset_id.isNotBlank() }
             .filter { it.parent_id.isNullOrBlank() && it.pose_role.isNullOrBlank() }
             .filter { uriOf(it) != null || it.asset_id in mothersBackedByRefs }
