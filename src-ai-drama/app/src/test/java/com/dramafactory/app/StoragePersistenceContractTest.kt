@@ -324,6 +324,14 @@ class StoragePersistenceContractTest {
         override suspend fun setShotReferenceVideo(shotId: String, uri: String?) {}
         override suspend fun shotKeyframes(shotId: String): ShotEntity? = shots[shotId]
         override suspend fun shotReferenceVideo(shotId: String): String? = null
+        override suspend fun updateShotSceneInfo(shotId: String, sceneNo: Int, sceneTitle: String?, screenSide: String?, eyeline: String?) {
+            shots[shotId]?.let {
+                shots[shotId] = it.copy(scene_no = sceneNo, scene_title = sceneTitle, screen_side = screenSide, eyeline = eyeline)
+            }
+        }
+        override suspend fun setProjectBgm(projectId: String, bgmPath: String?, bgmVolume: Double) {
+            projects[projectId]?.let { projects[projectId] = it.copy(bgm_path = bgmPath, bgm_volume = bgmVolume) }
+        }
         override suspend fun upsertRenderTask(t: RenderTaskEntity) { renderTasks[t.shot_id] = t }
         override suspend fun renderTasksOf(ep: String): List<RenderTaskEntity> = renderTasks.values.filter { it.episode_id == ep }
         override suspend fun renderTask(shotId: String): RenderTaskEntity? = renderTasks[shotId]
