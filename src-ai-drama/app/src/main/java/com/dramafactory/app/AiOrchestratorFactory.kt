@@ -186,7 +186,12 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                 val assets = runCatching { dao.assetsAllOf(pid) }.getOrDefault(emptyList())
                 // v1.7.17：与 StoryboardViewModel 共用同一套目录构造规则
                 // ★第二批 P0：AI 流水线的分镜目录只用已获批资产（审计阶段先于分镜）
-                val catalog = com.dramafactory.app.ui.AssetCatalog.build(assets, onlyApproved = true)
+                // ★v1.10：审计不可用 / 旧资产审核态为 pending 时 approved 目录会为空，分镜将失去全部资产绑定；
+                // 回退到「未拒绝」目录（拒绝态仍排除），保证分镜有资产可绑。
+                val approvedCatalog = com.dramafactory.app.ui.AssetCatalog.build(assets, onlyApproved = true)
+                val catalog = approvedCatalog.ifEmpty {
+                    com.dramafactory.app.ui.AssetCatalog.build(assets, onlyApproved = false)
+                }
                 val r = com.dramafactory.core.quality.AiStoryboardDirector.generate(
                     script, chat = { req -> tp.chat(req) }, assets = catalog)
                 r.shots.map { s ->

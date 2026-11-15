@@ -138,7 +138,8 @@ fun QueuePage(
                     st.shotStates.values.count { it == "COMPLETED" } else snap.completedShots
                 val statFailed = st.shotStates.values.count { it == "FAILED" || it == "BLOCKED" }
                 val statPending = (statTotal - statCompleted - statFailed).coerceAtLeast(0)
-                Text("$epLabel · ${snap.completedShots}/${snap.totalShots} 镜完成",
+                // ★v1.10：头部进度改用本页逐镜事实（历史失败任务存在时 snapshot 可能为 0/0）
+                Text("$epLabel · $statCompleted/$statTotal 镜完成",
                     style = MaterialTheme.typography.titleMedium)
                 LinearProgressIndicator(
                     progress = { if (statTotal > 0) statCompleted.toFloat() / statTotal else 0f },

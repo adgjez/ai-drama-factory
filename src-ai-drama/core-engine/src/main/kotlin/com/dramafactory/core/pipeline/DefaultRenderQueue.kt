@@ -66,6 +66,12 @@ class DefaultRenderQueue(
      *  防止「没有任何已批准资产」时整条资产校验被短路跳过。生产端（AppGraph 接线）置 true；
      *  默认 false 保持既有单测/旧调用行为。 */
     var catalogStrict: Boolean = false,
+    /** ★v1.10：已拒绝（rejected）资产集合——质检拒绝的资产硬拦，不再进入渲染 */
+    var catalogRejectedIdsProvider: suspend (episodeId: String) -> Set<String> = { _ -> emptySet() },
+    /** ★v1.10：项目真实资产 ID 全集；null=未配置（退回仅 approved 判定） */
+    var catalogKnownIdsProvider: suspend (episodeId: String) -> Set<String>? = { _ -> null },
+    /** ★v1.10：未审核（pending）资产是否放行（warn 不阻断）。生产端置 true，避免旧资产把整集渲染全灭 */
+    var allowUnreviewedAssets: Boolean = true,
     /** 整集六铁律是否未通过（读 shots.sb_check；有 error → 整集中止）。null=未配置(放行) */
     var storyboardBlockedProvider: suspend (episodeId: String) -> Boolean? = { _ -> null },
     /** 开场帧重渲染（不去头改重渲染）：返回重渲染后首帧 URI；null=用原始 first（逃生开关） */
@@ -221,6 +227,8 @@ class DefaultRenderQueue(
             val gateEntry = runCatching { fidelityGateEntryProvider(shotId) }.getOrNull()
             if (gateEntry != null) {
                 val catIds = runCatching { catalogApprovedIdsProvider(episodeId) }.getOrNull() ?: emptySet()
+                val rejectedIds = runCatching { catalogRejectedIdsProvider(episodeId) }.getOrNull() ?: emptySet()
+                val knownIds = runCatching { catalogKnownIdsProvider(episodeId) }.getOrNull()
                 val gr = FidelityGate.gateShot(
                     entry = gateEntry,
                     motionPrompt = prompt,
@@ -228,6 +236,9 @@ class DefaultRenderQueue(
                     submittedDuration = if (shotDuration > 0.0) shotDuration else gateEntry.panel.duration,
                     expectedIndex = gateEntry.index,
                     requireCatalog = catalogStrict,
+                    catalogRejectedIds = rejectedIds,
+                    catalogKnownIds = knownIds,
+                    allowUnreviewedAssets = allowUnreviewedAssets,
                 )
                 if (gr.blocked) {
                     val reason = gr.issues.filter { it.severity == "error" }

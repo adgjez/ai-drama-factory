@@ -25,6 +25,9 @@ class DramaApplication : Application() {
         com.dramafactory.app.CrashLog.installCrashLogger(this)
         runCatching { AppGraph.init(this) }
             .onFailure { android.util.Log.e("DramaApplication", "AppGraph.init failed", it) }
+        // 调试桥（仅 debug 包）：127.0.0.1 只读 DB 查询，供开发期直接排查
+        runCatching { com.dramafactory.app.debug.DebugBridge.start() }
+            .onFailure { android.util.Log.w("DramaApplication", "DebugBridge start failed", it) }
         // 队列协程作用域接线（DefaultRenderQueue worker在此scope内运行）
         runCatching { RenderRuntime.bindScope(appScope) }
         // P1-6进程重启恢复：读checkpoint → repoll已提交镜 → 续跑队列（绝不重复扣费）

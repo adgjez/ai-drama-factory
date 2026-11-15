@@ -97,6 +97,22 @@ object RenderRuntime {
                         ?.filter { !it.remote_url.isNullOrBlank() || !it.image_uri.isNullOrBlank() }
                         ?.map { it.asset_id }?.toSet() ?: emptySet()
                 },
+                // ★v1.10：已拒绝资产集合（硬拦）与项目真实资产全集（编造 ID 识别）
+                catalogRejectedIdsProvider = { epId ->
+                    val pid = epId.substringBeforeLast("_ep")
+                    runCatching { AppGraph.dao.assetsAllOf(pid) }.getOrNull()
+                        ?.filter { it.audit_state == "rejected" }
+                        ?.filter { !it.asset_id.isNullOrBlank() }
+                        ?.map { it.asset_id }?.toSet() ?: emptySet()
+                },
+                catalogKnownIdsProvider = { epId ->
+                    val pid = epId.substringBeforeLast("_ep")
+                    runCatching { AppGraph.dao.assetsAllOf(pid) }.getOrNull()
+                        ?.filter { !it.asset_id.isNullOrBlank() }
+                        ?.map { it.asset_id }?.toSet() ?: emptySet()
+                },
+                // ★v1.10：未审核资产放行（只告警不阻断）——修复旧资产 audit_state=pending 导致整集渲染全灭
+                allowUnreviewedAssets = true,
                 // ★第二批 P0（B-G1）：严格目录模式——批准集合为空也必须逐资产校验，不再 fail-open
                 catalogStrict = true,
                 // 整集六铁律：任一镜 sb_check 含 error → 整集中止（fail-closed）
@@ -123,8 +139,9 @@ object RenderRuntime {
                         val shot = AppGraph.dao.shotKeyframes(shotId)
                             ?: AppGraph.dao.shotsOf(epId).firstOrNull { it.shot_id == shotId }
                         val refIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
-                        // ★质量修复 G：拒绝态资产不再作为逐镜参考图（旧实现只看 URL 非空）
-                        val all = AppGraph.dao.assetsAllOf(projectId).filter { it.audit_state == "approved" }
+                        // ★v1.10：参考图「只认 approved」放宽为「排除 rejected」——未审核资产不再让整集无参考图，
+                        // 质检拒绝的差图仍然硬隔离（配合 fidelity 闸的 gate_asset_rejected）
+                        val all = AppGraph.dao.assetsAllOf(projectId).filter { it.audit_state != "rejected" }
                         AssetCatalog.resolveRefUris(all, refIds)
                             .ifEmpty { AssetCatalog.fallbackUris(all) }
                     }.getOrDefault(emptyList())
@@ -159,7 +176,8 @@ object RenderRuntime {
         val existing = shot?.first_image_uri?.takeIf { it.isNotBlank() }
         if (existing != null) return existing
         val projectId = epId.substringBeforeLast("_ep").ifBlank { epId }
-        val all = dao.assetsAllOf(projectId).filter { it.audit_state == "approved" }
+        // ★v1.10：同参考图策略——未审核资产可用于开场帧合成，拒绝态仍然排除
+        val all = dao.assetsAllOf(projectId).filter { it.audit_state != "rejected" }
         val refIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
         val refUris = AssetCatalog.resolveRefUris(all, refIds)
             .ifEmpty { AssetCatalog.fallbackUris(all) }
