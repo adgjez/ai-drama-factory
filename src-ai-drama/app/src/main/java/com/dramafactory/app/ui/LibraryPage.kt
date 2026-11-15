@@ -49,6 +49,12 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.sp
+import android.media.MediaPlayer
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.saveable.rememberSaveable
+import kotlin.math.roundToInt
 
 /**
  * 成片库页（S7）：已完成集数列表 + 导出/分享（Android ACTION_SEND分享mp4）。
@@ -70,6 +76,67 @@ fun LibraryPage() {
     val bgmNames = remember { mutableStateMapOf<String, String?>() }
     // episodes 必须先声明：bgmPicker 回调里要按项目刷新各集 BGM 回显
     val episodes = remember { mutableStateOf<List<Triple<String, Int, Int>>>(emptyList()) }
+    // ★第四批：BGM 音量（项目级共享 projects.bgm_volume，0..1）与已落盘 BGM 绝对路径（试听/音量落库用）
+    val bgmVolumes = remember { mutableStateMapOf<String, Double>() }
+    val bgmPaths = remember { mutableStateMapOf<String, String?>() }
+    // ★第四批：BGM 试听——MediaPlayer 用数组槽位持有（同 vvHolder 思路，不把 Android 对象放进 Compose state）
+    val bgmPlayerHolder = remember { arrayOfNulls<MediaPlayer>(1) }
+    var playingBgmEp by remember { mutableStateOf<String?>(null) }
+    // ★第四批：音量防抖落库——拖动只改本地 state，停顿 350ms 后写一次数据库
+    var bgmVolSaveReq by remember { mutableStateOf(0) }
+    var bgmVolSaveTarget by remember { mutableStateOf<Triple<String, String?, Double>?>(null) }
+
+    // 停止试听并释放 MediaPlayer（可能尚未初始化/已释放，统一 runCatching 兜底）
+    fun stopBgmPreview() {
+        playingBgmEp = null
+        val mp = bgmPlayerHolder[0] ?: return
+        bgmPlayerHolder[0] = null
+        runCatching { mp.release() }
+    }
+
+    // 试听：本地 BGM 文件同步 prepare（本地小文件，主线程可接受）；任何失败都提示，不静默
+    fun startBgmPreview(epId: String) {
+        stopBgmPreview()
+        val file = bgmPaths[epId]?.takeIf { it.isNotBlank() }?.let { java.io.File(it) }
+        if (file == null || !file.exists() || file.length() <= 0L) {
+            shareMsg = "BGM 试听失败：本地 BGM 文件不存在，请重新选择 BGM"
+            return
+        }
+        val mp = MediaPlayer()
+        bgmPlayerHolder[0] = mp
+        val result = runCatching {
+            mp.setAudioAttributes(
+                android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build(),
+            )
+            mp.setDataSource(file.absolutePath)
+            mp.setOnCompletionListener { stopBgmPreview() }
+            mp.setOnErrorListener { _, _, _ ->
+                stopBgmPreview()
+                shareMsg = "BGM 试听失败：无法播放该音频文件"
+                true
+            }
+            mp.prepare()
+            mp.start()
+        }
+        if (result.isSuccess) {
+            playingBgmEp = epId
+        } else {
+            stopBgmPreview()
+            shareMsg = "BGM 试听失败：" + (result.exceptionOrNull()?.message ?: "无法播放该音频文件")
+        }
+    }
+
+    // 离开成片库页面时释放试听播放器，避免音频泄漏/后台继续播放
+    DisposableEffect(Unit) {
+        onDispose {
+            bgmPlayerHolder[0]?.let { mp -> runCatching { mp.release() } }
+            bgmPlayerHolder[0] = null
+        }
+    }
+
     val bgmPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         val epId = bgmTargetEp
         bgmTargetEp = null
@@ -106,9 +173,14 @@ fun LibraryPage() {
             runCatching {
                 com.dramafactory.app.AppGraph.dao.setProjectBgm(projectId, local.absolutePath, 0.22)
             }.onSuccess {
-                // 同项目各集共用一条 BGM，回显一起刷新
+                // 同项目各集共用一条 BGM，回显/路径/音量一起刷新（新选 BGM 音量回到默认 0.22）
+                stopBgmPreview()
                 episodes.value.filter { it.first.substringBefore("_ep") == projectId }
-                    .forEach { bgmNames[it.first] = local.name }
+                    .forEach {
+                        bgmNames[it.first] = local.name
+                        bgmPaths[it.first] = local.absolutePath
+                        bgmVolumes[it.first] = 0.22
+                    }
                 shareMsg = "BGM 已设置：${local.name}（重新合成后生效）"
             }.onFailure { e -> shareMsg = "BGM 落库失败：" + (e.message ?: "数据库写入失败") }
         }
@@ -123,12 +195,30 @@ fun LibraryPage() {
             }
         }.getOrDefault(emptyList())
         // ★第三批：回填每集当前 BGM 文件名（项目级配置，来自 projects.bgm_path）
+        // ★第四批：同时回填 BGM 绝对路径与音量（音量滑杆初值读 projects.bgm_volume，默认 0.22）
         bgmNames.clear()
+        bgmPaths.clear()
+        bgmVolumes.clear()
         episodes.value.forEach { (epId, _, _) ->
-            bgmNames[epId] = runCatching {
-                com.dramafactory.app.AppGraph.bgmForEpisode(epId).first?.name
+            val bgm = runCatching {
+                com.dramafactory.app.AppGraph.bgmForEpisode(epId)
             }.getOrNull()
+            bgmNames[epId] = bgm?.first?.name
+            bgmPaths[epId] = bgm?.first?.absolutePath
+            bgmVolumes[epId] = bgm?.second ?: 0.22
         }
+    }
+
+    // ★第四批：BGM 音量防抖落库——拖动滑杆期间只更新本地 state，停顿 350ms 后写一次数据库
+    LaunchedEffect(bgmVolSaveReq) {
+        if (bgmVolSaveReq <= 0) return@LaunchedEffect
+        kotlinx.coroutines.delay(350L)
+        val target = bgmVolSaveTarget ?: return@LaunchedEffect
+        val (epId, bgmPath, volume) = target
+        val projectId = epId.substringBefore("_ep")
+        runCatching {
+            com.dramafactory.app.AppGraph.dao.setProjectBgm(projectId, bgmPath, volume)
+        }.onFailure { e -> shareMsg = "BGM 音量保存失败：" + (e.message ?: "数据库写入失败") }
     }
 
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -164,6 +254,8 @@ fun LibraryPage() {
                                     // ★第二批 P0-D2：统一从 filesDir/movies 找片（兼容旧 cacheDir 位置）
                                     val f = com.dramafactory.app.FilmPaths.resolveExisting(context, epId)
                                     if (f != null) {
+                                        // 预览成片前停掉 BGM 试听，避免两路音频同时响
+                                        stopBgmPreview()
                                         previewEp = epId
                                         previewUri = Uri.fromFile(f)
                                     } else shareMsg = "成片尚未合成，请先点「合成」"
@@ -218,8 +310,17 @@ fun LibraryPage() {
                                     bgmTargetEp = epId
                                     bgmPicker.launch(arrayOf("audio/*"))
                                 }) { Text("选择 BGM") }
+                                // ★第四批：BGM 试听/停止（MediaPlayer 播放已落盘本地 BGM，未选 BGM 时禁用）
+                                OutlinedButton(
+                                    enabled = bgmNames[epId] != null,
+                                    onClick = {
+                                        if (playingBgmEp == epId) stopBgmPreview() else startBgmPreview(epId)
+                                    },
+                                ) { Text(if (playingBgmEp == epId) "停止" else "试听") }
                                 if (bgmNames[epId] != null) {
                                     OutlinedButton(onClick = {
+                                        // 清除前先停掉试听，避免停在一个已删除的文件上继续响
+                                        stopBgmPreview()
                                         val projectId = epId.substringBefore("_ep")
                                         scope.launch {
                                             runCatching {
@@ -227,7 +328,11 @@ fun LibraryPage() {
                                             }.onSuccess {
                                                 episodes.value
                                                     .filter { it.first.substringBefore("_ep") == projectId }
-                                                    .forEach { bgmNames[it.first] = null }
+                                                    .forEach {
+                                                        bgmNames[it.first] = null
+                                                        bgmPaths[it.first] = null
+                                                        bgmVolumes[it.first] = 0.22
+                                                    }
                                                 shareMsg = "已清除 BGM（重新合成后生效）"
                                             }.onFailure { e ->
                                                 shareMsg = "清除 BGM 失败：" + (e.message ?: "数据库写入失败")
@@ -235,6 +340,32 @@ fun LibraryPage() {
                                         }
                                     }) { Text("清除") }
                                 }
+                            }
+                            // ★第四批：BGM 音量滑杆（项目级 projects.bgm_volume，0..100%；未选 BGM 时禁用）
+                            val bgmVolume = bgmVolumes[epId] ?: 0.22
+                            Row(verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text("音量", style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.outline)
+                                Slider(
+                                    value = bgmVolume.coerceIn(0.0, 1.0).toFloat(),
+                                    onValueChange = { v ->
+                                        // 拖动时只改本地 state（同项目各集实时同步回显），防抖后再落库
+                                        val volume = v.toDouble().coerceIn(0.0, 1.0)
+                                        val projectId = epId.substringBefore("_ep")
+                                        episodes.value
+                                            .filter { it.first.substringBefore("_ep") == projectId }
+                                            .forEach { bgmVolumes[it.first] = volume }
+                                        bgmVolSaveTarget = Triple(epId, bgmPaths[epId], volume)
+                                        bgmVolSaveReq += 1
+                                    },
+                                    valueRange = 0f..1f,
+                                    enabled = bgmNames[epId] != null,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Text("${(bgmVolume * 100).roundToInt()}%",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.outline)
                             }
                         }
                     }
@@ -253,9 +384,23 @@ fun LibraryPage() {
     previewUri?.let { uri ->
         // ★第三批：预览字幕叠加——底部居中的半透明字幕层（数据来自该集 shots 的台词/旁白）
         var subtitleLine by remember(uri) { mutableStateOf<String?>(null) }
+        // ★第四批：字幕开关 + 小/中/大三档字号（弹窗内临时状态，rememberSaveable 即可，不落库）
+        var subtitleEnabled by rememberSaveable(uri) { mutableStateOf(true) }
+        var subtitleSizeIdx by rememberSaveable(uri) { mutableStateOf(1) }
+        // 字幕字号随档位变：小 12sp / 中 14sp / 大 16sp
+        val subtitleFontSize = when (subtitleSizeIdx) {
+            0 -> 12.sp
+            2 -> 16.sp
+            else -> 14.sp
+        }
         // VideoView 实例用普通数组槽位持有：AndroidView factory 里不写 Compose state，避免额外重组
         val vvHolder = remember(uri) { arrayOfNulls<VideoView>(1) }
-        LaunchedEffect(uri, previewEp) {
+        LaunchedEffect(uri, previewEp, subtitleEnabled) {
+            // 字幕关闭时立刻清空当前字幕并停止时间轴轮询（重新打开会重新构建时间轴）
+            if (!subtitleEnabled) {
+                subtitleLine = null
+                return@LaunchedEffect
+            }
             val epId = previewEp ?: return@LaunchedEffect
             // 时间轴：按 shot_no 排序后简单累计 duration_seconds（转场重叠忽略，与成片字幕轨同口径）
             val timeline = runCatching {
@@ -283,8 +428,32 @@ fun LibraryPage() {
         androidx.compose.material3.AlertDialog(
             onDismissRequest = { previewUri = null; previewEp = null },
             confirmButton = { Button(onClick = { previewUri = null; previewEp = null }) { Text("关闭") } },
+            title = {
+                // ★第四批：预览工具栏——字幕开关 + 小/中/大三档字号（仅本次预览生效，不落库）
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("字幕", style = MaterialTheme.typography.bodyMedium)
+                        Switch(checked = subtitleEnabled, onCheckedChange = { subtitleEnabled = it })
+                    }
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("字号", style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.outline)
+                        listOf("小", "中", "大").forEachIndexed { idx, label ->
+                            if (subtitleSizeIdx == idx) {
+                                Button(onClick = { subtitleSizeIdx = idx }, enabled = subtitleEnabled,
+                                    modifier = Modifier.weight(1f)) { Text(label) }
+                            } else {
+                                OutlinedButton(onClick = { subtitleSizeIdx = idx }, enabled = subtitleEnabled,
+                                    modifier = Modifier.weight(1f)) { Text(label) }
+                            }
+                        }
+                    }
+                }
+            },
             text = {
-                Box(modifier = Modifier.fillMaxWidth().height(420.dp)) {
+                Box(modifier = Modifier.fillMaxWidth().height(360.dp)) {
                     AndroidView(
                         modifier = Modifier.fillMaxSize(),
                         factory = { ctx ->
@@ -297,19 +466,22 @@ fun LibraryPage() {
                         },
                         update = { vv -> vv.setVideoURI(uri); vv.start() }
                     )
-                    subtitleLine?.let { line ->
-                        Text(
-                            text = line,
-                            color = Color.White,
-                            fontSize = 15.sp,
-                            textAlign = TextAlign.Center,
-                            maxLines = 3,
-                            modifier = Modifier
-                                .align(Alignment.BottomCenter)
-                                .padding(bottom = 16.dp, start = 12.dp, end = 12.dp)
-                                .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(6.dp))
-                                .padding(horizontal = 10.dp, vertical = 6.dp),
-                        )
+                    // ★第四批：关闭字幕时完全不渲染字幕层；字号随小/中/大档位（12/14/16sp）
+                    if (subtitleEnabled) {
+                        subtitleLine?.let { line ->
+                            Text(
+                                text = line,
+                                color = Color.White,
+                                fontSize = subtitleFontSize,
+                                textAlign = TextAlign.Center,
+                                maxLines = 3,
+                                modifier = Modifier
+                                    .align(Alignment.BottomCenter)
+                                    .padding(bottom = 16.dp, start = 12.dp, end = 12.dp)
+                                    .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(6.dp))
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                            )
+                        }
                     }
                 }
             }

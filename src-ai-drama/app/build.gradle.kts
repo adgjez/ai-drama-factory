@@ -95,6 +95,17 @@ android {
 
     testOptions {
         unitTests.isReturnDefaultValues = true
+        // 第四批：个位数 flaky 止血——ScriptAssetExtractionTest 偶发
+        // UncaughtExceptionsBeforeTest（其它测试类泄漏的未捕获协程异常污染全局）。
+        // forkEvery=1 让每个测试类独占 JVM，隔离类级泄漏；失败时打印完整堆栈便于定位。
+        unitTests.all {
+            it.forkEvery = 1
+            it.maxParallelForks = 1
+            it.testLogging {
+                events("failed")
+                exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+            }
+        }
     }
 }
 

@@ -4,6 +4,7 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.dramafactory.app.AppGraph
+import com.dramafactory.app.data.RenderTaskEntity
 import com.dramafactory.app.update.UpdateChecker
 import com.dramafactory.core.quality.AssetAuditor
 import com.dramafactory.core.quality.StylePreset
@@ -390,6 +391,24 @@ class QueueViewModel(private val episodeId: String) : ViewModel() {
         }
     }
     val state: StateFlow<QueueLogic.UiState> get() = logic.state
+
+    /**
+     * 第四批：渲染任务行明细（shotId → RenderTaskEntity）。
+     * QueueLogic.UiState 只暴露状态名与简短原因；逐镜预览还需要 local_file_uri/file_size/时间戳，
+     * 这里单独读 render_tasks 表。QueuePage 在 shotStates 变化时调用 refreshRenderTasks()。
+     */
+    private val _renderTasks = MutableStateFlow<Map<String, RenderTaskEntity>>(emptyMap())
+    val renderTasks: StateFlow<Map<String, RenderTaskEntity>> = _renderTasks
+
+    fun refreshRenderTasks() {
+        viewModelScope.launch {
+            _renderTasks.value = withContext(Dispatchers.IO) {
+                runCatching {
+                    AppGraph.dao.renderTasksOf(episodeId).associateBy { it.shot_id }
+                }.getOrDefault(emptyMap())
+            }
+        }
+    }
 
     /**
      * 当前视频模型是否支持视频参考（UI 门控「上传参考视频」入口）。

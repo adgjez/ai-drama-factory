@@ -42,6 +42,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.TextButton
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -52,6 +54,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import com.dramafactory.app.ui.components.HeroButton
 import com.dramafactory.app.ui.components.PrimaryButton
+import com.dramafactory.core.quality.ShotFieldRewriter
 
 /** 分镜校验错误码 → 用户可理解的中文提示。 */
 private fun storyboardCheckLabel(code: String): String = when (code) {
@@ -106,22 +109,29 @@ private fun storyboardCheckSummary(raw: String): String = raw.removePrefix("erro
 private val SCREEN_SIDE_OPTIONS = listOf("", "左", "右", "中")
 private val EYELINE_OPTIONS = listOf("", "左", "右", "上", "下", "对方")
 
-/** 第三批：按 scene_no 把相邻同场镜头聚组；scene_no=0 的镜头归「未分场」。 */
+/**
+ * 第三批：按 scene_no 把相邻同场镜头聚组；scene_no=0 的镜头归「未分场」。
+ * 第四批：分组口径收敛到 VM 的 contiguousSceneGroups——场次结构操作按同一规则重编号，
+ * 否则「合并/拆分/移镜」之后的组头会和操作结果对不上。
+ */
 private fun groupShotsByScene(
     shots: List<com.dramafactory.app.data.ShotEntity>,
-): List<Pair<Int, List<com.dramafactory.app.data.ShotEntity>>> {
-    val groups = mutableListOf<Pair<Int, MutableList<com.dramafactory.app.data.ShotEntity>>>()
-    for (shot in shots) {
-        val last = groups.lastOrNull()
-        if (last != null && last.first == shot.scene_no) last.second.add(shot)
-        else groups.add(shot.scene_no to mutableListOf(shot))
-    }
-    return groups.map { (sceneNo, rows) -> sceneNo to rows.toList() }
-}
+): List<Pair<Int, List<com.dramafactory.app.data.ShotEntity>>> =
+    contiguousSceneGroups(shots).map { rows -> (rows.firstOrNull()?.scene_no ?: 0) to rows }
 
-/** 第三批：场次组头「第N场 · 标题 · N镜 · 共X秒」（scene_no=0 显示「未分场」）。 */
+/**
+ * 第三批：场次组头「第N场 · 标题 · N镜 · 共X秒」（scene_no=0 显示「未分场」）。
+ * 第四批：组头右侧「⋮」菜单提供场次结构操作（合并到上一场 / 拆分为新场…）。
+ */
 @Composable
-private fun SceneGroupHeader(sceneNo: Int, rows: List<com.dramafactory.app.data.ShotEntity>) {
+private fun SceneGroupHeader(
+    sceneNo: Int,
+    rows: List<com.dramafactory.app.data.ShotEntity>,
+    canMergeToPrevious: Boolean,
+    canSplit: Boolean,
+    onMergeToPrevious: () -> Unit,
+    onSplitClick: () -> Unit,
+) {
     val title = rows.firstOrNull()?.scene_title?.takeIf { it.isNotBlank() }
     val head = if (sceneNo > 0) "第${sceneNo}场" else "未分场"
     val label = (if (title != null) "$head · $title" else head) +
@@ -134,7 +144,69 @@ private fun SceneGroupHeader(sceneNo: Int, rows: List<com.dramafactory.app.data.
         Icon(Icons.Default.List, contentDescription = "场次",
             tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
         Text(label, style = MaterialTheme.typography.titleSmall,
-            color = MaterialTheme.colorScheme.primary)
+            color = MaterialTheme.colorScheme.primary, modifier = Modifier.weight(1f))
+        // 第四批：场次结构操作菜单
+        var menuOpen by remember(sceneNo, rows.size) { mutableStateOf(false) }
+        Box {
+            IconButton(onClick = { menuOpen = true }) {
+                Icon(Icons.Default.MoreVert, contentDescription = "场次操作",
+                    tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+            }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("合并到上一场") },
+                    enabled = canMergeToPrevious,
+                    onClick = {
+                        menuOpen = false
+                        onMergeToPrevious()
+                    },
+                )
+                DropdownMenuItem(
+                    text = { Text("拆分为新场…") },
+                    enabled = canSplit,
+                    onClick = {
+                        menuOpen = false
+                        onSplitClick()
+                    },
+                )
+            }
+        }
+    }
+}
+
+/** 第四批：可 AI 重写的字段 → 中文名（编辑框按钮/弹窗标题用）。 */
+private fun shotFieldRewriteLabel(field: String): String = when (field) {
+    ShotFieldRewriter.FIELD_ACTION -> "动作"
+    ShotFieldRewriter.FIELD_NARRATION -> "旁白"
+    ShotFieldRewriter.FIELD_VISUAL -> "画面描述"
+    ShotFieldRewriter.FIELD_SCENE_CONTEXT -> "场景上下文"
+    ShotFieldRewriter.FIELD_CARRY_OVER -> "承接"
+    else -> field
+}
+
+/**
+ * 第四批：编辑对话框单字段的「label + AI重写」小按钮行。
+ * 重写进行中禁用按钮并显示「重写中…」，避免重复触发。
+ */
+@Composable
+private fun FieldHeaderRow(
+    label: String,
+    rewriting: Boolean,
+    onRewrite: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(label, style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        TextButton(onClick = onRewrite, enabled = !rewriting) {
+            Text(
+                if (rewriting) "重写中…" else "AI 重写",
+                style = MaterialTheme.typography.labelSmall,
+            )
+        }
     }
 }
 
@@ -240,6 +312,13 @@ fun StoryboardPage(
     var queuedCount by remember { mutableStateOf<Int?>(null) }
     // 第十三轮：分镜视频预览（非空=正在播放该本地路径）
     var previewUri by remember { mutableStateOf<String?>(null) }
+    // 第四批：场次结构操作（拆分场次弹窗的场次号）
+    var splitSceneNo by remember { mutableStateOf<Int?>(null) }
+    // 第四批：已通过校验的镜头「重新生成」二次确认
+    var confirmRegenerateShotId by remember { mutableStateOf<String?>(null) }
+    // 第四批：单字段 AI 重写（rewriteField 非空=正在填补充要求；空串=按上下文直接重写）
+    var rewriteField by remember { mutableStateOf<String?>(null) }
+    var rewriteInstruction by remember { mutableStateOf("") }
     // 第三批：按 scene_no 连续分组渲染；scene_no=0 归「未分场」。
     val sceneGroups = groupShotsByScene(st.shots)
 
@@ -440,9 +519,18 @@ fun StoryboardPage(
                 )
             }
         }
-        sceneGroups.forEach { (sceneNo, groupShots) ->
+        sceneGroups.forEachIndexed { groupIndex, group ->
+            val sceneNo = group.first
+            val groupShots = group.second
             item(key = "scene_h_${groupShots.first().shot_id}") {
-                SceneGroupHeader(sceneNo, groupShots)
+                SceneGroupHeader(
+                    sceneNo = sceneNo,
+                    rows = groupShots,
+                    canMergeToPrevious = sceneNo > 0 && groupIndex > 0,
+                    canSplit = sceneNo > 0 && groupShots.size >= 2,
+                    onMergeToPrevious = { vm.mergeSceneIntoPrevious(sceneNo) },
+                    onSplitClick = { splitSceneNo = sceneNo },
+                )
             }
             items(groupShots, key = { it.shot_id }) { shot ->
                 DramaCard(
@@ -540,6 +628,25 @@ fun StoryboardPage(
                         shot.narration?.let { Text("旁白：$it", style = MaterialTheme.typography.bodySmall) }
                         shot.carry_over?.let { Text("承接：$it", style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.outline) }
+                        // 第四批：单镜跨场移动（首场没有上一场 / 末场没有下一场时隐藏）
+                        if (sceneGroups.size > 1) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                if (groupIndex > 0) {
+                                    TextButton(onClick = { vm.moveShotToScene(shot.shot_id, -1) }) {
+                                        Icon(Icons.Default.KeyboardArrowUp, contentDescription = "移到上一场",
+                                            modifier = Modifier.size(16.dp))
+                                        Text("移到上一场", style = MaterialTheme.typography.labelSmall)
+                                    }
+                                }
+                                if (groupIndex < sceneGroups.lastIndex) {
+                                    TextButton(onClick = { vm.moveShotToScene(shot.shot_id, 1) }) {
+                                        Icon(Icons.Default.KeyboardArrowDown, contentDescription = "移到下一场",
+                                            modifier = Modifier.size(16.dp))
+                                        Text("移到下一场", style = MaterialTheme.typography.labelSmall)
+                                    }
+                                }
+                            }
+                        }
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             // 第十三轮：已出产视频 → 预览入口
                             st.videoUris[shot.shot_id]?.let { uri ->
@@ -550,13 +657,15 @@ fun StoryboardPage(
                                     Text("预览")
                                 }
                             }
-                            if (shot.sb_check != "pass") {
-                                OutlinedButton(onClick = { vm.regenerateShot(shot.shot_id) }) {
-                                    Icon(Icons.Default.Refresh, contentDescription = "重新生成",
-                                        modifier = Modifier.size(18.dp))
-                                    Spacer(Modifier.width(6.dp))
-                                    Text("重新生成")
-                                }
+                            OutlinedButton(onClick = {
+                                // 第四批：已通过校验的镜不再直接拒绝，改二次确认后强制重生成
+                                if (shot.sb_check == "pass") confirmRegenerateShotId = shot.shot_id
+                                else vm.regenerateShot(shot.shot_id)
+                            }) {
+                                Icon(Icons.Default.Refresh, contentDescription = "重新生成",
+                                    modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("重新生成")
                             }
                             OutlinedButton(onClick = { editingShotId = shot.shot_id }) {
                                 Icon(Icons.Default.Edit, contentDescription = "编辑",
@@ -707,6 +816,21 @@ fun StoryboardPage(
         var eEye by remember(editingShot.shot_id) { mutableStateOf(editingShot.eyeline ?: "") }
         var sideMenu by remember(editingShot.shot_id) { mutableStateOf(false) }
         var eyeMenu by remember(editingShot.shot_id) { mutableStateOf(false) }
+        // 第四批：单字段 AI 重写状态（rewritingField 形如 "shotId|field"）
+        val rewritingField = st.rewritingField
+        // 重写完成 → 回填当前编辑框，再清掉结果避免重复回填
+        androidx.compose.runtime.LaunchedEffect(st.rewriteResult) {
+            val result = st.rewriteResult ?: return@LaunchedEffect
+            if (result.shotId != editingShot.shot_id) return@LaunchedEffect
+            when (result.field) {
+                ShotFieldRewriter.FIELD_ACTION -> eAction = result.value
+                ShotFieldRewriter.FIELD_VISUAL -> eVisual = result.value
+                ShotFieldRewriter.FIELD_SCENE_CONTEXT -> eScene = result.value
+                ShotFieldRewriter.FIELD_CARRY_OVER -> eCarry = result.value
+                ShotFieldRewriter.FIELD_NARRATION -> eNarration = result.value
+            }
+            vm.consumeRewriteResult()
+        }
         AlertDialog(
             onDismissRequest = { editingShotId = null },
             title = { Text("编辑镜头 #${editingShot.shot_no}") },
@@ -716,6 +840,15 @@ fun StoryboardPage(
                         .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
+                    FieldHeaderRow(
+                        label = "动作描述",
+                        rewriting = rewritingField ==
+                            "${editingShot.shot_id}|${ShotFieldRewriter.FIELD_ACTION}",
+                        onRewrite = {
+                            rewriteInstruction = ""
+                            rewriteField = ShotFieldRewriter.FIELD_ACTION
+                        },
+                    )
                     OutlinedTextField(value = eAction, onValueChange = { eAction = it },
                         label = { Text("动作描述") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
                     // 第三批：场次号（0=未分场）+ 场次标题
@@ -756,13 +889,40 @@ fun StoryboardPage(
                         }
                     }
                     OutlinedTextField(value = eDialogue, onValueChange = { eDialogue = it },
-                        label = { Text("台词（留空删除）") }, modifier = Modifier.fillMaxWidth())
+                        label = { Text("台词（留空删除；需与剧本逐字一致，AI 不重写）") }, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(value = eNarration, onValueChange = { eNarration = it },
                         label = { Text("旁白（留空删除）") }, modifier = Modifier.fillMaxWidth())
+                    FieldHeaderRow(
+                        label = "画面描述",
+                        rewriting = rewritingField ==
+                            "${editingShot.shot_id}|${ShotFieldRewriter.FIELD_VISUAL}",
+                        onRewrite = {
+                            rewriteInstruction = ""
+                            rewriteField = ShotFieldRewriter.FIELD_VISUAL
+                        },
+                    )
                     OutlinedTextField(value = eVisual, onValueChange = { eVisual = it },
                         label = { Text("画面描述（景别/运镜/光线/影调）") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
+                    FieldHeaderRow(
+                        label = "场景上下文",
+                        rewriting = rewritingField ==
+                            "${editingShot.shot_id}|${ShotFieldRewriter.FIELD_SCENE_CONTEXT}",
+                        onRewrite = {
+                            rewriteInstruction = ""
+                            rewriteField = ShotFieldRewriter.FIELD_SCENE_CONTEXT
+                        },
+                    )
                     OutlinedTextField(value = eScene, onValueChange = { eScene = it },
                         label = { Text("场景上下文（时间/空间/天气）") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
+                    FieldHeaderRow(
+                        label = "承接",
+                        rewriting = rewritingField ==
+                            "${editingShot.shot_id}|${ShotFieldRewriter.FIELD_CARRY_OVER}",
+                        onRewrite = {
+                            rewriteInstruction = ""
+                            rewriteField = ShotFieldRewriter.FIELD_CARRY_OVER
+                        },
+                    )
                     OutlinedTextField(value = eCarry, onValueChange = { eCarry = it },
                         label = { Text("承接（上一镜结束状态/转场）") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
                     OutlinedTextField(value = eDur,
@@ -787,6 +947,40 @@ fun StoryboardPage(
             },
             dismissButton = { OutlinedButton(onClick = { editingShotId = null }) { Text("取消") } },
         )
+
+        // 第四批：AI 重写补充要求弹窗（可留空；确认后后台重写并回填字段）
+        rewriteField?.let { field ->
+            AlertDialog(
+                onDismissRequest = { rewriteField = null },
+                title = { Text("AI 重写${shotFieldRewriteLabel(field)}") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("可补充重写要求（留空则按本镜上下文与前后镜重写）：",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        OutlinedTextField(
+                            value = rewriteInstruction,
+                            onValueChange = { rewriteInstruction = it },
+                            label = { Text("补充要求（可选）") },
+                            modifier = Modifier.fillMaxWidth(),
+                            minLines = 2,
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(onClick = {
+                        val targetField = rewriteField
+                        if (targetField != null) {
+                            rewriteField = null
+                            vm.rewriteShotField(editingShot.shot_id, targetField, rewriteInstruction)
+                        }
+                    }) { Text("开始重写") }
+                },
+                dismissButton = {
+                    OutlinedButton(onClick = { rewriteField = null }) { Text("取消") }
+                },
+            )
+        }
     }
 
     // ---- 第十三轮：分镜视频预览（原生VideoView，零新增依赖）----
@@ -819,6 +1013,73 @@ fun StoryboardPage(
                 Button(onClick = { vm.deleteShot(delId); confirmDeleteShotId = null }) { Text("删除") }
             },
             dismissButton = { OutlinedButton(onClick = { confirmDeleteShotId = null }) { Text("取消") } },
+        )
+    }
+
+    // ---- 第四批：拆分场次 ----
+    splitSceneNo?.let { sceneNo ->
+        val group = sceneGroups.firstOrNull { it.first == sceneNo }?.second.orEmpty()
+        val splitIndex = sceneGroups.indexOfFirst { it.first == sceneNo }
+        var splitFromNo by remember(sceneNo, group.lastOrNull()?.shot_no) {
+            mutableStateOf(group.lastOrNull()?.shot_no?.toString().orEmpty())
+        }
+        var splitTitle by remember(sceneNo, group.lastOrNull()?.shot_no) {
+            mutableStateOf(if (splitIndex >= 0) "第${splitIndex + 2}场" else "")
+        }
+        AlertDialog(
+            onDismissRequest = { splitSceneNo = null },
+            title = { Text("拆分第${sceneNo}场") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "本场共 ${group.size} 镜（镜号 ${group.firstOrNull()?.shot_no}–" +
+                            "${group.lastOrNull()?.shot_no}），从指定镜起拆成新场，后续场次序号整体后移。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedTextField(
+                        value = splitFromNo,
+                        onValueChange = { txt -> splitFromNo = txt.filter(Char::isDigit) },
+                        label = { Text("从本场第几镜开始拆（镜号）") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = splitTitle,
+                        onValueChange = { splitTitle = it },
+                        label = { Text("新场标题（留空=第N场）") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val fromNo = splitFromNo.toIntOrNull()
+                        vm.splitScene(sceneNo, fromNo ?: 0, splitTitle.trim().takeIf { it.isNotBlank() })
+                        splitSceneNo = null
+                    },
+                    enabled = splitFromNo.toIntOrNull() != null,
+                ) { Text("拆分") }
+            },
+            dismissButton = { OutlinedButton(onClick = { splitSceneNo = null }) { Text("取消") } },
+        )
+    }
+
+    // ---- 第四批：已通过校验的镜头「重新生成」二次确认 ----
+    confirmRegenerateShotId?.let { shotId ->
+        AlertDialog(
+            onDismissRequest = { confirmRegenerateShotId = null },
+            title = { Text("重新生成该镜头？") },
+            text = { Text("该镜已通过校验，重新生成会覆盖现有内容（动作/台词/视觉指令/承接等）。") },
+            confirmButton = {
+                Button(onClick = {
+                    vm.regenerateShot(shotId, force = true)
+                    confirmRegenerateShotId = null
+                }) { Text("仍然重新生成") }
+            },
+            dismissButton = { OutlinedButton(onClick = { confirmRegenerateShotId = null }) { Text("取消") } },
         )
     }
 }

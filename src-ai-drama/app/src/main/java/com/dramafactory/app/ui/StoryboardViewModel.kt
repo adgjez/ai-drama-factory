@@ -4,6 +4,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.dramafactory.app.AppGraph
 import com.dramafactory.app.data.PersistenceActionExecutor
+import com.dramafactory.app.data.ShotEntity
+import com.dramafactory.core.quality.ShotFieldRewriter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -31,6 +33,10 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
         val assetNames: Map<String, String> = emptyMap(),
         /** v1.9.2：assetId → 缩略图 URI（remote_url 或本地 image_uri），分镜详情弹窗展示引用资产 */
         val assetThumbs: Map<String, String> = emptyMap(),
+        /** 第四批：正在 AI 重写的字段，格式 "shotId|field"（编辑框按钮据此显示 loading） */
+        val rewritingField: String? = null,
+        /** 第四批：AI 重写成功结果，UI 回填输入框后调 consumeRewriteResult() 清空 */
+        val rewriteResult: ShotFieldRewriteResult? = null,
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -168,12 +174,16 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
                 (if (softCount > 0) "（${softCount}镜有画面描述提示，不阻断渲染）" else "") + noAssetNote)
     }
 
-    /** 单镜重新生成：只生成指定镜头；已校验通过的镜头不允许覆盖。 */
-    fun regenerateShot(shotId: String) = viewModelScope.launch {
+    /**
+     * 单镜重新生成：只生成指定镜头。
+     * 第四批：已通过校验（sb_check=="pass"）的镜头不再直接拒绝——UI 弹二次确认后带 force=true 调进来；
+     * force=false 时仍然拦下并给出「会覆盖现有内容」的提示，避免被其他入口静默覆盖。
+     */
+    fun regenerateShot(shotId: String, force: Boolean = false) = viewModelScope.launch {
         val old = withContext(Dispatchers.IO) { AppGraph.dao.shotKeyframes(shotId) }
             ?: run { _state.value = _state.value.copy(message = "找不到镜头：$shotId"); return@launch }
-        if (old.sb_check == "pass") {
-            _state.value = _state.value.copy(message = "镜头 #${old.shot_no} 已校验通过，不再重新生成")
+        if (old.sb_check == "pass" && !force) {
+            _state.value = _state.value.copy(message = "镜头 #${old.shot_no} 已通过校验，重新生成会覆盖现有内容，请二次确认")
             return@launch
         }
         _state.value = _state.value.copy(generating = true, message = "正在重新生成镜头 #${old.shot_no}…")
@@ -305,4 +315,342 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
             .onSuccess { onQueued(metas.size) }
             .onFailure { _state.value = _state.value.copy(message = "入队失败：${it.message}") }
     }
+
+    // ---- 第四批：场次结构操作（合并 / 拆分 / 单镜跨场移动）----
+    //
+    // 分镜页按「相邻同场」连续分组渲染（与 StoryboardPage.groupShotsByScene 同口径），
+    // 所以场次结构一变，就必须把受影响的镜重新编号成连续 1..N，否则组头会飘。
+    // 场次号/标题统一走 dao.updateShotSceneInfo 局部 UPDATE（保留站位/视线/台词等列）；
+    // 只有「移到上一场/下一场」需要重排镜号时，才对镜号变化的镜整行 upsert——
+    // 数据层没有单列改 shot_no 的 DAO，且本任务不允许改 DramaDatabase.kt。
+    // 所有写入都在 writeLock 内串行；upsert 的整行内容取自刚读到的快照。
+
+    /**
+     * 第四批：合并场次——把第 [sceneNo] 场所有镜并入上一场（沿用上一场标题），
+     * 后面的场整体前移，重新编号成连续 1..N。第一场不可合并。
+     */
+    fun mergeSceneIntoPrevious(sceneNo: Int) = viewModelScope.launch {
+        val outcome = runCatching {
+            withContext(Dispatchers.IO) {
+                writeLock.withLock {
+                    val rows = AppGraph.dao.shotsOf(episodeId)
+                    if (rows.isEmpty()) error("本集还没有分镜")
+                    val groups = contiguousSceneGroups(rows)
+                    val index = groups.indexOfFirst { it.firstOrNull()?.scene_no == sceneNo }
+                    if (index < 0) error("找不到第${sceneNo}场")
+                    if (index == 0) error("第一场没有上一场，无法合并")
+                    val merged = ArrayList<List<ShotEntity>>(groups.size - 1)
+                    for (i in groups.indices) {
+                        when (i) {
+                            index - 1 -> merged.add(groups[i] + groups[index])
+                            index -> Unit
+                            else -> merged.add(groups[i])
+                        }
+                    }
+                    applySceneLayout(rows, sceneLayoutByGroups(merged))
+                    "已把第${sceneNo}场（${groups[index].size}镜）并入上一场，后续场次序号已前移"
+                }
+            }
+        }
+        refresh()
+        _state.value = _state.value.copy(message = outcome.getOrElse {
+            "合并场次失败：${it.message ?: it.javaClass.simpleName}"
+        })
+    }
+
+    /**
+     * 第四批：拆分场次——把第 [sceneNo] 场从镜号 [fromShotNo] 起拆成新场。
+     * 拆出的镜换成原场后一位的场次号，后续场整体后移；新场标题缺省「第N场」。
+     * [fromShotNo] 必须是本场第 2 镜及以后（从第一镜拆会导致原场为空）。
+     */
+    fun splitScene(sceneNo: Int, fromShotNo: Int, newTitle: String?) = viewModelScope.launch {
+        val outcome = runCatching {
+            withContext(Dispatchers.IO) {
+                writeLock.withLock {
+                    val rows = AppGraph.dao.shotsOf(episodeId)
+                    if (rows.isEmpty()) error("本集还没有分镜")
+                    val groups = contiguousSceneGroups(rows)
+                    val index = groups.indexOfFirst { it.firstOrNull()?.scene_no == sceneNo }
+                    if (index < 0) error("找不到第${sceneNo}场")
+                    val group = groups[index]
+                    if (group.size < 2) error("本场只有一镜，无法拆分")
+                    val splitAt = group.indexOfFirst { it.shot_no == fromShotNo }
+                    if (splitAt < 0) error("本场没有镜号 #$fromShotNo")
+                    if (splitAt == 0) error("不能从本场第一镜拆起（原场会变空）")
+                    val splitGroups = ArrayList<List<ShotEntity>>(groups.size + 1)
+                    for (i in groups.indices) {
+                        if (i == index) {
+                            splitGroups.add(group.subList(0, splitAt))
+                            splitGroups.add(group.subList(splitAt, group.size))
+                        } else {
+                            splitGroups.add(groups[i])
+                        }
+                    }
+                    val newSceneNo = index + 2
+                    val title = newTitle?.trim()?.ifBlank { null } ?: "第${newSceneNo}场"
+                    val layout = HashMap<String, SceneLayout>()
+                    splitGroups.forEachIndexed { groupIndex, run ->
+                        val runTitle = if (groupIndex == index + 1) title else sceneTitleOf(run)
+                        for (row in run) {
+                            layout[row.shot_id] = SceneLayout(
+                                shotNo = row.shot_no, sceneNo = groupIndex + 1, sceneTitle = runTitle)
+                        }
+                    }
+                    applySceneLayout(rows, layout)
+                    "已从镜头 #$fromShotNo 起拆出第${newSceneNo}场（${group.size - splitAt}镜）"
+                }
+            }
+        }
+        refresh()
+        _state.value = _state.value.copy(message = outcome.getOrElse {
+            "拆分场次失败：${it.message ?: it.javaClass.simpleName}"
+        })
+    }
+
+    /**
+     * 第四批：把单镜移到相邻场次（[delta] = -1 上一场 / +1 下一场）。
+     * 为了让「连续同场」分组不产生碎片场，会把它真正挪到目标场边界
+     * （上一场末尾 / 下一场开头），再按新顺序重排镜号并重编场次号 1..N。
+     */
+    fun moveShotToScene(shotId: String, delta: Int) = viewModelScope.launch {
+        val outcome = runCatching {
+            withContext(Dispatchers.IO) {
+                writeLock.withLock {
+                    val rows = AppGraph.dao.shotsOf(episodeId)
+                    if (rows.isEmpty()) error("本集还没有分镜")
+                    if (delta != -1 && delta != 1) error("不支持的移动方向：$delta")
+                    val shot = rows.firstOrNull { it.shot_id == shotId } ?: error("找不到镜头：$shotId")
+                    val groups = contiguousSceneGroups(rows)
+                    val groupIndex = groups.indexOfFirst { group -> group.any { it.shot_id == shotId } }
+                    if (groupIndex < 0) error("找不到镜头 #${shot.shot_no} 所在场次")
+                    val targetIndex = groupIndex + delta
+                    if (targetIndex !in groups.indices) {
+                        error(if (delta < 0) "镜头 #${shot.shot_no} 已在第一场，无法移到上一场"
+                        else "镜头 #${shot.shot_no} 已在最后一场，无法移到下一场")
+                    }
+                    val targetGroup = groups[targetIndex]
+                    val targetTitle = sceneTitleOf(targetGroup)
+                    val ordered = rows.toMutableList()
+                    ordered.removeAt(ordered.indexOfFirst { it.shot_id == shotId })
+                    // 上一场 → 插到上一场末镜之后；下一场 → 插到下一场首镜之前
+                    val anchorId = if (delta < 0) targetGroup.last().shot_id else targetGroup.first().shot_id
+                    val anchorPos = ordered.indexOfFirst { it.shot_id == anchorId }
+                    if (anchorPos < 0) error("目标场次锚点丢失")
+                    val insertPos = if (delta < 0) anchorPos + 1 else anchorPos
+                    ordered.add(insertPos, shot.copy(
+                        scene_no = targetGroup.first().scene_no, scene_title = targetTitle))
+                    // 重排后按「相邻同场」重新聚组，连续编号并顺便重排镜号
+                    val runs = ArrayList<MutableList<ShotEntity>>()
+                    for (row in ordered) {
+                        val lastRun = runs.lastOrNull()
+                        if (lastRun != null && lastRun.first().scene_no == row.scene_no) lastRun.add(row)
+                        else runs.add(mutableListOf(row))
+                    }
+                    val layout = HashMap<String, SceneLayout>()
+                    var position = 0
+                    runs.forEachIndexed { runIndex, run ->
+                        val title = sceneTitleOf(run)
+                        for (row in run) {
+                            position += 1
+                            layout[row.shot_id] = SceneLayout(
+                                shotNo = position, sceneNo = runIndex + 1, sceneTitle = title)
+                        }
+                    }
+                    applySceneLayout(rows, layout)
+                    "镜头 #${shot.shot_no} 已移到${if (delta < 0) "上一场" else "下一场"}，镜号已按新顺序重排"
+                }
+            }
+        }
+        refresh()
+        _state.value = _state.value.copy(message = outcome.getOrElse {
+            "移动镜头失败：${it.message ?: it.javaClass.simpleName}"
+        })
+    }
+
+    /** 第四批：组内第一个非空场次标题（组头展示口径）。 */
+    private fun sceneTitleOf(rows: List<ShotEntity>): String? =
+        rows.firstOrNull { !it.scene_title.isNullOrBlank() }?.scene_title?.trim()?.ifBlank { null }
+
+    /** 第四批：按组顺序生成连续 1..N 的场次映射（每组标题取组内首个非空标题）。 */
+    private fun sceneLayoutByGroups(groups: List<List<ShotEntity>>): Map<String, SceneLayout> {
+        val layout = HashMap<String, SceneLayout>()
+        groups.forEachIndexed { index, rows ->
+            val title = sceneTitleOf(rows)
+            for (row in rows) {
+                layout[row.shot_id] = SceneLayout(
+                    shotNo = row.shot_no, sceneNo = index + 1, sceneTitle = title)
+            }
+        }
+        return layout
+    }
+
+    /**
+     * 第四批：把场次结构目标状态落库并读回校验。
+     * ① 镜号变化（只有跨场移动会触发）→ 整行 upsert，行内容取自刚读到的快照；
+     * ② 场次号/标题变化 → dao.updateShotSceneInfo 局部 UPDATE（保留站位/视线/台词/时长等列）。
+     */
+    private suspend fun applySceneLayout(rows: List<ShotEntity>, layout: Map<String, SceneLayout>) {
+        for (row in rows) {
+            val target = layout[row.shot_id] ?: continue
+            if (target.shotNo == row.shot_no) continue
+            AppGraph.dao.upsertShot(row.copy(shot_no = target.shotNo))
+        }
+        for (row in rows) {
+            val target = layout[row.shot_id] ?: continue
+            if (target.sceneNo == row.scene_no && target.sceneTitle == row.scene_title) continue
+            AppGraph.dao.updateShotSceneInfo(
+                row.shot_id, target.sceneNo, target.sceneTitle, row.screen_side, row.eyeline)
+        }
+        val back = AppGraph.dao.shotsOf(episodeId)
+        check(back.size == rows.size) { "场次操作后镜数不一致：${rows.size} → ${back.size}" }
+        for (row in back) {
+            val target = layout[row.shot_id] ?: error("场次操作后找不到镜头：${row.shot_id}")
+            check(row.shot_no == target.shotNo) { "镜号读回不一致：${row.shot_no} ≠ ${target.shotNo}" }
+            check(row.scene_no == target.sceneNo) { "场次号读回不一致：${row.scene_no} ≠ ${target.sceneNo}" }
+            check(row.scene_title == target.sceneTitle) {
+                "场次标题读回不一致：${row.scene_title} ≠ ${target.sceneTitle}"
+            }
+        }
+    }
+
+    // ---- 第四批：单镜单字段 AI 重写（台词不提供：StoryboardGate 有逐字校验）----
+
+    /**
+     * 第四批：只重写某一镜的单个字段（动作/旁白/画面描述/场景上下文/承接），
+     * 不整镜重生成，避免连带改掉台词、时长、资产引用与已通过的校验结果。
+     * 模型返回 null（不合格/不可重写）时不落库，保留原值。
+     */
+    fun rewriteShotField(shotId: String, field: String, instruction: String? = null) = viewModelScope.launch {
+        if (!ShotFieldRewriter.isRewritable(field)) {
+            _state.value = _state.value.copy(message = "该字段不支持 AI 重写（台词需与剧本逐字一致，只能人工改）")
+            return@launch
+        }
+        if (!AppGraph.isInitialized || !AppGraph.hasAnyTextKey()) {
+            _state.value = _state.value.copy(message = "未配置文本模型 API Key，无法使用 AI 重写。请到「设置」页配置后重试。")
+            return@launch
+        }
+        _state.value = _state.value.copy(
+            rewritingField = "$shotId|$field", message = null, rewriteResult = null)
+        val outcome = runCatching {
+            // ① 只读快照（网络请求不占 writeLock，避免重写期间 UI 保存被卡住）
+            val snapshot = withContext(Dispatchers.IO) {
+                val rows = AppGraph.dao.shotsOf(episodeId)
+                val index = rows.indexOfFirst { it.shot_id == shotId }
+                if (index < 0) error("找不到镜头：$shotId")
+                ShotRewriteSnapshot(
+                    row = rows[index],
+                    prevAction = rows.getOrNull(index - 1)?.action,
+                    nextAction = rows.getOrNull(index + 1)?.action,
+                    script = runCatching { AppGraph.dao.episode(episodeId)?.script_json }.getOrNull(),
+                )
+            }
+            val row = snapshot.row
+            val context = ShotFieldRewriter.ShotContext(
+                shotNo = row.shot_no,
+                action = row.action.orEmpty(),
+                dialogue = row.dialogue,
+                narration = row.narration,
+                visualPrompt = row.visual_prompt,
+                sceneContext = row.scene_context,
+                carryOver = row.carry_over,
+                durationSeconds = row.duration_seconds,
+                sceneTitle = row.scene_title,
+                prevAction = snapshot.prevAction,
+                nextAction = snapshot.nextAction,
+                scriptExcerpt = snapshot.script,
+            )
+            val value = ShotFieldRewriter.rewrite(
+                field = field,
+                context = context,
+                instruction = instruction?.trim().orEmpty(),
+                chat = { req -> AppGraph.text.chat(req) },
+            ) ?: error("模型没有返回可用的重写内容，已保留原文")
+            // ② 落库：只改目标列，其余列整行保留；落库前重读最新行，避免覆盖这期间的其它保存
+            withContext(Dispatchers.IO) {
+                writeLock.withLock {
+                    val latest = AppGraph.dao.shotKeyframes(shotId) ?: error("找不到镜头：$shotId")
+                    val updated = when (field) {
+                        ShotFieldRewriter.FIELD_ACTION -> latest.copy(action = value)
+                        ShotFieldRewriter.FIELD_NARRATION -> latest.copy(narration = value)
+                        ShotFieldRewriter.FIELD_VISUAL -> latest.copy(visual_prompt = value)
+                        ShotFieldRewriter.FIELD_SCENE_CONTEXT -> latest.copy(scene_context = value)
+                        ShotFieldRewriter.FIELD_CARRY_OVER -> latest.copy(carry_over = value)
+                        else -> error("该字段不支持 AI 重写：$field")
+                    }
+                    AppGraph.dao.upsertShot(updated)
+                    val back = AppGraph.dao.shotKeyframes(shotId)
+                    check(back != null && rewrittenValueOf(back, field) == value) {
+                        "AI 重写落库后读回不一致：$shotId/$field"
+                    }
+                }
+            }
+            row.shot_no to value
+        }
+        refresh()
+        val message = outcome.fold(
+            onSuccess = { pair -> "已重写镜头 #${pair.first} 的${shotFieldLabel(field)}" },
+            onFailure = { e -> "AI 重写未生效：${e.message ?: e.javaClass.simpleName}" },
+        )
+        val result = outcome.getOrNull()?.let { ShotFieldRewriteResult(shotId, field, it.second) }
+        _state.value = _state.value.copy(rewritingField = null, message = message, rewriteResult = result)
+    }
+
+    /** 第四批：UI 已把重写结果回填编辑框，清掉结果避免重复回填。 */
+    fun consumeRewriteResult() {
+        if (_state.value.rewriteResult != null) {
+            _state.value = _state.value.copy(rewriteResult = null)
+        }
+    }
+
+    /** 第四批：读出某一字段当前值（重写落库后的读回校验用）。 */
+    private fun rewrittenValueOf(row: ShotEntity, field: String): String? = when (field) {
+        ShotFieldRewriter.FIELD_ACTION -> row.action
+        ShotFieldRewriter.FIELD_NARRATION -> row.narration
+        ShotFieldRewriter.FIELD_VISUAL -> row.visual_prompt
+        ShotFieldRewriter.FIELD_SCENE_CONTEXT -> row.scene_context
+        ShotFieldRewriter.FIELD_CARRY_OVER -> row.carry_over
+        else -> null
+    }
+
+    /** 第四批：字段中文名（message 与 UI 标题用）。 */
+    private fun shotFieldLabel(field: String): String = when (field) {
+        ShotFieldRewriter.FIELD_ACTION -> "动作"
+        ShotFieldRewriter.FIELD_NARRATION -> "旁白"
+        ShotFieldRewriter.FIELD_VISUAL -> "画面描述"
+        ShotFieldRewriter.FIELD_SCENE_CONTEXT -> "场景上下文"
+        ShotFieldRewriter.FIELD_CARRY_OVER -> "承接"
+        else -> field
+    }
 }
+
+/** 第四批：场次结构操作的目标状态（镜号 + 场次号 + 场次标题）。 */
+private data class SceneLayout(val shotNo: Int, val sceneNo: Int, val sceneTitle: String?)
+
+/** 第四批：单字段 AI 重写前的只读快照（读一次，网络请求后再重读最新行落库）。 */
+private data class ShotRewriteSnapshot(
+    val row: ShotEntity,
+    val prevAction: String?,
+    val nextAction: String?,
+    val script: String?,
+)
+
+/**
+ * 第四批：按「相邻 scene_no 相等」连续分组（分镜页组头与 VM 场次操作共用同一口径，
+ * scene_no=0 自然归入「未分场」）。
+ */
+internal fun contiguousSceneGroups(rows: List<ShotEntity>): List<List<ShotEntity>> {
+    val groups = ArrayList<MutableList<ShotEntity>>()
+    for (row in rows) {
+        val last = groups.lastOrNull()
+        if (last != null && last.first().scene_no == row.scene_no) last.add(row)
+        else groups.add(mutableListOf(row))
+    }
+    return groups.map { it.toList() }
+}
+
+/** 第四批：单字段 AI 重写结果（shotId + 字段 + 新内容），UI 据此回填编辑框。 */
+data class ShotFieldRewriteResult(
+    val shotId: String,
+    val field: String,
+    val value: String,
+)
