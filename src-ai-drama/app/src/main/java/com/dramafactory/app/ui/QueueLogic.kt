@@ -208,3 +208,21 @@ class QueueLogic(
         _state.value = _state.value.copy(enqueueError = null)
     }
 }
+
+/**
+ * 暂停原因码 → 用户可读中文（第五批：队列页不再直出内部码）。
+ *
+ * 纯 Kotlin、不依赖 Android，可被 JVM 单测覆盖；未知原因码保留在括号内，避免吞掉排障信息。
+ * 返回 null 表示未暂停（reason 为空白）。
+ */
+internal fun pausedReasonText(reason: String?): String? {
+    val code = reason?.trim().orEmpty()
+    if (code.isEmpty()) return null
+    return when (code) {
+        "budget_exceeded" -> "预算已到上限，可调整上限或确认后继续"
+        "auth_401" -> "密钥失效，请到设置页更新后恢复"
+        "storyboard_gate" -> "分镜未过审，需回分镜页修复后重新入队"
+        "manual" -> "手动暂停"
+        else -> "未知原因（$code）"
+    }
+}

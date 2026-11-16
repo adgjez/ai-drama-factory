@@ -21,6 +21,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * 渲染队列 —— 单消费者协程（架构§2）。
@@ -83,6 +85,15 @@ class DefaultRenderQueue(
     var shotSceneContextProvider: suspend (String) -> String = { "" },
     var shotCinematicProvider: suspend (String) -> String = { "" },
     var shotDurationProvider: suspend (String) -> Double = { 0.0 },
+    /** ★第五批 P0：空白分镜止损。台词/旁白/动作全空（孤儿镜、分镜文本丢失）时绝不提交付费任务。
+     *  默认 false 保持既有单测行为；生产端（RenderRuntime）置 true。 */
+    var blockEmptyPrompt: Boolean = false,
+    /** ★第五批 P0：COMPLETED 但本地 clip 丢失时，用落库的远端 URL 重取（绝不重新提交付费任务） */
+    var recordedRemoteUrlOf: suspend (shotId: String) -> String? = { _ -> null },
+    /** ★第五批 P0：轮询到成片 URL 时先落库（配合 recordedRemoteUrlOf，让付费 clip 可重新取回） */
+    var remoteUrlRecorder: suspend (shotId: String, videoUrl: String) -> Unit = { _, _ -> },
+    /** ★第五批 P0：本地 clip 是否仍在（uri,size）；默认视为存在（单测无文件系统） */
+    var clipFileChecker: (uri: String, expectedSize: Long) -> Boolean = { _, _ -> true },
     // v1.9.28：本地媒体 URI → 公网 URL（图床）。2.5 要求参考媒体公开可访问，
     // content:///file:///data: 必须先上传再提交。默认恒等透传（无图床/单测）。
     // 上传失败抛异常 → 本镜按 ValidationError 标 FAILED（可读原因），不烧钱提交。
@@ -106,6 +117,8 @@ class DefaultRenderQueue(
     private val cancelledShots = mutableSetOf<String>()
     private val submittedAtMap = mutableMapOf<String, Long>()
     private var worker: Job? = null
+    /** ★第五批 P0：入队/剪枝/自愈串行化（旧实现无锁：两次 enqueue 竞争会各起 worker 重复提交付费） */
+    private val enqueueMutex = Mutex()
 
     /** P1-4：取回失败重试退避上限（指数退避封顶） */
     companion object {
@@ -125,41 +138,95 @@ class DefaultRenderQueue(
     }
 
     override suspend fun enqueueEpisode(episodeId: String, shots: List<ShotMeta>) {
-        // 入队前过load-or-merge：复用checkpoint权威态
-        checkpointStore.loadOrMerge(episodeId, shots)
-        // P1-5：budget_exceeded 暂停必须等用户确认，enqueue不得自动续跑烧钱
-        if (pausedReason != "budget_exceeded") {
-            paused = false; pausedReason = null
-        }
-        // P0-2：旧worker必须真正退出（cancel是异步的）才能启动新worker，
-        // 否则两个worker短暂并行会同时选中同一PENDING镜重复提交。
-        worker?.cancel()
-        worker?.join()
-        worker = scope.launch {
-            // 主循环：反复扫描checkpoint直至全部终态。
-            // 暂停（预算/401/弱网）时不退出——delay等待用户resume后自动续跑剩余PENDING镜
-            while (true) {
-                if (paused) { delay(100); continue }
+        // ★第五批 P0：入队/剪枝/自愈/重建 worker 全部串行化（旧实现无锁，双击「开始渲染」
+        // 会两个 worker 并行抢同一 PENDING 镜 → 同一镜重复提交、重复扣费）。
+        enqueueMutex.withLock {
+            // ★第五批 P0：空分镜不得启动 worker。旧实现会对着历史 render_tasks 的 PENDING/SUBMITTING
+            // 行继续跑（用户看到「清空队列后开始渲染没反应/反而重提旧任务」的根因之一）。
+            if (shots.isEmpty()) {
                 updateSnapshot(episodeId)
-                // 先re-poll已提交镜（恢复路径），绝不重新submit已提交任务
-                val repolls = checkpointStore.pendingRepoll(episodeId)
-                if (repolls.isNotEmpty()) {
-                    for (entry in repolls) {
-                        if (paused) break
-                        repoll(entry.shotId, entry.providerTaskId!!)
-                    }
-                    continue
-                }
-                val cp = checkpointStore.getEpisode(episodeId)
-                val next = cp?.shots?.firstOrNull {
-                    it.shotId !in cancelledShots && it.state == ShotState.PENDING
-                }
-                if (next == null) break   // 无待处理镜：队列跑完
-                processShot(episodeId, next.shotId)
-                updateSnapshot(episodeId)
+                _state.value = _state.value.copy(running = false)
+                return
             }
-            updateSnapshot(episodeId)
-            _state.value = _state.value.copy(running = false)
+            // 入队前过load-or-merge：复用checkpoint权威态
+            checkpointStore.loadOrMerge(episodeId, shots)
+            // ★第五批 P0：剪掉已不存在于分镜的 checkpoint 行（幽灵任务），
+            // 否则 recoverOnBoot/本循环会为已删除镜头重新提交付费任务。
+            runCatching { checkpointStore.pruneToShots(episodeId, shots.map { it.shotId }.toSet()) }
+            // 重新入队=用户重新点「开始渲染」：清掉上一轮的取消标记（旧实现只增不清，
+            // 同队列实例里被取消过的镜永远被跳过）。
+            cancelledShots.removeAll { sid -> shots.any { it.shotId == sid } }
+            // ★第五批 P0：已 COMPLETED 但本地 clip 被系统清理的镜，先用落库的远端 URL 重新取回，
+            // 绝不重新提交付费任务。
+            healCompletedClips(episodeId)
+            // P1-5：budget_exceeded 暂停必须等用户确认，enqueue不得自动续跑烧钱
+            if (pausedReason != "budget_exceeded") {
+                paused = false; pausedReason = null
+            }
+            // P0-2：旧worker必须真正退出（cancel是异步的）才能启动新worker，
+            // 否则两个worker短暂并行会同时选中同一PENDING镜重复提交。
+            worker?.cancel()
+            worker?.join()
+            worker = scope.launch {
+                // 主循环：反复扫描checkpoint直至全部终态。
+                // 暂停（预算/401/弱网）时不退出——delay等待用户resume后自动续跑剩余PENDING镜
+                while (true) {
+                    if (paused) { delay(100); continue }
+                    updateSnapshot(episodeId)
+                    // 先re-poll已提交镜（恢复路径），绝不重新submit已提交任务
+                    val repolls = checkpointStore.pendingRepoll(episodeId)
+                    if (repolls.isNotEmpty()) {
+                        for (entry in repolls) {
+                            if (paused) break
+                            repoll(entry.shotId, entry.providerTaskId!!)
+                        }
+                        continue
+                    }
+                    val cp = checkpointStore.getEpisode(episodeId)
+                    val next = cp?.shots?.firstOrNull {
+                        it.shotId !in cancelledShots && it.state == ShotState.PENDING
+                    }
+                    if (next == null) break   // 无待处理镜：队列跑完
+                    processShot(episodeId, next.shotId)
+                    updateSnapshot(episodeId)
+                }
+                updateSnapshot(episodeId)
+                _state.value = _state.value.copy(running = false)
+            }
+        }
+    }
+
+    /**
+     * ★第五批 P0：本地 clip 丢失自愈。
+     * 付费已完成的镜头（COMPLETED）若本地文件被系统清理，用落库的远端 URL 重新下载并 markCompleted；
+     * 没有远端 URL 时标 RECONCILE 交人工对账，绝不重新 submit（重提=重复付费）。
+     */
+    private suspend fun healCompletedClips(episodeId: String) {
+        val cp = runCatching { checkpointStore.getEpisode(episodeId) }.getOrNull() ?: return
+        for (entry in cp.shots) {
+            if (entry.state != ShotState.COMPLETED) continue
+            val uri = entry.localFileUri ?: continue
+            val present = runCatching { clipFileChecker(uri, entry.fileSize) }.getOrDefault(true)
+            if (present) continue
+            val remote = runCatching { recordedRemoteUrlOf(entry.shotId) }.getOrNull()
+            if (remote.isNullOrBlank()) {
+                runCatching {
+                    checkpointStore.markReconcile(entry.shotId,
+                        "local clip missing and no remote url; manual reconcile required")
+                }
+                continue
+            }
+            try {
+                val (newUri, size) = downloader(remote, entry.shotId)
+                checkpointStore.markCompleted(entry.shotId, newUri, size)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                runCatching {
+                    checkpointStore.markReconcile(entry.shotId,
+                        "local clip re-download failed: " + (e.message ?: "unknown"))
+                }
+            }
         }
     }
 
@@ -204,9 +271,9 @@ class DefaultRenderQueue(
                 return
             }
             budgetConfirmed = false
-            // ★P0-1生死线第一步：submit之前先把「即将付费」的意图同步落盘。
-            // 此后进程无论在哪一行被杀，恢复时都能看到该镜处于SUBMITTING→对账，绝不静默重提。
-            checkpointStore.markSubmitting(shotId)
+            // ★第五批 P0：SUBMITTING 意图已移到所有校验之后、submitVideo 之前。
+            // 旧实现先落 SUBMITTING 再跑闸门：闸门拦截 / storyboard_gate 暂停会留下卡死的 SUBMITTING，
+            // 恢复时被误判为「已提交结果未知→需对账」，用户看到莫名的待对账镜。
 
             // ★v1.8.0 质量三闸·整集六铁律（提交前整集一次）：任一镜 sb_check=error → 整集中止，
             // 绝不烧钱出未过审的镜。对齐 pavo storyboard 六铁律 gate（fail-closed）。
@@ -218,6 +285,13 @@ class DefaultRenderQueue(
             val sceneContext = runCatching { shotSceneContextProvider(shotId) }.getOrDefault("")
             val cinematic = runCatching { shotCinematicProvider(shotId) }.getOrDefault("")
             val shotDuration = runCatching { shotDurationProvider(shotId) }.getOrDefault(0.0)
+            // ★第五批 P0：空白分镜止损——台词/旁白/动作全空时提交等于烧钱出随机画面（孤儿镜高发）
+            if (blockEmptyPrompt && dialogue.isBlank() && narration.isBlank() && action.isBlank()) {
+                runCatching {
+                    checkpointStore.markFailed(shotId, "empty_prompt: 分镜台词/旁白/动作均为空，未提交以免浪费额度")
+                }
+                return
+            }
             val prompt = com.dramafactory.core.provider.ChineseAudioInjector.buildShotPrompt(
                 dialogue, narration, action, sceneContext, cinematic)
 
@@ -270,6 +344,9 @@ class DefaultRenderQueue(
             // 人物漂移/脸部崩坏/剧烈抖动；英文抑制强于中文。锁脸专用负向模板（用户文档提供）。
             val videoNegative = "face drift, identity change, inconsistent character, deformed face, " +
                 "deformed hands, extra fingers, severe shaking, motion blur overshoot, blurry, watermark, text"
+            // ★第五批 P0：生死线前置条件——只有真正的 PENDING（非已 SUBMITTED/COMPLETED）才允许
+            // 转 SUBMITTING 并提交；条件化落库失败即跳过该镜，杜绝重复付费。
+            if (!checkpointStore.tryMarkSubmitting(shotId)) return
             val taskId = videoProvider.submitVideo(
                 com.dramafactory.core.model.VideoSubmitRequest(
                     shotId = shotId, prompt = prompt,
@@ -332,6 +409,8 @@ class DefaultRenderQueue(
             }
             when (r) {
                 is PollResult.Completed -> {
+                    // ★第五批 P0：先落库远端成片 URL（付费资产可追溯/可重取），再下载本地 clip
+                    runCatching { remoteUrlRecorder(shotId, r.videoUrl) }
                     try {
                         val (uri, size) = downloader(r.videoUrl, shotId)
                         checkpointStore.markCompleted(shotId, uri, size)

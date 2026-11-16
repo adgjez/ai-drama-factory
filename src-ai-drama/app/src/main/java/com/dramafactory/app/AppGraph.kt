@@ -211,6 +211,46 @@ object AppGraph {
     @Volatile private var appContextRef: Context? = null
     fun appContext(): Context? = appContextRef
 
+    // ---- ★第五批 P0：渲染预算（条数型）持久化 ----
+    // 预算只存内存时：杀进程/崩溃重启后 used 归零，用户可以无限提交付费任务；上限也无 UI 可调。
+    private const val BUDGET_PREFS = "render_budget"
+    private const val LIMIT_PREFIX = "limit_"
+    private const val USED_PREFIX = "used_"
+
+    private fun budgetPrefs(): android.content.SharedPreferences? =
+        appContext()?.getSharedPreferences(BUDGET_PREFS, android.content.Context.MODE_PRIVATE)
+
+    /** 某项目当前预算上限（条）。未设置过 = DefaultBudgetGuard.DEFAULT_LIMIT。 */
+    fun budgetLimit(projectId: String): Int =
+        runCatching { budgetPrefs()?.getInt(LIMIT_PREFIX + projectId, DefaultBudgetGuard.DEFAULT_LIMIT) }
+            .getOrNull() ?: DefaultBudgetGuard.DEFAULT_LIMIT
+
+    /** 调整某项目预算上限（条，1..200）：落 SharedPreferences + 立即生效到内存 guard。 */
+    fun setBudgetLimit(projectId: String, limit: Int) {
+        val v = limit.coerceIn(1, 200)
+        runCatching { budgetPrefs()?.edit()?.putInt(LIMIT_PREFIX + projectId, v)?.apply() }
+        runCatching { budgetGuard.setLimit(projectId, v) }
+    }
+
+    /** 构造预算闸门：恢复已用条数与自定义上限，并在每次扣减时落盘。 */
+    private fun buildBudgetGuard(): DefaultBudgetGuard {
+        val prefs = budgetPrefs()
+        val initialUsed = mutableMapOf<String, Int>()
+        prefs?.all?.forEach { (k, v) ->
+            if (v is Int && k.startsWith(USED_PREFIX)) initialUsed[k.removePrefix(USED_PREFIX)] = v
+        }
+        val guard = DefaultBudgetGuard(initialUsed = initialUsed)
+        prefs?.all?.forEach { (k, v) ->
+            if (v is Int && k.startsWith(LIMIT_PREFIX)) {
+                runCatching { guard.setLimit(k.removePrefix(LIMIT_PREFIX), v) }
+            }
+        }
+        guard.onUsageChanged = { projectId, used ->
+            runCatching { prefs?.edit()?.putInt(USED_PREFIX + projectId, used)?.apply() }
+        }
+        return guard
+    }
+
     // ---- v1.7.18：视频参数（设置页可调，渲染按镜透传）----
     @Volatile
     var videoParams: com.dramafactory.core.model.VideoParams = com.dramafactory.core.model.VideoParams()
@@ -661,7 +701,8 @@ object AppGraph {
             // 必须在 initialized=true 之后跑（refreshConfiguredProviders 内部早退保护），
             // 故挂 ioScope 异步执行；init 同步跑到置位后才轮到它调度。
             ioScope.launch { refreshConfiguredProviders() }
-            budgetGuard = DefaultBudgetGuard()
+            // ★第五批 P0：预算上限/已用持久化（旧实现纯内存，进程重启后预算归零可无限烧钱）
+            budgetGuard = buildBudgetGuard()
 
             // v1.8.4：激活文本模型已落盘（saveActiveModel 写 KeyVault），factory 已同步预热进内存，
             // 保证 initialized=true 之前内存已是持久值，避免任何 UI 首帧读到默认 agnes 再跳变。

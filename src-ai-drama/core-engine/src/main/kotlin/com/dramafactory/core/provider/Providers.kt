@@ -106,6 +106,30 @@ interface CheckpointStore {
     suspend fun getEpisode(episodeId: String): com.dramafactory.core.model.EpisodeCheckpoint?
     /** 遍历全部 episodeId（recoverOnBoot 扫描用，P1-6） */
     suspend fun allEpisodeIds(): List<String>
+
+    /**
+     * ★第五批 P0：清理已不存在于当前分镜的 checkpoint 行（「幽灵渲染任务」）。
+     * 删除/重生成分镜后，旧 render_tasks 行若残留，recoverOnBoot 会为已删除镜头
+     * 重新提交付费任务。默认空实现保持既有测试 fake 兼容。
+     * @return 实际删除行数
+     */
+    suspend fun pruneToShots(episodeId: String, keepShotIds: Collection<String>): Int = 0
+
+    /**
+     * ★第五批 P0：条件化提交意图。只有仍处于可提交态（非 SUBMITTED/COMPLETED 已付费态）
+     * 的镜才允许转 SUBMITTING；返回 false 时调用方必须跳过该镜，绝不重复提交付费。
+     * 默认实现退化为旧 markSubmitting（异常视为失败）。
+     */
+    suspend fun tryMarkSubmitting(shotId: String): Boolean {
+        return try {
+            markSubmitting(shotId)
+            true
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            false
+        }
+    }
 }
 
 // ============ 预算闸门 ============

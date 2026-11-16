@@ -21,6 +21,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -43,6 +44,7 @@ import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.ui.res.painterResource
+import com.dramafactory.app.AppGraph
 import com.dramafactory.app.R
 import com.dramafactory.app.data.RenderTaskEntity
 import com.dramafactory.app.ui.components.DramaCard
@@ -85,6 +87,17 @@ fun QueuePage(
     LaunchedEffect(st.shotStates) { vm.refreshRenderTasks() }
     var previewShotId by remember { mutableStateOf<String?>(null) }
     var reasonShotId by remember { mutableStateOf<String?>(null) }
+
+    // 第五批：预算上限可调（工程 ID 与 RenderRuntime.projectIdOf 对齐：截到最后一个 _ep 之前）
+    val projectId = remember(episodeId) { episodeId.substringBeforeLast("_ep") }
+    var budgetLimit by remember(projectId) { mutableStateOf(st.usage.limit) }
+    var showBudgetLimitDialog by remember { mutableStateOf(false) }
+    var budgetLimitInput by remember { mutableStateOf("") }
+    var budgetLimitError by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(projectId, st.usage.limit) {
+        budgetLimit = runCatching { AppGraph.budgetLimit(projectId) }.getOrDefault(0)
+            .takeIf { it > 0 } ?: st.usage.limit
+    }
 
     // 第六轮：图生视频/视频参考 入口状态
     var pendingShotId by remember { mutableStateOf<String?>(null) }
@@ -132,10 +145,9 @@ fun QueuePage(
                     id.substringAfterLast("_").takeIf { it.startsWith("ep", ignoreCase = true) } ?: id
                 } ?: "本集"
                 val epLabel = "第${epDisplay}集"
-                // 第四批：逐镜进度统计（shotStates 是本页逐镜事实；队列快照为空时回退 snapshot）
-                val statTotal = if (st.shotStates.isNotEmpty()) st.shotStates.size else snap.totalShots
-                val statCompleted = if (st.shotStates.isNotEmpty())
-                    st.shotStates.values.count { it == "COMPLETED" } else snap.completedShots
+                // 第五批：统计只认本页逐镜事实 shotStates（不再回退 snapshot 的 0/0，见 batch5 P0-2）
+                val statTotal = st.shotStates.size
+                val statCompleted = st.shotStates.values.count { it == "COMPLETED" }
                 val statFailed = st.shotStates.values.count { it == "FAILED" || it == "BLOCKED" }
                 val statPending = (statTotal - statCompleted - statFailed).coerceAtLeast(0)
                 // ★v1.10：头部进度改用本页逐镜事实（历史失败任务存在时 snapshot 可能为 0/0）
@@ -147,19 +159,34 @@ fun QueuePage(
                 Text("已完成 $statCompleted / 失败 $statFailed / 待处理 $statPending / 共 $statTotal",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
-                val statusLine = when (pauseText) {
-                    null -> if (snap.running) "渲染中…" else "空闲 · 点击「开始渲染」入队"
-                    "budget_exceeded" -> "已暂停：预算达上限，等待确认"
-                    "auth_401" -> "已暂停：API Key失效，请到设置页更新"
-                    else -> "已暂停：$pauseText"
+                // 第五批：暂停原因统一走中文映射（QueueLogic.pausedReasonText，纯 Kotlin 可单测）
+                val statusLine = if (pauseText == null) {
+                    if (snap.running) "渲染中…" else "空闲 · 点击「开始渲染」入队"
+                } else {
+                    "已暂停：" + (pausedReasonText(pauseText) ?: pauseText)
                 }
                 val isPaused = pauseText != null
                 Text(statusLine, style = MaterialTheme.typography.bodySmall,
                     color = if (isPaused) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outline)
-                // 预算用量条（条数型，决议Q2）
-                Text("预算：${st.usage.used}/${st.usage.limit} 条" +
-                        (if (st.usage.priceEstimateYuan > 0) " · 约¥%.2f".format(st.usage.priceEstimateYuan) else ""),
-                    style = MaterialTheme.typography.bodySmall)
+                // 预算用量条（条数型，决议Q2）；第五批：上限可调，保存后立即生效
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("预算：${st.usage.used}/$budgetLimit 条" +
+                            (if (st.usage.priceEstimateYuan > 0) " · 约¥%.2f".format(st.usage.priceEstimateYuan) else ""),
+                        style = MaterialTheme.typography.bodySmall)
+                    CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides 32.dp) {
+                        OutlinedButton(
+                            onClick = {
+                                budgetLimitError = null
+                                budgetLimitInput = budgetLimit.toString()
+                                showBudgetLimitDialog = true
+                            },
+                            enabled = !snap.running,
+                            modifier = Modifier.height(32.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                        ) { Text("调整上限", style = MaterialTheme.typography.labelMedium) }
+                    }
+                }
 
                 // ---- 暂停/恢复/开始按钮组（FlowRow：窄屏自动换行，不再挤压放大）----
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -168,10 +195,9 @@ fun QueuePage(
                     Button(onClick = { vm.resume() },
                         enabled = !snap.running && snap.pausedReason != "budget_exceeded") { Text("恢复") }
                     Button(onClick = {
-                        // 入队一集（shots由分镜层供给；MVP从checkpoint/DB取）
-                        vm.enqueue(emptyList())
-                    }, enabled = (!snap.running && snap.pausedReason == null && snap.totalShots > 0) ||
-                            (!snap.running && st.shotStates.isNotEmpty())) {
+                        // 第五批：从本集分镜表读真实镜头构造 ShotMeta 入队（原先传空列表恒为 0 镜）
+                        vm.enqueueCurrentEpisode()
+                    }, enabled = !snap.running) {
                         Text(if (snap.running) "渲染中" else "开始渲染")
                     }
                 }
@@ -293,9 +319,55 @@ fun QueuePage(
         AlertDialog(
             onDismissRequest = { vm.dismissBudgetConfirm() },
             title = { Text("预算已达上限") },
-            text = { Text("已用 ${st.usage.used}/${st.usage.limit} 条。继续渲染将超出预设上限并产生额外费用。\n确认继续吗？") },
+            text = { Text("已用 ${st.usage.used}/$budgetLimit 条。继续渲染将超出预设上限并产生额外费用。\n确认继续吗？") },
             confirmButton = { Button(onClick = { vm.confirmBudget() }) { Text("继续渲染（超限放行）") } },
             dismissButton = { OutlinedButton(onClick = { vm.dismissBudgetConfirm() }) { Text("暂不渲染") } },
+        )
+    }
+
+    // ---- 第五批：调整预算上限（1–200；保存同步 AppGraph/SharedPreferences 与 budgetGuard）----
+    if (showBudgetLimitDialog) {
+        val parsed = budgetLimitInput.toIntOrNull()
+        val valid = parsed != null && parsed in 1..200
+        AlertDialog(
+            onDismissRequest = { showBudgetLimitDialog = false },
+            title = { Text("调整预算上限") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("每集最多提交渲染的镜头数（1–200）。保存后立即生效，已用条数不受影响。",
+                        style = MaterialTheme.typography.bodySmall)
+                    OutlinedTextField(
+                        value = budgetLimitInput,
+                        onValueChange = { raw ->
+                            budgetLimitInput = raw.filter { it.isDigit() }.take(3)
+                            budgetLimitError = null
+                        },
+                        singleLine = true,
+                        isError = budgetLimitError != null || (budgetLimitInput.isNotEmpty() && !valid),
+                        label = { Text("上限（条）") },
+                        supportingText = {
+                            Text(budgetLimitError ?: if (valid) "当前已用 ${st.usage.used} 条" else "请输入 1–200 的整数")
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    val n = budgetLimitInput.toIntOrNull()
+                    if (n != null && n in 1..200) {
+                        runCatching { AppGraph.setBudgetLimit(projectId, n) }
+                            .onSuccess {
+                                budgetLimit = n
+                                showBudgetLimitDialog = false
+                            }
+                            .onFailure { budgetLimitError = it.message ?: "保存失败，请重试" }
+                    }
+                }, enabled = valid) { Text("保存") }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { showBudgetLimitDialog = false }) { Text("取消") }
+            },
         )
     }
 

@@ -405,7 +405,7 @@ fun StoryboardPage(
                 DramaCard(Modifier.fillMaxWidth()) {
                     Column(Modifier, verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         Text(
-                            "分镜设计：${st.shots.size} 镜 · 总 ${totalSeconds.toInt()} 秒 · 平均 ${((average * 10).toInt() / 10.0)} 秒",
+                            "分镜设计：${st.shots.size} 镜 · 已渲染 ${st.videoUris.size} 镜 · 总 ${totalSeconds.toInt()} 秒 · 平均 ${((average * 10).toInt() / 10.0)} 秒",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -471,8 +471,9 @@ fun StoryboardPage(
             }
             item {
                 PrimaryButton(
-                    text = "渲染本集全部 ${st.shots.size} 镜",
-                    onClick = { vm.enqueueRender { n -> queuedCount = n } },
+                    text = "渲染本集全部 ${st.shots.size} 镜 · 已渲染 ${st.videoUris.size} 镜",
+                    // 第五批：先预检（读库统计镜数/未过审镜），弹确认后才真正入队，避免误触付费。
+                    onClick = { vm.requestRender() },
                     enabled = !st.generating,
                     modifier = Modifier.fillMaxWidth(),
                 )
@@ -684,6 +685,34 @@ fun StoryboardPage(
                 }
             }
         }
+    }
+
+    // 第五批：渲染入口二次确认（预检结果来自 vm.requestRender → state.renderPrompt，未调用付费接口）
+    st.renderPrompt?.let { prompt ->
+        AlertDialog(
+            onDismissRequest = { vm.dismissRenderPrompt() },
+            title = { Text(if (prompt.blockedShotNos.isEmpty()) "确认提交渲染" else "有镜头未通过校验") },
+            text = {
+                Text(
+                    if (prompt.blockedShotNos.isEmpty()) {
+                        "本集 ${prompt.totalShots} 镜将提交渲染，可能产生视频费用，确认？"
+                    } else {
+                        "本集 ${prompt.totalShots} 镜中有 ${prompt.blockedShotNos.size} 镜未过审（" +
+                            prompt.blockedShotNos.joinToString("、") { "#$it" } +
+                            "），整集渲染会被中止。是否仍要提交？"
+                    }
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    vm.dismissRenderPrompt()
+                    vm.enqueueRender { n -> queuedCount = n }
+                }) { Text(if (prompt.blockedShotNos.isEmpty()) "确认渲染" else "仍要提交") }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { vm.dismissRenderPrompt() }) { Text("取消") }
+            },
+        )
     }
 
     val viewingShot = viewingShotId?.let { id -> st.shots.firstOrNull { it.shot_id == id } }

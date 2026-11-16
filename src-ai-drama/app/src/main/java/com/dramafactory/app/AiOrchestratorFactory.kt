@@ -125,28 +125,49 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
             // ★F2 修复：真实质量审计——调用 AssetAuditor.audit（G1 文件级硬校验 + G2 多模态打分），
             // 替换原直接返回 passed=true 的「假通过」（原实现关闭了 PRD F03 两层闸门）。
             // ★第二批 P0 fail-closed：未生成图像/未配置 Key/取图解码失败 = 审核未通过（passed=false），
-            // 由编排器重新生成后再审；不再静默放行。
+            // ★第五批 task-21：标记 NON_RETRYABLE，由编排器立即止损（为无图/无 Key 重生成不会通过）。
             // 注意：λ 返回类型必须是 Result<AuditResult>，故整体包在 runCatching 内；
-            // 异常会变为 Result.failure，由编排器 AUDIT 阶段按「未过」处理（WARN 标红放行）。
+            // 异常会变为 Result.failure（NON_RETRYABLE），由编排器 AUDIT 阶段立即止损、不再盲重生成。
             runCatching {
                 val remoteUrl = runCatching { dao.assetRemoteUrl(asset.assetId) }.getOrNull()
                 // ★第二批 P0 fail-closed："没法审" 不再等于 "通过"。
                 // 旧实现无图/无 Key/取图失败/解码失败一律 passed=true，等于关掉质量闸；
-                // 现在一律 passed=false，由编排器走「重新生成→再审」循环；仍不过则 rejected，渲染永不引用。
+                // 现在一律 passed=false：前四类（无图/无Key/取图/解码）标 NON_RETRYABLE 立即止损，
+                // 只有画面类缺陷（QualityEngine REJECTED）才走「重生成→再审」，重试用尽落 rejected。
                 if (remoteUrl.isNullOrBlank()) {
                     markAssetAuditPending(asset.assetId, "audit_no_image")
-                    return@runCatching DefaultAiOrchestrator.AuditResult(passed = false, reason = "audit_no_image")
+                    return@runCatching DefaultAiOrchestrator.AuditResult(
+                        passed = false,
+                        reason = "audit_no_image",
+                        verdict = DefaultAiOrchestrator.AuditVerdict.NON_RETRYABLE,
+                        errorCode = "audit_no_image",
+                    )
                 }
                 if (!agnesKeyReady()) {
                     markAssetAuditPending(asset.assetId, "audit_no_key")
-                    return@runCatching DefaultAiOrchestrator.AuditResult(passed = false, reason = "audit_no_key")
+                    return@runCatching DefaultAiOrchestrator.AuditResult(
+                        passed = false,
+                        reason = "audit_no_key",
+                        verdict = DefaultAiOrchestrator.AuditVerdict.NON_RETRYABLE,
+                        errorCode = "audit_no_key",
+                    )
                 }
                 val bytes = MediaHelpers.fetchImageBytes(remoteUrl)
-                    ?: return@runCatching DefaultAiOrchestrator.AuditResult(passed = false, reason = "audit_image_fetch_failed").also {
+                    ?: return@runCatching DefaultAiOrchestrator.AuditResult(
+                        passed = false,
+                        reason = "audit_image_fetch_failed",
+                        verdict = DefaultAiOrchestrator.AuditVerdict.NON_RETRYABLE,
+                        errorCode = "audit_image_fetch_failed",
+                    ).also {
                         markAssetAuditPending(asset.assetId, "audit_image_fetch_failed")
                     }
                 val dataUri = MediaHelpers.downscaleToDataUri(bytes)
-                    ?: return@runCatching DefaultAiOrchestrator.AuditResult(passed = false, reason = "audit_image_decode_failed").also {
+                    ?: return@runCatching DefaultAiOrchestrator.AuditResult(
+                        passed = false,
+                        reason = "audit_image_decode_failed",
+                        verdict = DefaultAiOrchestrator.AuditVerdict.NON_RETRYABLE,
+                        errorCode = "audit_image_decode_failed",
+                    ).also {
                         markAssetAuditPending(asset.assetId, "audit_image_decode_failed")
                     }
                 val describer = com.dramafactory.core.quality.AssetAuditor.agnesDescriber(agnes, "")
@@ -175,8 +196,30 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                     passed = outcome.auditState == com.dramafactory.core.model.AuditState.APPROVED,
                     score = outcome.qualityScore,
                     reason = outcome.rejectReason,
+                    // ★第五批 task-21：质量引擎的未通过属于画面类缺陷（构图/脸崩/风格不符），可重生成；
+                    // 无图/无 Key/取图解码失败走上面的 NON_RETRYABLE 早退，不再为不可修复原因 3 倍付费。
+                    verdict = if (outcome.auditState == com.dramafactory.core.model.AuditState.APPROVED)
+                        DefaultAiOrchestrator.AuditVerdict.PASSED
+                    else DefaultAiOrchestrator.AuditVerdict.RETRYABLE_CONTENT_FAILURE,
+                    defects = outcome.defects,
+                    errorCode = outcome.g1ErrorCode,
                 )
             }.onFailure { markAssetAuditPending(asset.assetId, it.message ?: "audit_exception") }
+        },
+        onAssetAuditRejected = { assetId, rejectReason, defectsJson, qualityScore ->
+            // ★第五批 P0（task-21）：画面类缺陷重试用尽 → audit_state=rejected + 原因 + defects 落库，
+            // 渲染侧据此硬拦，不再把未过审的图当参考图/关键帧。
+            try {
+                dao.setAssetQuality(
+                    assetId = assetId, qualityScore = qualityScore, auditState = "rejected",
+                    defectsJson = defectsJson, rejectReason = rejectReason, g1ErrorCode = null,
+                    faceRatio = null, poseRole = null, updatedAt = System.currentTimeMillis(),
+                )
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                // 拒绝结论落库失败不阻断流水线（编排器侧已 emit WARN）
+            }
         },
         generateShots = { pid, script, _ ->
             runCatching {

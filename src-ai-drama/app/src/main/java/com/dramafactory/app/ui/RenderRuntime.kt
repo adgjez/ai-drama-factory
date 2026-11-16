@@ -62,6 +62,35 @@ object RenderRuntime {
                 shotDurationProvider = { shotId ->
                     runCatching { AppGraph.dao.shotKeyframes(shotId)?.duration_seconds }.getOrNull() ?: 0.0
                 },
+                // ★第五批 P0：空白分镜止损——台词/旁白/动作全空的孤儿镜绝不提交付费任务
+                blockEmptyPrompt = true,
+                // ★第五批 P0：付费 clip 本地丢失自愈（先看旧 cacheDir/clips，兼容升级前已下载的片）
+                clipFileChecker = { uri, _ ->
+                    fun ok(f: java.io.File?): Boolean = f != null && f.isFile && f.length() > 0L
+                    val f = runCatching { java.io.File(uri) }.getOrNull()
+                    if (ok(f)) true else {
+                        val legacy = AppGraph.appContext()?.let { ctx ->
+                            f?.name?.let { name -> java.io.File(java.io.File(ctx.cacheDir, "clips"), name) }
+                        }
+                        ok(legacy)
+                    }
+                },
+                // ★第五批 P0：已落库的远端成片 URL（clip 被清理后可重取，不重新提交付费）
+                recordedRemoteUrlOf = { shotId ->
+                    runCatching {
+                        AppGraph.dao.renderTasksOfShot(shotId).maxByOrNull { it.submitted_at ?: 0L }
+                            ?.remote_video_url
+                    }.getOrNull()
+                },
+                // ★第五批 P0：轮询到成片 URL 就落库（本地下载失败也能追溯/重取）
+                remoteUrlRecorder = { shotId, url ->
+                    runCatching {
+                        val row = AppGraph.dao.renderTasksOfShot(shotId).maxByOrNull { it.submitted_at ?: 0L }
+                        if (row != null && row.remote_video_url != url) {
+                            AppGraph.dao.upsertRenderTask(row.copy(remote_video_url = url))
+                        }
+                    }
+                },
                 // ★v1.8.0 质量三闸接线（对齐 pavo fidelity_gate + storyboard 六铁律 + shot_director 开场帧重渲染）
                 // 提交前保真闸：把该镜分镜条目编译为 StoryboardGate.Entry 跑 FidelityGate。
                 // 未绑定资产的镜 fail-soft 跳过（避免误杀纯场景/动作镜，整集 sb_check 仍覆盖）。
@@ -310,7 +339,9 @@ object RenderRuntime {
      * 失败抛异常 → 队列保持SUBMITTED仅重试取回，绝不重新提交已付费任务。
      */
     private suspend fun downloadClip(videoUrl: String, shotId: String): Pair<String, Long> {
-        val dir = cacheDir()
+        // ★第五批 P0：付费 clip 不再落 cacheDir（系统可随时清理 → 成片页缺镜、只能重渲重付）。
+        // 统一写 filesDir/clips（持久），远端 URL 同时落库，被清理后也能免费重取。
+        val dir = clipDir()
         // ★F5 修复：校验 mkdirs() 结果，目录不可写立即抛明确错误，不再静默丢弃返回值。
         if ((!dir.exists() && !dir.mkdirs()) || !dir.isDirectory) {
             throw IllegalStateException("无法创建/访问 clip 缓存目录：${dir.absolutePath}")
@@ -343,9 +374,10 @@ object RenderRuntime {
      * 不再用 java.io.tmpdir（ART 上取值不可控，且与全项目策略不一致）。
      * 兜底顺序：appContext().cacheDir → appContext().filesDir/clips → 最后才退 java.io.tmpdir。
      */
-    private fun cacheDir(): java.io.File {
+    private fun clipDir(): java.io.File {
         val ctx = AppGraph.appContext()
-        val base = ctx?.cacheDir ?: ctx?.filesDir
+        // 优先持久目录 filesDir/clips；cacheDir 仅在无 filesDir 时兜底（兼容异常环境）
+        val base = ctx?.filesDir ?: ctx?.cacheDir
         if (base != null) return java.io.File(base, "clips")
         return java.io.File(System.getProperty("java.io.tmpdir") ?: "/tmp", "ai-drama-clips")
     }

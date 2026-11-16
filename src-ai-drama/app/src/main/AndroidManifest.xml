@@ -10,14 +10,9 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 第六轮：本地上传拍摄需要相机权限 -->
     <uses-permission android:name="android.permission.CAMERA" />
-    <!-- 相册读取（READ_MEDIA_IMAGES/VIDEO 在 Android 13+；旧版用 READ_EXTERNAL_STORAGE） -->
-    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
-    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
-        android:maxSdkVersion="32" />
-    <!-- 崩溃日志写到 Download 目录（Android 10 仍可用，11+ 受限制但 runCatching 兜底） -->
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="29" />
+    <!-- 第五批 P0：删除未使用的媒体/存储权限。全仓 grep 确认无消费者：
+         相册选择走 ActivityResultContracts.GetContent()（系统 picker 临时授权），
+         崩溃日志写 App 专属目录 getExternalFilesDir()，均无需 READ_MEDIA_* / READ/WRITE_EXTERNAL_STORAGE。 -->
 
     <application
         android:name=".DramaApplication"

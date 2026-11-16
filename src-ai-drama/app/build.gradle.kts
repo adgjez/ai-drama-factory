@@ -59,8 +59,8 @@ android {
             }
         }
     }
-    // 缺少签名配置时（如 CI 没有密钥）不再直接抛错，回退到默认 debug 签名，
-    // 否则整个 Gradle 配置阶段失败，连 :core-engine:test 都跑不起来。
+    // 缺少签名配置时（如 CI 没有密钥）不阻断 Gradle 配置阶段（否则 :core-engine:test 也跑不起来）；
+    // release 构建由下方 tasks 守卫在执行期直接失败，绝不产出 unsigned / 误签名包。
     fun secret(name: String): String? = keyProps[name] ?: System.getenv(name)
     val KEYSTORE_DIR = "keystore"
     val KEYSTORE_FILE = "drama-release.jks"
@@ -81,15 +81,34 @@ android {
     } else {
         logger.warn("未找到签名密钥配置，使用默认 debug 签名（仅适用于 CI / 本地测试）")
     }
-    // debug 也用固定签名（与发布同 keystore），使 assembleDebug 产出可覆盖安装的包。
+    // 签名策略（第五批 P0 安全收口）：
+    // - debug 包显式用 Android 默认 debug keystore（不再复用 release 签名）：
+    //   debug 包无法覆盖安装正式包，调试产物也不会被误当发布包分发。
+    // - release 只在签名齐全时构建；缺 AI_DRAMA_* 时 assembleRelease 直接失败（见下方守卫）。
+    // - 注意：签名从旧 debug 签名切到 release 签名后，旧安装包无法覆盖升级，
+    //   用户需先卸载一次再安装正式包。
     buildTypes {
         debug {
-            if (hasSigning) signingConfig = signingConfigs.getByName("releaseSigned")
+            signingConfig = signingConfigs.getByName("debug")
             isDebuggable = true
         }
         release {
             if (hasSigning) signingConfig = signingConfigs.getByName("releaseSigned")
             isMinifyEnabled = false
+        }
+    }
+    // 缺签名时拒绝 release 构建（配置阶段不抛错，避免 core-engine 测试也跑不起来）
+    if (!hasSigning) {
+        tasks.configureEach {
+            if (name == "assembleRelease" || name == "bundleRelease") {
+                doFirst {
+                    throw org.gradle.api.GradleException(
+                        "缺少 release 签名：请在 local.properties 或环境变量配置 " +
+                            "AI_DRAMA_KEY_ALIAS / AI_DRAMA_STORE_PASSWORD / AI_DRAMA_KEY_PASSWORD，" +
+                            "并把 keystore 放到 app/keystore/drama-release.jks（见 README「构建」）"
+                    )
+                }
+            }
         }
     }
 

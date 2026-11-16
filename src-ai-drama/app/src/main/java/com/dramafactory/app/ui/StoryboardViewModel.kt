@@ -37,6 +37,8 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
         val rewritingField: String? = null,
         /** 第四批：AI 重写成功结果，UI 回填输入框后调 consumeRewriteResult() 清空 */
         val rewriteResult: ShotFieldRewriteResult? = null,
+        /** 第五批：渲染入口预检结果（非空时 UI 弹确认；预检只读库、不调用付费接口） */
+        val renderPrompt: RenderPrompt? = null,
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -148,6 +150,11 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
             _state.value = _state.value.copy(generating = false, message = "分镜保存失败：${e.message ?: e.javaClass.simpleName}")
             return@launch
         }
+        // 第五批：全量重生成后旧镜的渲染任务全部失效，必须清空本集 render_tasks，
+        // 否则 QueuePage 会按 checkpoint 旧任务继续渲染已删除/已改内容的镜头（P0）。
+        val renderReset = runCatching {
+            withContext(Dispatchers.IO) { AppGraph.dao.deleteRenderTasksOf(episodeId) }
+        }.isSuccess
         refresh()
         val errCount = result.gateErrors.count { (_, codes) -> codes.any { it !in SOFT_SB_CHECK_CODES } }
         val softCount = result.gateErrors.count { (_, codes) -> codes.isNotEmpty() && codes.all { it in SOFT_SB_CHECK_CODES } }
@@ -171,7 +178,8 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
         }
         _state.value = _state.value.copy(generating = false, message =
             "已生成${result.shots.size}镜" + (if (errCount > 0) "（其中${errCount}镜校验有误，见列表标记）" else "，全部通过校验✓") +
-                (if (softCount > 0) "（${softCount}镜有画面描述提示，不阻断渲染）" else "") + noAssetNote)
+                (if (softCount > 0) "（${softCount}镜有画面描述提示，不阻断渲染）" else "") + noAssetNote +
+                (if (renderReset) " · 已重置本集渲染队列" else " · ⚠ 重置渲染队列失败，请到渲染页清空队列"))
     }
 
     /**
@@ -215,17 +223,23 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
             visual_prompt = s.visualPrompt, duration_seconds = s.durationSeconds,
             sb_check = sbCheckFromResult(result.gateErrors[s.shotNo])
         )
+        var renderInvalidateFailure: Throwable? = null
         runCatching {
             withContext(Dispatchers.IO) {
                 AppGraph.dao.upsertShot(updated)
                 check(AppGraph.dao.shotKeyframes(shotId)?.sb_check == updated.sb_check) { "单镜重生成后读回不一致" }
+                // 第五批：镜头内容已变，旧渲染结果失效；删除失败不阻断保存，只在 message 提示。
+                runCatching { AppGraph.dao.deleteRenderTask(shotId) }
+                    .onFailure { renderInvalidateFailure = it }
             }
         }.onFailure {
             _state.value = _state.value.copy(generating = false, message = "单镜保存失败：${it.message}")
             return@launch
         }
         refresh()
-        _state.value = _state.value.copy(generating = false, message = "镜头 #${old.shot_no} 已重新生成并完成校验")
+        _state.value = _state.value.copy(generating = false, message =
+            "镜头 #${old.shot_no} 已重新生成并完成校验" +
+                (if (renderInvalidateFailure != null) "（渲染任务失效失败，可重新入队）" else "，该镜渲染结果已失效✓"))
     }
 
 
@@ -253,8 +267,20 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
                 }
             }
         }.exceptionOrNull()
+        // 第五批：画面语义已变 → 删掉该镜旧 render_task，否则同 shot_id 的 COMPLETED 会让重渲被跳过。
+        var renderInvalidateFailure: Throwable? = null
+        if (failure == null) {
+            renderInvalidateFailure = runCatching {
+                withContext(Dispatchers.IO) { AppGraph.dao.deleteRenderTask(shotId) }
+            }.exceptionOrNull()
+        }
         refresh()
-        _state.value = _state.value.copy(message = failure?.let { "保存分镜失败：${it.message}" } ?: "已保存镜头修改✓")
+        _state.value = _state.value.copy(message = when {
+            failure != null -> "保存分镜失败：${failure.message}"
+            renderInvalidateFailure != null ->
+                "已保存镜头修改，但渲染任务失效失败：${renderInvalidateFailure?.message}（请到渲染页清空后重新入队）"
+            else -> "已保存镜头修改，该镜渲染结果已失效✓"
+        })
     }
 
     /**
@@ -279,9 +305,19 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
                 }
             }
         }.exceptionOrNull()
+        var renderInvalidateFailure: Throwable? = null
+        if (failure == null) {
+            renderInvalidateFailure = runCatching {
+                withContext(Dispatchers.IO) { AppGraph.dao.deleteRenderTask(shotId) }
+            }.exceptionOrNull()
+        }
         refresh()
-        _state.value = _state.value.copy(message =
-            failure?.let { "保存场次信息失败：${it.message}" } ?: "已保存场次/站位/视线✓")
+        _state.value = _state.value.copy(message = when {
+            failure != null -> "保存场次信息失败：${failure.message}"
+            renderInvalidateFailure != null ->
+                "已保存场次/站位/视线，但渲染任务失效失败：${renderInvalidateFailure?.message}（请到渲染页清空后重新入队）"
+            else -> "已保存场次/站位/视线，该镜渲染结果已失效✓"
+        })
     }
 
     /** 删除单镜 */
@@ -292,8 +328,19 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
                 check(AppGraph.dao.shotKeyframes(shotId) == null) { "分镜删除后仍可读回：$shotId" }
             }
         }.exceptionOrNull()
+        // 第五批：删镜同时删 render_task，避免渲染队列里留孤儿任务。
+        var renderFailure: Throwable? = null
+        if (failure == null) {
+            renderFailure = runCatching {
+                withContext(Dispatchers.IO) { AppGraph.dao.deleteRenderTask(shotId) }
+            }.exceptionOrNull()
+        }
         refresh()
-        if (failure != null) _state.value = _state.value.copy(message = "删除分镜失败：${failure.message}")
+        _state.value = _state.value.copy(message = when {
+            failure != null -> "删除分镜失败：${failure.message}"
+            renderFailure != null -> "分镜已删除，但渲染任务清理失败：${renderFailure?.message}"
+            else -> "分镜已删除✓"
+        })
     }
 
     /**
@@ -314,6 +361,29 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
         runCatching { queue.enqueueEpisode(episodeId, metas) }
             .onSuccess { onQueued(metas.size) }
             .onFailure { _state.value = _state.value.copy(message = "入队失败：${it.message}") }
+    }
+
+    /**
+     * 第五批：渲染入口预检——只读 shotsOf(episodeId) 统计镜数与未过审镜，
+     * 结果写进 state.renderPrompt 由 UI 弹确认框；这里不调用任何付费/入队接口。
+     */
+    fun requestRender() = viewModelScope.launch {
+        val rows = runCatching {
+            withContext(Dispatchers.IO) { AppGraph.dao.shotsOf(episodeId) }
+        }.getOrNull()
+        if (rows.isNullOrEmpty()) {
+            _state.value = _state.value.copy(message = "本集还没有分镜，无法提交渲染")
+            return@launch
+        }
+        val blocked = rows.filter { sbCheckBlocks(it.sb_check) }.map { it.shot_no }
+        _state.value = _state.value.copy(renderPrompt = RenderPrompt(rows.size, blocked))
+    }
+
+    /** 第五批：关闭渲染确认框（取消或已确认后调用）。 */
+    fun dismissRenderPrompt() {
+        if (_state.value.renderPrompt != null) {
+            _state.value = _state.value.copy(renderPrompt = null)
+        }
     }
 
     // ---- 第四批：场次结构操作（合并 / 拆分 / 单镜跨场移动）----
@@ -531,6 +601,7 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
         }
         _state.value = _state.value.copy(
             rewritingField = "$shotId|$field", message = null, rewriteResult = null)
+        var renderInvalidateFailure: Throwable? = null
         val outcome = runCatching {
             // ① 只读快照（网络请求不占 writeLock，避免重写期间 UI 保存被卡住）
             val snapshot = withContext(Dispatchers.IO) {
@@ -582,13 +653,19 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
                     check(back != null && rewrittenValueOf(back, field) == value) {
                         "AI 重写落库后读回不一致：$shotId/$field"
                     }
+                    // 第五批：字段已变，旧渲染结果失效（失败不阻断重写落库，只在 message 提示）。
+                    runCatching { AppGraph.dao.deleteRenderTask(shotId) }
+                        .onFailure { renderInvalidateFailure = it }
                 }
             }
             row.shot_no to value
         }
         refresh()
         val message = outcome.fold(
-            onSuccess = { pair -> "已重写镜头 #${pair.first} 的${shotFieldLabel(field)}" },
+            onSuccess = { pair ->
+                "已重写镜头 #${pair.first} 的${shotFieldLabel(field)}" +
+                    (if (renderInvalidateFailure != null) "（渲染任务失效失败，可重新入队）" else "，该镜渲染结果已失效✓")
+            },
             onFailure = { e -> "AI 重写未生效：${e.message ?: e.javaClass.simpleName}" },
         )
         val result = outcome.getOrNull()?.let { ShotFieldRewriteResult(shotId, field, it.second) }
@@ -654,3 +731,12 @@ data class ShotFieldRewriteResult(
     val field: String,
     val value: String,
 )
+
+/**
+ * 第五批：渲染入口预检结果。blockedShotNos = sb_check 含 error 的镜号（整集渲染会被运行时闸门中止）。
+ */
+data class RenderPrompt(val totalShots: Int, val blockedShotNos: List<Int>)
+
+/** 第五批：该镜的 sb_check 是否会阻断整集渲染（与 RenderRuntime 的 error 判定同口径）。 */
+private fun sbCheckBlocks(sb: String?): Boolean =
+    sb != null && sb != "pass" && sb.contains("error")

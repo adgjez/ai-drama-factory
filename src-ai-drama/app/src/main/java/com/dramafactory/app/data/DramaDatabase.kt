@@ -127,6 +127,8 @@ data class RenderTaskEntity(
     val blocked_reason: String? = null,
     val fail_reason: String? = null,
     val local_file_uri: String? = null,
+    /** ★第五批 P0：远端成片 URL。本地 clip 被系统清理后可重取，避免重新提交付费任务 */
+    val remote_video_url: String? = null,
     val file_size: Long = 0,             // size>0才算completed
     val submitted_at: Long? = null,
     val completed_at: Long? = null,

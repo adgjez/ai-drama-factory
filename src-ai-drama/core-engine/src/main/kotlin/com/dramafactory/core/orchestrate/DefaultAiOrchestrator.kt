@@ -13,6 +13,9 @@ import kotlinx.coroutines.flow.StateFlow
  * 纯 Kotlin 类（core-engine 模块），所有外部依赖以函数引用注入，JVM 可单测。
  * :app 模块负责将 AppGraph 真实实现绑定到 DefaultAiOrchestrator 实例。
  */
+/** ★第五批 P0（task-21）：画面类缺陷最多重生成 2 次（共审 3 张）；不可重试原因直接止损，不再为无图/无 Key 重生成付费。 */
+private const val MAX_AUDIT_REGENERATIONS = 2
+
 interface AiOrchestrator {
 
     /** 五阶段流水线实时进度（StateFlow 追加式日志流） */
@@ -120,6 +123,10 @@ class DefaultAiOrchestrator(
     private val readShots: suspend (episodeId: String) -> List<AiShot> = { emptyList() },
     /** 激活的文本模型 id 提供方（AppGraph 注入当前激活的 DeepSeek 模型 id；不能硬编码 default） */
     private val activeTextModelIdProvider: () -> String = { "default" },
+    /** ★第五批 P0（task-21）：画面类缺陷重试用尽后的拒绝结论落库（assetId、原因、defects JSON）。
+     *  默认空实现：core 单测 / desktop 无 DB 时保持原行为；:app 注入 dao.setAssetQuality(audit_state=rejected)。 */
+    private val onAssetAuditRejected: suspend (assetId: String, rejectReason: String, defectsJson: String?, qualityScore: Double?) -> Unit =
+        { _, _, _, _ -> },
 ) : AiOrchestrator {
 
     private val _events = MutableStateFlow<List<ProgressEvent>>(emptyList())
@@ -297,23 +304,48 @@ class DefaultAiOrchestrator(
                 val stA = t0
                 emit(PipelineStage5.AUDIT, 0, "开始质量审计…", stA)
                 var auditedOk = 0
+                var failedCount = 0
                 for ((i, a) in assets.withIndex()) {
                     var passed = false
                     var regenerated = 0
-                    // 审计闭环：不过 → 重新生成一张 → 再审；最多重生成 2 次（共审 3 张），仍不过才标红。
-                    // 旧实现只是把同一张图连审两次，等于没重试。
+                    var lastReason = "未达质量线"
+                    var lastDefects: List<String> = emptyList()
+                    var lastErrorCode: String? = null
+                    var lastScore: Double? = null
+                    var nonRetryable = false
+                    // ★第五批 P0（task-21）：审计三分类止损。旧实现不管原因一律重生成 2 次（3 倍付费），
+                    // 无图/无 Key/取图解码失败/审计调用异常重生成也永远不会通过。现在只有画面类缺陷才重生成，
+                    // 且每次把上一轮 defects 反馈进 prompt；不可重试原因立即停止。
                     while (true) {
                         val r = auditAsset(a)
-                        if (r.isSuccess && r.getOrNull()?.passed == true) { passed = true; break }
-                        if (regenerated >= 2) break
-                        val reason = r.exceptionOrNull()?.message ?: r.getOrNull()?.reason ?: "未达质量线"
+                        // 结构化取消必须穿透：factory 的 runCatching 可能把 CancellationException 包成 failure
+                        val auditFailure = r.exceptionOrNull()
+                        if (auditFailure is CancellationException) throw auditFailure
+                        val res = r.getOrNull()
+                        if (r.isSuccess && res != null && res.passed) {
+                            passed = true
+                            break
+                        }
+                        lastReason = r.exceptionOrNull()?.message ?: res?.reason ?: "未达质量线"
+                        lastDefects = res?.defects ?: emptyList()
+                        lastErrorCode = res?.errorCode
+                        lastScore = res?.score
+                        val verdict = res?.verdict ?: AuditVerdict.NON_RETRYABLE
+                        if (r.isFailure || verdict == AuditVerdict.NON_RETRYABLE) {
+                            nonRetryable = true
+                            break
+                        }
+                        if (regenerated >= MAX_AUDIT_REGENERATIONS) break
+                        val feedbackPrompt = withAuditFeedback(a.prompt, lastDefects)
                         val regen = try {
-                            generateImage(a)
+                            generateImage(a.copy(prompt = feedbackPrompt))
                         } catch (e: CancellationException) {
                             throw e
                         } catch (t: Throwable) {
                             Result.failure<String>(t)
                         }
+                        val regenFailure = regen.exceptionOrNull()
+                        if (regenFailure is CancellationException) throw regenFailure
                         if (regen.isFailure) {
                             emit(PipelineStage5.AUDIT, i + 1,
                                 "资产${i + 1}审计未过且重生成失败：${(regen.exceptionOrNull()?.message ?: "unknown").take(80)}",
@@ -322,13 +354,37 @@ class DefaultAiOrchestrator(
                         }
                         regenerated++
                         emit(PipelineStage5.AUDIT, i + 1,
-                            "资产${i + 1}审计未过（${reason.take(60)}），已重新生成第 ${regenerated} 次",
+                            "资产${i + 1}审计未过（${lastReason.take(60)}），已按质检反馈重新生成第 $regenerated 次",
                             stA, ProgressEvent.Level.WARN)
                     }
-                    if (passed) auditedOk++
-                    else emit(PipelineStage5.AUDIT, i + 1, "资产${i + 1}审计 3 次仍未过：不可用于渲染（rejected/pending），需要人工复核", stA, ProgressEvent.Level.WARN)
+                    if (passed) {
+                        auditedOk++
+                    } else if (nonRetryable) {
+                        // 不可重试：不重生成、不标 rejected（无 Key/取图失败可能只是环境问题），
+                        // factory 侧已落 audit_state=pending + reject_reason，环境恢复后可重审。
+                        failedCount++
+                        emit(PipelineStage5.AUDIT, i + 1,
+                            "资产${i + 1}不可重试（${lastReason.take(80)}），已停止重生成，需到资产页处理",
+                            stA, ProgressEvent.Level.WARN, lastErrorCode ?: lastReason)
+                    } else {
+                        // 画面类缺陷重试用尽：rejected + 原因 + defects 落库，禁止进入渲染参考。
+                        failedCount++
+                        try {
+                            onAssetAuditRejected(a.assetId, lastReason, defectsJson(lastDefects), lastScore)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (t: Throwable) {
+                            emit(PipelineStage5.AUDIT, i + 1,
+                                "资产${i + 1}拒绝结论落库失败：${(t.message ?: t.javaClass.simpleName).take(80)}",
+                                stA, ProgressEvent.Level.WARN)
+                        }
+                        emit(PipelineStage5.AUDIT, i + 1,
+                            "已自动重试 $MAX_AUDIT_REGENERATIONS 次仍未过审，资产${i + 1}被拒绝，需到资产页重新生成（${lastReason.take(80)}）",
+                            stA, ProgressEvent.Level.WARN)
+                    }
                 }
-                emit(PipelineStage5.AUDIT, assets.size, "审计通过 ${auditedOk}/${assets.size}，未过已标红（不进入渲染）", stA)
+                emit(PipelineStage5.AUDIT, assets.size,
+                    "审计通过 $auditedOk/${assets.size}，未过 $failedCount（不可重试/重试用尽，需到资产页处理）", stA)
                 writeCheckpoint(episodeId, PipelineStage5.AUDIT, assetCount, 0, false, null)
             }
 
@@ -420,6 +476,23 @@ class DefaultAiOrchestrator(
         }
     }
 
+    /** task-21：把上一轮质检缺陷反馈进重生成 prompt（旧实现重生成沿用同一 prompt，等于盲重试）。 */
+    private fun withAuditFeedback(original: String, defects: List<String>): String {
+        val summary = if (defects.isNotEmpty()) defects.joinToString("、").take(200)
+                      else "画面质量未达标（构图/角色面部/风格一致性）"
+        return original + "\n上一版质检未过：" + summary + "；请避免并改进构图/服装/光线"
+    }
+
+    /** task-21：defects 列表 -> JSON；模型输出的引号替换为空格，保证落库 JSON 合法。 */
+    private fun defectsJson(defects: List<String>): String? {
+        if (defects.isEmpty()) return null
+        return defects.joinToString(",", prefix = "[", postfix = "]") { d ->
+            // 转义 JSON 字符串必需字符，避免模型输出的引号/换行/反斜杠破坏落库 JSON
+            val safe = d.replace("\\", " ").replace("\"", " ").replace("\n", " ").replace("\r", " ")
+            "\"" + safe + "\""
+        }
+    }
+
     private fun throwAi(msg: String, stage: PipelineStage5, st0: Long, cause: String): Nothing {
         val err = AiOrchestrator.AiError.StageFailed(msg, stage, cause)
         emit(stage, 0, msg, st0, ProgressEvent.Level.ERROR, msg)
@@ -461,5 +534,15 @@ class DefaultAiOrchestrator(
         val screenSide: String? = null,
         val eyeline: String? = null,
     )
-    data class AuditResult(val passed: Boolean, val score: Double? = null, val reason: String? = null)
+    /** task-21：审计结论三分类；verdict 默认按 passed 推导，兼容既有「只传 passed/score/reason」的构造。 */
+    enum class AuditVerdict { PASSED, RETRYABLE_CONTENT_FAILURE, NON_RETRYABLE }
+
+    data class AuditResult(
+        val passed: Boolean,
+        val score: Double? = null,
+        val reason: String? = null,
+        val verdict: AuditVerdict = if (passed) AuditVerdict.PASSED else AuditVerdict.RETRYABLE_CONTENT_FAILURE,
+        val defects: List<String> = emptyList(),
+        val errorCode: String? = null,
+    )
 }

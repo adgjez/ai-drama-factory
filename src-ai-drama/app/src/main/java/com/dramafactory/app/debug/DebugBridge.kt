@@ -1,5 +1,7 @@
 package com.dramafactory.app.debug
 
+import android.content.Context
+import android.content.SharedPreferences
 import android.util.Log
 import com.dramafactory.app.AppGraph
 import com.dramafactory.app.BuildConfig
@@ -7,12 +9,15 @@ import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
+import java.io.File
 import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
+import java.security.MessageDigest
+import java.security.SecureRandom
 
 /**
  * 调试桥（仅 debug 包启用）：在本机 127.0.0.1 上暴露只读的 JSON 查询接口，
@@ -21,7 +26,11 @@ import java.net.URLDecoder
  *
  * 设计约束：
  * - 只在 BuildConfig.DEBUG 构建里启动；release 包不会跑这段代码；
+ * - 可通过 SharedPreferences("dsh_debug" / debug_bridge_enabled) 关闭（默认开）；
  * - 只绑 127.0.0.1，不对外网/局域网开放；
+ * - 所有请求必须带 X-Debug-Token 头或 ?token=（SecureRandom 生成并持久化）；
+ *   鉴权失败返回 401，且不读取 DAO、不生成任何数据；
+ * - 不带 CORS 头：浏览器跨域读取被同源策略阻断；
  * - 只读：不提供任何写库或触发付费渲染的接口；
  * - 单线程 accept + 每连接一线程，DAO 调用走 runBlocking（IO 线程）。
  *
@@ -33,50 +42,148 @@ import java.net.URLDecoder
  *   /shots?episodeId=...
  *   /tasks?episodeId=...
  *   /summary?projectId=...
+ *
+ * 鉴权：所有端点都需带 X-Debug-Token 头或 ?token=；桥启动时把 baseUrl 与 token
+ * 写入 getExternalFilesDir(null)/debug-bridge.txt（一行 JSON），也可在设置页
+ * 「开发者选项」查看/复制。
  */
 object DebugBridge {
 
     const val PORT = 18765
     private const val TAG = "DebugBridge"
 
+    private const val PREFS = "dsh_debug"
+    private const val KEY_ENABLED = "debug_bridge_enabled"
+    private const val KEY_TOKEN = "debug_bridge_token"
+
     @Volatile private var started = false
 
-    fun start() {
-        if (!BuildConfig.DEBUG) return
-        if (started) return
-        started = true
-        Thread({ runServer() }, "drama-debug-bridge").apply { isDaemon = true }.start()
+    /** 当前监听 socket（stop() 时 close，以唤醒阻塞在 accept 的线程） */
+    @Volatile private var serverSocket: ServerSocket? = null
+
+    private fun prefs(context: Context): SharedPreferences =
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    /** 调试桥开关（默认 true；仅在 debug 包生效） */
+    fun isEnabled(context: Context): Boolean = prefs(context).getBoolean(KEY_ENABLED, true)
+
+    fun setEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_ENABLED, enabled).apply()
     }
 
-    private fun runServer() {
-        try {
-            ServerSocket(PORT, 16, InetAddress.getByName("127.0.0.1")).use { server ->
-                Log.i(TAG, "debug bridge listening on http://127.0.0.1:" + PORT)
-                while (true) {
-                    val client = try {
-                        server.accept()
-                    } catch (t: Throwable) {
-                        Log.w(TAG, "accept failed", t)
-                        break
-                    }
-                    Thread({ handle(client) }, "drama-debug-conn").apply { isDaemon = true }.start()
-                }
-            }
-        } catch (t: Throwable) {
-            Log.e(TAG, "debug bridge failed", t)
+    /** 已生成的 token（未生成过为 null），供设置页「开发者选项」展示 */
+    fun tokenOrNull(context: Context): String? =
+        prefs(context).getString(KEY_TOKEN, null)?.takeIf { it.isNotBlank() }
+
+    fun isRunning(): Boolean = started
+
+    /**
+     * 启动调试桥（需 Context 读开关 / 生成并落盘 token）。
+     * 幂等：已在监听或关闭状态下重复调用直接返回。
+     */
+    fun start(context: Context) {
+        if (!BuildConfig.DEBUG) return
+        val app = context.applicationContext
+        if (!isEnabled(app)) {
+            Log.i(TAG, "debug bridge disabled by " + PREFS + "/" + KEY_ENABLED)
+            return
+        }
+        synchronized(this) {
+            if (started || serverSocket != null) return
+            val token = ensureToken(app)
+            writeAccessInfo(app, token)
+            started = true
+            Thread({ runServer(token) }, "drama-debug-bridge").apply { isDaemon = true }.start()
         }
     }
 
-    private fun handle(client: Socket) {
+    /** 关闭监听（设置页开关用）；再次 start() 会重新监听，token 不变 */
+    fun stop() {
+        synchronized(this) {
+            started = false
+            runCatching { serverSocket?.close() }
+            serverSocket = null
+        }
+    }
+
+    /**
+     * token 首次启动时生成：SecureRandom 16 字节 → 32 位小写 hex。
+     * 持久化在 SharedPreferences("dsh_debug")，重启 App / 重开桥都不变。
+     */
+    private fun ensureToken(context: Context): String {
+        val p = prefs(context)
+        p.getString(KEY_TOKEN, null)?.takeIf { it.isNotBlank() }?.let { return it }
+        val bytes = ByteArray(16)
+        SecureRandom().nextBytes(bytes)
+        val token = bytes.joinToString("") { "%02x".format(it) }
+        p.edit().putString(KEY_TOKEN, token).apply()
+        return token
+    }
+
+    /**
+     * baseUrl + token 写入 getExternalFilesDir(null)/debug-bridge.txt（一行 JSON），
+     * 并 Log.i 一次；getExternalFilesDir 可能为 null（外置存储未挂载），此时仅 log。
+     */
+    private fun writeAccessInfo(context: Context, token: String) {
+        val baseUrl = "http://127.0.0.1:" + PORT
+        runCatching {
+            val dir = context.getExternalFilesDir(null)
+            if (dir == null) {
+                Log.w(TAG, "getExternalFilesDir(null) == null，跳过 debug-bridge.txt")
+                return@runCatching
+            }
+            val file = File(dir, "debug-bridge.txt")
+            file.writeText(JSONObject().put("baseUrl", baseUrl).put("token", token).toString() + "\n")
+            Log.i(TAG, "debug bridge listening on " + baseUrl + " ; token/access info -> " + file.absolutePath)
+        }.onFailure { Log.w(TAG, "写入 debug-bridge.txt 失败", it) }
+    }
+
+    private fun runServer(expectedToken: String) {
+        var server: ServerSocket? = null
+        try {
+            val s = ServerSocket(PORT, 16, InetAddress.getByName("127.0.0.1"))
+            server = s
+            serverSocket = s
+            Log.i(TAG, "debug bridge listening on http://127.0.0.1:" + PORT + " (token required)")
+            s.use {
+                while (true) {
+                    val client = try {
+                        it.accept()
+                    } catch (t: Throwable) {
+                        if (started) Log.w(TAG, "accept failed", t) else Log.i(TAG, "debug bridge stopped")
+                        break
+                    }
+                    Thread({ handle(client, expectedToken) }, "drama-debug-conn")
+                        .apply { isDaemon = true }.start()
+                }
+            }
+        } catch (t: Throwable) {
+            if (started) Log.e(TAG, "debug bridge failed", t)
+        } finally {
+            synchronized(this) {
+                // 只清自己这次的 socket：避免 stop() 后立刻 start() 的新实例被误清
+                if (serverSocket === server) {
+                    serverSocket = null
+                    started = false
+                }
+            }
+        }
+    }
+
+    private fun handle(client: Socket, expectedToken: String) {
         try {
             client.use { socket ->
                 socket.soTimeout = 5000
                 val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
                 val requestLine = reader.readLine() ?: return
-                // 读掉请求头（不处理 body：本桥只读）
+                // 读掉请求头（不处理 body：本桥只读），顺带取出 X-Debug-Token
+                var headerToken: String? = null
                 while (true) {
                     val line = reader.readLine() ?: break
                     if (line.isEmpty()) break
+                    if (line.startsWith("X-Debug-Token:", ignoreCase = true)) {
+                        headerToken = line.substringAfter(':').trim()
+                    }
                 }
                 val parts = requestLine.split(" ")
                 val method = parts.getOrElse(0) { "" }
@@ -84,6 +191,11 @@ object DebugBridge {
                 val path = target.substringBefore('?')
                 val query = parseQuery(target.substringAfter('?', ""))
                 val out = socket.getOutputStream()
+                // 鉴权必须早于任何 DAO 读取 / JSON 生成：未授权只回 401，绝不泄露数据
+                if (!tokenMatches(headerToken ?: query["token"], expectedToken)) {
+                    respond(out, 401, error("unauthorized", "缺少或无效的 X-Debug-Token / ?token="))
+                    return
+                }
                 if (method != "GET") {
                     respond(out, 405, error("method_not_allowed", "只读调试桥，只支持 GET"))
                     return
@@ -307,13 +419,22 @@ object DebugBridge {
         return map
     }
 
+    /** 定长比较，避免按字节短路泄露 token 前缀 */
+    private fun tokenMatches(provided: String?, expected: String): Boolean {
+        if (provided.isNullOrEmpty()) return false
+        return MessageDigest.isEqual(
+            provided.toByteArray(Charsets.UTF_8),
+            expected.toByteArray(Charsets.UTF_8),
+        )
+    }
+
     private fun respond(out: OutputStream, code: Int, body: String) {
         val bytes = body.toByteArray(Charsets.UTF_8)
         val head = "HTTP/1.1 " + code + " " + reason(code) + "\r\n" +
             "Content-Type: application/json; charset=utf-8\r\n" +
             "Content-Length: " + bytes.size + "\r\n" +
             "Connection: close\r\n" +
-            "Access-Control-Allow-Origin: *\r\n" +
+            "Cache-Control: no-store\r\n" +
             "\r\n"
         try {
             out.write(head.toByteArray(Charsets.UTF_8))
@@ -328,6 +449,7 @@ object DebugBridge {
         200 -> "OK"
         400 -> "Bad Request"
         404 -> "Not Found"
+        401 -> "Unauthorized"
         405 -> "Method Not Allowed"
         503 -> "Service Unavailable"
         else -> "Internal Server Error"
