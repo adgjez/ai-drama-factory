@@ -573,6 +573,16 @@ internal val SOFT_SB_CHECK_CODES = setOf(
     "scene_single_shot",
     "hook_weak",
     "ending_weak",
+    "action_camera",
+    "action_vague",
+    "action_thin",
+    "visual_missing",
+    "visual_thin",
+    "visual_no_size",
+    "visual_no_light",
+    "visual_no_composition",
+    "scene_thin",
+    "carry_intent",
 )
 
 /** gateErrors → sb_check 持久化值：硬错误写 error:（渲染闸拦截），软提示写 warn:（界面黄色提示）。 */
@@ -616,6 +626,16 @@ internal fun sbCheckLabel(code: String) = when (code) {
     "beat_index_invalid" -> "剧本节拍顺序无效"
     "beat_out_of_order" -> "剧本节拍顺序回退"
     "action_empty" -> "动作描述为空"
+    "action_camera" -> "动作混入镜头语言：景别/机位/运镜应写进画面描述"
+    "action_vague" -> "动作空泛：情绪需外化成可见行为"
+    "action_thin" -> "动作太短：补一个道具/光影/环境细节"
+    "visual_missing" -> "缺少画面描述：需补景别+机位+构图+光线"
+    "visual_thin" -> "画面描述过短：按五项写满 70–130 字"
+    "visual_no_size" -> "画面缺景别"
+    "visual_no_light" -> "画面缺光线"
+    "visual_no_composition" -> "画面缺构图与主体调度"
+    "scene_thin" -> "场景信息太薄：补时间/空间布局/主光源"
+    "carry_intent" -> "承接写成了剧情意图：应写最后一帧状态"
     else -> code
 }
 

@@ -79,6 +79,16 @@ private fun storyboardCheckLabel(code: String): String = when (code) {
     "scene_single_shot" -> "单镜成场"
     "hook_weak" -> "开场钩子弱"
     "ending_weak" -> "结尾泄气"
+    "action_camera" -> "动作混入镜头语言：景别/机位/运镜应写进画面描述"
+    "action_vague" -> "动作空泛：情绪需外化成可见行为"
+    "action_thin" -> "动作太短：补一个道具/光影/环境细节"
+    "visual_missing" -> "缺少画面描述：需补景别+机位+构图+光线"
+    "visual_thin" -> "画面描述过短：按五项写满 70–130 字"
+    "visual_no_size" -> "画面缺景别"
+    "visual_no_light" -> "画面缺光线"
+    "visual_no_composition" -> "画面缺构图与主体调度"
+    "scene_thin" -> "场景信息太薄：补时间/空间布局/主光源"
+    "carry_intent" -> "承接写成了剧情意图：应写最后一帧状态"
     else -> code
 }
 
@@ -609,18 +619,25 @@ fun StoryboardPage(
                                 }
                             }
                         }
-                        shot.action?.let { Text("动作：${displayAction(shot)}", style = MaterialTheme.typography.bodyMedium) }
-                        shot.visual_prompt?.let {
+                        // 第八批：画面描述（景别/机位/构图/光线/运镜）升为主文案，动作降为副文案。
+                        val visualText = shot.visual_prompt?.takeIf { it.isNotBlank() }
+                        if (visualText != null) {
                             Row(
                                 verticalAlignment = androidx.compose.ui.Alignment.Top,
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                             ) {
-                                Icon(painterResource(R.drawable.ic_movie), contentDescription = "视觉指令",
+                                Icon(painterResource(R.drawable.ic_movie), contentDescription = "画面",
                                     tint = MaterialTheme.colorScheme.secondary, modifier = Modifier.size(16.dp))
-                                Text(it, style = MaterialTheme.typography.bodySmall,
-                                    modifier = Modifier.weight(1f),
-                                    color = MaterialTheme.colorScheme.secondary)
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("画面：$visualText", style = MaterialTheme.typography.bodyMedium)
+                                    shot.action?.takeIf { it.isNotBlank() }?.let { a ->
+                                        Text("动作：${displayAction(shot)}", style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                }
                             }
+                        } else {
+                            shot.action?.let { Text("动作：${displayAction(shot)}", style = MaterialTheme.typography.bodyMedium) }
                         }
                         shot.scene_context?.takeIf { it.isNotBlank() }?.let {
                             Row(

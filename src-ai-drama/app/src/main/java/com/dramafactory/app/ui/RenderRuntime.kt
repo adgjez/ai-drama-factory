@@ -251,11 +251,12 @@ object RenderRuntime {
         }?.let { it.remote_url?.takeIf { s -> s.isNotBlank() } ?: it.image_uri }
         // 接缝帧优先做基础画面（承接上一镜尾帧）；否则退回场景底图/首张参考
         val base = seamInputs.firstOrNull() ?: sceneBase ?: refUris.firstOrNull() ?: return null
-        // 场景锚点 + 导演镜头语言一起作为「本镜开场画面描述」（旧链路两者都没有）
+        // 第八批：还原原文细节——首帧描述 = 场景 + 画面（含原文细节）+ 动作节拍，缺一不可。
         val frameStart = listOfNotNull(
             shot?.scene_context?.takeIf { it.isNotBlank() },
             shot?.visual_prompt?.takeIf { it.isNotBlank() },
-        ).ifEmpty { listOfNotNull(shot?.action) }.joinToString("；")
+            shot?.action?.takeIf { it.isNotBlank() },
+        ).distinct().joinToString("；")
         // 有接缝帧时图1=上一镜尾帧（本镜基础画面），其余图只做角色/场景一致性约束
         val legend = if (seamInputs.isNotEmpty()) {
             "其余图片为角色/场景设定图，仅用于保持人物长相与场景一致，不要照搬棚拍背景；本镜在此基础上自然推进到开场动作。"
