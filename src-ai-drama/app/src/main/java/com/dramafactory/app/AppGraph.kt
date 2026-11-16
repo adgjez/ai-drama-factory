@@ -340,7 +340,9 @@ object AppGraph {
                     }.getOrNull()?.content ?: ""
                 },
                 kind = kind, name = baseName,
-                eraLabel = preset.era.label, forbidden = preset.forbiddenEraTerms)
+                eraLabel = preset.era.label, forbidden = preset.forbiddenEraTerms,
+                // 资产专业化：现代/当代/架空题材关闭「禁现代元素」，避免把现代剧资产扩成古装
+                modernAllowed = preset.name == "neutral" || preset.name == "modern" || preset.name == "fantasy")
         }.getOrDefault(baseName)
     }
 
@@ -496,7 +498,8 @@ object AppGraph {
         val tp = textProviderFor()
         val r = com.dramafactory.core.quality.LlmAssetExtractor.extract(text) { req -> tp.chat(req) }
         return r.assets.map { a ->
-            DefaultAiOrchestrator.AiAsset(assetId = "a_${System.nanoTime()}", kind = a.kind, name = a.name, prompt = a.desc)
+            DefaultAiOrchestrator.AiAsset(assetId = "a_${System.nanoTime()}", kind = a.kind, name = a.name,
+                prompt = com.dramafactory.core.quality.LlmAssetExtractor.cardPrompt(a))
         }
     }
 

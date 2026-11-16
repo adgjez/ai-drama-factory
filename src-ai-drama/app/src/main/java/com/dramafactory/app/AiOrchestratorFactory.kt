@@ -92,7 +92,8 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                 r.assets.map { a ->
                     DefaultAiOrchestrator.AiAsset(
                         assetId = "a_${System.nanoTime()}",
-                        kind = a.kind, name = a.name, prompt = a.desc,
+                        kind = a.kind, name = a.name,
+                        prompt = com.dramafactory.core.quality.LlmAssetExtractor.cardPrompt(a),
                     )
                 }
             }
@@ -291,7 +292,8 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                     asset_id = a.assetId,
                     project_id = projectId,
                     kind = a.kind,
-                    prompt = a.name + "：" + a.prompt,
+                    // cardPrompt 已含「name：desc」；旧数据/自定义 prompt 才补前缀，避免双前缀
+                    prompt = if (a.prompt.startsWith(a.name)) a.prompt else a.name + "：" + a.prompt,
                     updated_at = System.currentTimeMillis(),
                 )
             }

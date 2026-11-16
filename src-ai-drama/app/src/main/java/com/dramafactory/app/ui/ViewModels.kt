@@ -641,7 +641,8 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
                         }.getOrNull()?.content ?: ""
                     },
                     kind = kindKey, name = card.prompt,
-                    eraLabel = preset.era.label, forbidden = preset.forbiddenEraTerms)
+                    eraLabel = preset.era.label, forbidden = preset.forbiddenEraTerms,
+                    modernAllowed = preset.name == "neutral" || preset.name == "modern" || preset.name == "fantasy")
                 Result.success(enriched)
             }
         }
@@ -950,7 +951,7 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
                     "scene" -> AssetsLogic.Kind.SCENE
                     else -> AssetsLogic.Kind.PROP
                 }
-                val desc = if (a.desc.isBlank()) a.name else "${a.name}·${a.desc}"
+                val desc = com.dramafactory.core.quality.LlmAssetExtractor.cardPrompt(a)
                 val key = "${kind.name}:$desc"
                 if (logic.assets.value.any { "${it.kind.name}:${it.prompt}" == key }) continue
                 logic.addAsset(idGen(), kind, desc)

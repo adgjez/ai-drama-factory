@@ -74,7 +74,8 @@ object DesktopAppGraph {
                     val tp = textModelRouter.resolve(textModelRouter.activeTextModelId())
                     val r = LlmAssetExtractor.extract(text) { req -> tp.chat(req) }
                     r.assets.map { a ->
-                        AiAsset(assetId = "a_${System.nanoTime()}", kind = a.kind, name = a.name, prompt = a.desc)
+                        AiAsset(assetId = "a_${System.nanoTime()}", kind = a.kind, name = a.name,
+                            prompt = LlmAssetExtractor.cardPrompt(a))
                     }
                 }
             },
