@@ -132,6 +132,7 @@ jobs:
     steps:
       - name: Skip notice when signing secret is absent
         if: env.KS == ''
+        working-directory: .
         run: echo "未配置 AI_DRAMA_KEYSTORE_BASE64：跳过 release 构建，仅产出 debug APK。"
 
       - uses: actions/checkout@v4
