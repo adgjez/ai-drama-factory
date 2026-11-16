@@ -402,18 +402,10 @@ fun LibraryPage() {
                 return@LaunchedEffect
             }
             val epId = previewEp ?: return@LaunchedEffect
-            // 时间轴：按 shot_no 排序后简单累计 duration_seconds（转场重叠忽略，与成片字幕轨同口径）
-            val timeline = runCatching {
-                var cursorMs = 0L
-                com.dramafactory.app.AppGraph.dao.shotsOf(epId).sortedBy { it.shot_no }.mapNotNull { shot ->
-                    val durMs = ((shot.duration_seconds.takeIf { it > 0.0 } ?: 5.0) * 1000).toLong()
-                    val startMs = cursorMs
-                    cursorMs += durMs
-                    val line = shot.dialogue?.takeIf { it.isNotBlank() }
-                        ?: shot.narration?.takeIf { it.isNotBlank() }
-                    line?.let { text -> Triple(startMs, cursorMs, text) }
-                }
-            }.getOrDefault(emptyList())
+            // ★第七批 T4（P1-1/P1-2）：预览与 SRT 同一口径——同一数据源（已落盘 COMPLETED 镜）、
+            // 同一 SubtitleTimeline.build（实测镜长/DB 兜底 + 0.30s 转场对齐），不再本地第三套累加。
+            val timeline = kotlin.runCatching { buildPreviewSubtitleTimeline(epId) }
+                .getOrDefault(emptyList())
             if (timeline.isEmpty()) {
                 subtitleLine = null
                 return@LaunchedEffect
@@ -421,7 +413,7 @@ fun LibraryPage() {
             // 每 250ms 读播放位置映射到当前镜头字幕；弹窗关闭（离开组合）时 effect 取消，轮询即停止
             while (true) {
                 val pos = vvHolder[0]?.currentPosition?.toLong() ?: 0L
-                subtitleLine = timeline.firstOrNull { pos >= it.first && pos < it.second }?.third
+                subtitleLine = timeline.firstOrNull { pos >= it.startMs && pos < it.endMs }?.text
                 kotlinx.coroutines.delay(250L)
             }
         }
@@ -520,9 +512,8 @@ fun LibraryPage() {
                         com.dramafactory.app.AppGraph.dao.shotsOf(targetEpId).associateBy { it.shot_id }
                     }.getOrDefault(emptyMap())
                     val transitionSeconds = 0.30
-                    var cursorMs = 0L
-                    val cues = mutableListOf<com.dramafactory.core.assemble.MovieAssembler.SubtitleCue>()
-                    entries.forEachIndexed { index, (task, clip) ->
+                    // ★第七批 T4（P1-1）：手动合成字幕轨与 AI 自动成片共用 SubtitleTimeline（转场对齐）
+                    val timings = entries.map { (task, clip) ->
                         val shot = shotsById[task.shot_id]
                         // 真实镜长优先，DB duration_seconds 兜底（字幕不再按台词时长凭空累加）
                         val durMs = com.dramafactory.app.videoDurationMs(clip)
@@ -531,16 +522,11 @@ fun LibraryPage() {
                             shot?.dialogue?.takeIf { it.isNotBlank() },
                             shot?.narration?.takeIf { it.isNotBlank() },
                         ).joinToString(" / ")
-                        if (text.isNotBlank() && durMs > 250L) {
-                            val start = (cursorMs + 150L).coerceAtLeast(0L)
-                            val end = (cursorMs + durMs - 100L -
-                                (if (index > 0) (transitionSeconds * 1000).toLong() else 0L))
-                                .coerceAtLeast(start + 1L)
-                            cues += com.dramafactory.core.assemble.MovieAssembler.SubtitleCue(
-                                text = text, startMs = start, endMs = end)
-                        }
-                        cursorMs += durMs
+                        com.dramafactory.core.assemble.SubtitleTimeline.ShotTiming(
+                            durationMs = durMs, text = text)
                     }
+                    val cues = com.dramafactory.core.assemble.SubtitleTimeline.build(
+                        shots = timings, transitionSeconds = transitionSeconds)
                     // ★第三批：手动合成也混入项目 BGM（成片页选曲；文件被删/未选则自动跳过）
                     val bgmPair: Pair<java.io.File?, Double>? = kotlin.runCatching {
                         com.dramafactory.app.AppGraph.bgmForEpisode(targetEpId)
@@ -612,6 +598,52 @@ fun LibraryPage() {
             composingEp = null
         }
     }
+}
+
+// ---------- 第七批 T4：成片/预览共用的字幕时间轴 ----------
+
+/**
+ * 构建成片预览的字幕时间轴（P1-1：按 xfade 转场对齐；与 SRT 侧共用 [com.dramafactory.core.assemble.SubtitleTimeline]）。
+ *
+ * 数据口径与 AppGraph.composeFilmIfReady / 本页手动合成完全一致：
+ * - 只取已 COMPLETED 且落盘的镜片段，按 shot_no 排序（未渲染/缺片的镜头不计入）；
+ * - 镜长实测优先（MediaMetadataRetriever），DB duration_seconds 兜底；
+ * - 文本为 dialogue + narration 以 " / " 拼接（都空则该镜无字幕）；
+ * - 转场按成片实际 FADE 0.30s 对齐。
+ *
+ * 探测 MediaMetadataRetriever 较重，整体在 IO 线程执行（预览打开后字幕可能晚几百毫秒出现）。
+ */
+private suspend fun buildPreviewSubtitleTimeline(
+    episodeId: String,
+): List<com.dramafactory.core.assemble.MovieAssembler.SubtitleCue> {
+    val shotsById = kotlin.runCatching {
+        com.dramafactory.app.AppGraph.dao.shotsOf(episodeId).associateBy { it.shot_id }
+    }.getOrDefault(emptyMap())
+    val tasks = kotlin.runCatching {
+        com.dramafactory.app.AppGraph.dao.renderTasksOf(episodeId)
+            .filter { it.state == "COMPLETED" && !it.local_file_uri.isNullOrBlank() }
+            .sortedWith(
+                compareBy<RenderTaskEntity> {
+                    shotsById[it.shot_id]?.shot_no ?: Int.MAX_VALUE
+                }.thenBy { it.shot_id })
+    }.getOrDefault(emptyList())
+    val timings = withContext(Dispatchers.IO) {
+        tasks.mapNotNull { task ->
+            val file = java.io.File(task.local_file_uri ?: "")
+            if (!file.exists() || file.length() <= 0L) return@mapNotNull null
+            val shot = shotsById[task.shot_id]
+            val durMs = com.dramafactory.app.videoDurationMs(file)
+                ?: (((shot?.duration_seconds?.takeIf { it > 0.0 } ?: 5.0) * 1000).toLong())
+            val text = listOfNotNull(
+                shot?.dialogue?.takeIf { it.isNotBlank() },
+                shot?.narration?.takeIf { it.isNotBlank() },
+            ).joinToString(" / ")
+            com.dramafactory.core.assemble.SubtitleTimeline.ShotTiming(
+                durationMs = durMs, text = text)
+        }
+    }
+    return com.dramafactory.core.assemble.SubtitleTimeline.build(
+        shots = timings, transitionSeconds = 0.30)
 }
 
 // ---------- Compose预览 ----------

@@ -261,7 +261,10 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
                         narration = narration?.trim()?.ifBlank { null }, visual_prompt = visualPrompt?.trim()?.ifBlank { null },
                         scene_context = sceneContext?.trim()?.ifBlank { null },
                         carry_over = carryOver?.trim()?.ifBlank { null },
-                        duration_seconds = durationSeconds.coerceIn(1.0, 60.0)))
+                        duration_seconds = durationSeconds.coerceIn(1.0, 60.0),
+                        // ★第七批：内容改了，旧校验结论不再可信——重置 pending，
+                        // 避免「明明改过内容却仍显示校验通过/仍带着旧的 error 拦住渲染」。
+                        sb_check = "pending"))
                     val back = AppGraph.dao.shotKeyframes(shotId)
                     check(back?.action == action.trim()) { "分镜编辑后读回不一致：$shotId" }
                 }
@@ -302,6 +305,10 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
                         eyeline?.trim()?.ifBlank { null })
                     val back = AppGraph.dao.shotKeyframes(shotId)
                     check(back?.scene_no == no) { "场次保存后读回不一致：$shotId" }
+                    // ★第七批：场次/站位/视线变化会影响轴线与场次校验，旧结论重置。
+                    if (back != null && back.sb_check != "pending") {
+                        AppGraph.dao.upsertShot(back.copy(sb_check = "pending"))
+                    }
                 }
             }
         }.exceptionOrNull()
@@ -581,6 +588,9 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
                 "场次标题读回不一致：${row.scene_title} ≠ ${target.sceneTitle}"
             }
         }
+        // ★第七批：场次结构变了（拆/合/移动），轴线与场次校验的旧结论必须重置。
+        back.filter { it.shot_id in layout.keys && it.sb_check != "pending" }
+            .forEach { AppGraph.dao.upsertShot(it.copy(sb_check = "pending")) }
     }
 
     // ---- 第四批：单镜单字段 AI 重写（台词不提供：StoryboardGate 有逐字校验）----
@@ -640,12 +650,13 @@ class StoryboardViewModel(private val episodeId: String) : ViewModel() {
             withContext(Dispatchers.IO) {
                 writeLock.withLock {
                     val latest = AppGraph.dao.shotKeyframes(shotId) ?: error("找不到镜头：$shotId")
+                    // ★第七批：AI 重写改了画面语义，旧校验结论（pass/error/软提示）全部失效。
                     val updated = when (field) {
-                        ShotFieldRewriter.FIELD_ACTION -> latest.copy(action = value)
-                        ShotFieldRewriter.FIELD_NARRATION -> latest.copy(narration = value)
-                        ShotFieldRewriter.FIELD_VISUAL -> latest.copy(visual_prompt = value)
-                        ShotFieldRewriter.FIELD_SCENE_CONTEXT -> latest.copy(scene_context = value)
-                        ShotFieldRewriter.FIELD_CARRY_OVER -> latest.copy(carry_over = value)
+                        ShotFieldRewriter.FIELD_ACTION -> latest.copy(action = value, sb_check = "pending")
+                        ShotFieldRewriter.FIELD_NARRATION -> latest.copy(narration = value, sb_check = "pending")
+                        ShotFieldRewriter.FIELD_VISUAL -> latest.copy(visual_prompt = value, sb_check = "pending")
+                        ShotFieldRewriter.FIELD_SCENE_CONTEXT -> latest.copy(scene_context = value, sb_check = "pending")
+                        ShotFieldRewriter.FIELD_CARRY_OVER -> latest.copy(carry_over = value, sb_check = "pending")
                         else -> error("该字段不支持 AI 重写：$field")
                     }
                     AppGraph.dao.upsertShot(updated)

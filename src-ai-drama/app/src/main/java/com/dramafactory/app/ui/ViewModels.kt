@@ -7,6 +7,7 @@ import com.dramafactory.app.AppGraph
 import com.dramafactory.app.data.RenderTaskEntity
 import com.dramafactory.app.update.UpdateChecker
 import com.dramafactory.core.quality.AssetAuditor
+import com.dramafactory.core.quality.RenderPreflight
 import com.dramafactory.core.quality.StylePreset
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -390,6 +391,40 @@ class QueueViewModel(private val episodeId: String) : ViewModel() {
                 if (supported) AppGraph.dao.shotReferenceVideo(shotId) else null
             }
         }
+        // 第七批：渲染前预检——本集分镜 + 项目资产（含 rejected）+ 预算剩余 → RenderPreflight.check。
+        // 与 QueueLogic 的 preflightReader 契约一致；任何读取失败返回 null（UI 保持上一次结果）。
+        preflightReader = {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    val projectId = episodeId.substringBeforeLast("_ep").ifBlank { episodeId }
+                    val shots = AppGraph.dao.shotsOf(episodeId).sortedBy { it.shot_no }
+                    val assets = AppGraph.dao.assetsAllOf(projectId)
+                    val guard = AppGraph.budgetGuard
+                    RenderPreflight.check(
+                        shots = shots.map { shot ->
+                            RenderPreflight.ShotInput(
+                                shotNo = shot.shot_no,
+                                shotId = shot.shot_id,
+                                action = shot.action.orEmpty(),
+                                dialogue = shot.dialogue,
+                                narration = shot.narration,
+                                durationSeconds = shot.duration_seconds,
+                                firstImageUri = shot.first_image_uri,
+                                lastImageUri = shot.last_image_uri,
+                                boundAssetIds = AssetCatalog.parseRefIds(shot.first_asset_ids),
+                                sbCheck = shot.sb_check,
+                                sceneNo = shot.scene_no,
+                            )
+                        },
+                        knownAssetIds = assets.map { it.asset_id }.toSet(),
+                        rejectedAssetIds = assets.filter { it.audit_state == "rejected" }
+                            .map { it.asset_id }.toSet(),
+                        budgetRemaining = (guard.limitOf(projectId) - guard.used(projectId))
+                            .coerceAtLeast(0),
+                    )
+                }.getOrNull()
+            }
+        }
     }
     val state: StateFlow<QueueLogic.UiState> get() = logic.state
 
@@ -410,6 +445,9 @@ class QueueViewModel(private val episodeId: String) : ViewModel() {
             }
         }
     }
+
+    /** 第七批：刷新渲染前预检（零付费只读；页面进入 / 点「开始渲染」前调用） */
+    suspend fun refreshPreflight() = logic.refreshPreflight()
 
     /**
      * 当前视频模型是否支持视频参考（UI 门控「上传参考视频」入口）。

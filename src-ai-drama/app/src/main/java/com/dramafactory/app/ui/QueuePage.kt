@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -29,6 +30,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -51,12 +53,14 @@ import com.dramafactory.app.ui.components.DramaCard
 import com.dramafactory.app.ui.components.EmptyState
 import androidx.compose.ui.Alignment
 import com.dramafactory.app.ui.components.PageHeader
+import com.dramafactory.core.quality.RenderPreflight
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.runtime.collectAsState
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.material3.LocalMinimumInteractiveComponentSize
 import androidx.compose.runtime.CompositionLocalProvider
 import java.io.File
+import kotlinx.coroutines.launch
 
 /**
  * 渲染队列页（S6）：每集渲染进度列表（镜状态机实时刷新）、暂停/恢复/取消、
@@ -85,8 +89,14 @@ fun QueuePage(
     // 第四批：渲染任务明细（local_file_uri / file_size / 时间戳）——逐镜预览 + 原始失败原因
     val renderTasks by vm.renderTasks.collectAsState()
     LaunchedEffect(st.shotStates) { vm.refreshRenderTasks() }
+    // 第七批：进入页面先跑一次零付费预检（不阻塞首帧）
+    LaunchedEffect(Unit) { vm.refreshPreflight() }
     var previewShotId by remember { mutableStateOf<String?>(null) }
     var reasonShotId by remember { mutableStateOf<String?>(null) }
+    // 第七批：预检明细弹窗 / 有阻断镜时的入队二次确认
+    var showPreflightDetail by remember { mutableStateOf(false) }
+    var showStartBlockedConfirm by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     // 第五批：预算上限可调（工程 ID 与 RenderRuntime.projectIdOf 对齐：截到最后一个 _ep 之前）
     val projectId = remember(episodeId) { episodeId.substringBeforeLast("_ep") }
@@ -168,6 +178,16 @@ fun QueuePage(
                 val isPaused = pauseText != null
                 Text(statusLine, style = MaterialTheme.typography.bodySmall,
                     color = if (isPaused) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outline)
+                // 第七批：渲染前预检摘要（阻断>0 红色）；点击查看逐条原因
+                st.preflight?.let { rep ->
+                    Text(
+                        "预检：可渲 ${rep.renderable}/${rep.total} 镜 · 阻断 ${rep.blockedShots} · 警告 ${rep.warningShots}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (rep.blockedShots > 0) MaterialTheme.colorScheme.error
+                                else MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.fillMaxWidth().clickable { showPreflightDetail = true },
+                    )
+                }
                 // 预算用量条（条数型，决议Q2）；第五批：上限可调，保存后立即生效
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween) {
@@ -195,8 +215,17 @@ fun QueuePage(
                     Button(onClick = { vm.resume() },
                         enabled = !snap.running && snap.pausedReason != "budget_exceeded") { Text("恢复") }
                     Button(onClick = {
-                        // 第五批：从本集分镜表读真实镜头构造 ShotMeta 入队（原先传空列表恒为 0 镜）
-                        vm.enqueueCurrentEpisode()
+                        // 第七批：先刷新预检；有阻断镜先二次确认，阻断=0 才直接入队
+                        scope.launch {
+                            vm.refreshPreflight()
+                            val report = vm.state.value.preflight
+                            if (report != null && report.blockedShots > 0) {
+                                showStartBlockedConfirm = true
+                            } else {
+                                // 第五批：从本集分镜表读真实镜头构造 ShotMeta 入队（原先传空列表恒为 0 镜）
+                                vm.enqueueCurrentEpisode()
+                            }
+                        }
                     }, enabled = !snap.running) {
                         Text(if (snap.running) "渲染中" else "开始渲染")
                     }
@@ -401,6 +430,80 @@ fun QueuePage(
             text = { Text("将清空本集全部渲染任务记录（含已完成/失败/待处理）。\n\n分镜数据（shots）会保留，之后仍可点「开始渲染」重新入队。") },
             confirmButton = { Button(onClick = { vm.confirmClearQueue() }) { Text("清空") } },
             dismissButton = { OutlinedButton(onClick = { vm.dismissClearQueue() }) { Text("取消") } },
+        )
+    }
+
+    // ---- 第七批：渲染前预检明细（逐条原因，阻断红色）----
+    val preflightReport = st.preflight
+    if (showPreflightDetail && preflightReport != null) {
+        AlertDialog(
+            onDismissRequest = { showPreflightDetail = false },
+            title = { Text("渲染前预检") },
+            text = {
+                Column(
+                    Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        "共 ${preflightReport.total} 镜：可渲 ${preflightReport.renderable} · " +
+                            "阻断 ${preflightReport.blockedShots} · 警告 ${preflightReport.warningShots}",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    if (preflightReport.issues.isEmpty()) {
+                        Text("没有发现阻断项或警告。", style = MaterialTheme.typography.bodySmall)
+                    } else {
+                        for (issue in preflightReport.issues) {
+                            val isBlock = issue.severity == RenderPreflight.Severity.BLOCK
+                            Text(
+                                text = (if (issue.shotNo > 0) "镜头 #${issue.shotNo} · " else "") +
+                                    (if (isBlock) "阻断" else "警告") + "：" + issue.message,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (isBlock) MaterialTheme.colorScheme.error
+                                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(onClick = { showPreflightDetail = false }) { Text("知道了") }
+            },
+        )
+    }
+
+    // ---- 第七批：有阻断镜时的「开始渲染」二次确认（确认后才入队）----
+    if (showStartBlockedConfirm) {
+        val blockers = preflightReport?.blockers.orEmpty()
+        AlertDialog(
+            onDismissRequest = { showStartBlockedConfirm = false },
+            title = { Text("有 ${blockers.size} 镜会被渲染闸门拦下") },
+            text = {
+                Column(
+                    Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text("以下镜头会被队列闸门拦下，整集渲染可能中止：",
+                        style = MaterialTheme.typography.bodySmall)
+                    for (issue in blockers) {
+                        Text(
+                            (if (issue.shotNo > 0) "镜头 #${issue.shotNo}：" else "") + issue.message,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                    Text("建议先回分镜页修复这些镜头，再点「开始渲染」。",
+                        style = MaterialTheme.typography.bodySmall)
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    showStartBlockedConfirm = false
+                    vm.enqueueCurrentEpisode()
+                }) { Text("仍要提交") }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { showStartBlockedConfirm = false }) { Text("先去修") }
+            },
         )
     }
 

@@ -70,7 +70,7 @@ class AgnesVideo25ProtocolTest {
     }
 
     @Test
-    fun `25 reference模式 禁width字段 images顶层 mode必填`() = runBlocking {
+    fun `25 首帧优先keyframe 禁width字段 媒体字段顶层`() = runBlocking {
         val api = MockApi()
         provider("agnes-video-2.5", api).submitVideo(VideoSubmitRequest(
             shotId = "s1", prompt = "主角踏入客栈环视",
@@ -83,13 +83,45 @@ class AgnesVideo25ProtocolTest {
         assertFalse(b.contains("\"num_frames\""), "2.5 禁 num_frames")
         assertFalse(b.contains("\"frame_rate\""), "2.5 禁 frame_rate")
         assertFalse(b.contains("extra_body"), "媒体字段必须顶层，不再走 extra_body")
+        assertTrue(b.contains("\"mode\":\"keyframe\""), b)
+        assertTrue(b.contains("\"first_frame\":\"data:image/png;base64,FIRST\""), "声明首帧必须锁定")
+        assertFalse(b.contains("\"images\""), "keyframe 模式禁 images（与 reference 互斥）")
+        assertFalse(b.contains("\"last_frame\""), "未提供尾帧时不得伪造")
+        assertTrue(b.contains("\"seconds\":\""), "时长用 seconds 字符串")
+        assertTrue(b.contains("\"size\":\"720P\""), "默认 448x832 短边 448 → 720P")
+        assertTrue(b.contains("\"aspect_ratio\":\"9:16\""), "默认 448x832 → 9:16 竖屏")
+    }
+
+    @Test
+    fun `25 首尾帧加资产参考仍走keyframe且无images`() = runBlocking {
+        val api = MockApi()
+        provider("agnes-video-2.5", api).submitVideo(VideoSubmitRequest(
+            shotId = "s1", prompt = "接缝帧续写",
+            firstImageUri = "data:image/png;base64,SEAM",
+            lastImageUri = "data:image/png;base64,TAIL",
+            inputImages = listOf("data:image/png;base64,CHAR1", "data:image/png;base64,CHAR2"),
+        ))
+        val b = api.lastBody
+        assertTrue(b.contains("\"mode\":\"keyframe\""), b)
+        assertTrue(b.contains("\"first_frame\":\"data:image/png;base64,SEAM\""))
+        assertTrue(b.contains("\"last_frame\":\"data:image/png;base64,TAIL\""))
+        assertFalse(b.contains("\"images\""), "keyframe 模式禁 images")
+        assertFalse(b.contains("\"videos\""), "keyframe 模式禁 videos")
+    }
+
+    @Test
+    fun `25 仅资产参考图走reference images顶层`() = runBlocking {
+        val api = MockApi()
+        provider("agnes-video-2.5", api).submitVideo(VideoSubmitRequest(
+            shotId = "s1", prompt = "角色环视",
+            inputImages = listOf("data:image/png;base64,REF1", "data:image/png;base64,REF2"),
+        ))
+        val b = api.lastBody
         assertTrue(b.contains("\"mode\":\"reference\""), b)
         assertTrue(b.contains("\"images\":["), "参考图走顶层 images 数组")
-        assertTrue(b.contains("FIRST") && b.contains("REF1") && b.contains("REF2"))
-        assertTrue(b.contains("<Picture 1>"), "reference prompt 需 Picture 指代首帧为视觉主体")
-        assertTrue(b.contains("\"seconds\":\""), "时长用 seconds 字符串")
-        assertTrue(b.contains("\"size\":\"720P\""))
-        assertTrue(b.contains("\"aspect_ratio\":\"9:16\""), "默认 448x832 → 9:16 竖屏")
+        assertTrue(b.contains("REF1") && b.contains("REF2"))
+        assertTrue(b.contains("<Picture 1>"))
+        assertFalse(b.contains("\"width\""))
     }
 
     @Test

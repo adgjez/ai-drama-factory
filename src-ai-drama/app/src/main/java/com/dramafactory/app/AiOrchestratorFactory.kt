@@ -255,9 +255,10 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
         },
         // ★第二批 P0：自动关键帧阶段——分镜落库后逐镜合成首帧并做尾帧接力。
         // 失败/无参考图时返回 0，编排器只发 WARN，渲染侧回落原始首帧逻辑。
-        generateKeyframes = { episodeId, shots ->
+        // ★第七批：不传 shots.size（旧分镜可能多于本次生成），交给合成器按库里全集处理。
+        generateKeyframes = { episodeId, _ ->
             try {
-                com.dramafactory.app.ui.RenderRuntime.synthesizeEpisodeKeyframes(episodeId, shots.size)
+                com.dramafactory.app.ui.RenderRuntime.synthesizeEpisodeKeyframes(episodeId)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (_: Throwable) {

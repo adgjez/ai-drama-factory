@@ -11,6 +11,8 @@ import com.dramafactory.core.quality.StoryboardGate
 import io.ktor.client.request.prepareGet
 import io.ktor.client.statement.bodyAsChannel
 import io.ktor.utils.io.jvm.javaio.toInputStream
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * 渲染队列运行时 —— 按集懒建/复用DefaultRenderQueue实例 + 编排器恢复入口。
@@ -22,6 +24,8 @@ object RenderRuntime {
 
     @Volatile private var orchestrator: DefaultPipelineOrchestrator? = null
     private val queues = HashMap<String, DefaultRenderQueue>()
+    /** ★第七批：关键帧合成互斥（同一时刻只允许一份在跑，防并发重复生图/重复付费） */
+    private val keyframeMutex = Mutex()
 
     /**
      * 取某集的渲染队列（无则创建）。downloader把videoUrl下载到app缓存目录并校验size>0。
@@ -307,8 +311,16 @@ object RenderRuntime {
      * - 下一镜首帧缺失时保留本镜已有尾帧（绝不把人工尾帧覆盖成 null）。
      *
      * 任何一镜失败只跳过该镜，绝不阻断流水线；返回本次真正新合成且写库成功的镜数。
+     *
+     * ★第七批加固：
+     * - 默认不截断（maxShots<=0 表示全集；老调用仍可传正整数做限流，不再有 24 镜暗坑）；
+     * - 进程内互斥：编排器重试/用户手动触发并发时只跑一份，绝不重复生图（重复=重复付费）；
+     * - 取消异常继续向上抛，绝不吞掉取消继续合成。
      */
-    suspend fun synthesizeEpisodeKeyframes(episodeId: String, maxShots: Int = 24): Int {
+    suspend fun synthesizeEpisodeKeyframes(episodeId: String, maxShots: Int = 0): Int =
+        keyframeMutex.withLock { synthesizeEpisodeKeyframesLocked(episodeId, maxShots) }
+
+    private suspend fun synthesizeEpisodeKeyframesLocked(episodeId: String, maxShots: Int): Int {
         return try {
         // 无可用图像 Key 时直接跳过：否则会逐镜走到 Provider 才失败，白跑 24 次（A-G4）
         if (!AppGraph.agnesKeyReady()) return 0
@@ -316,7 +328,7 @@ object RenderRuntime {
         // 接缝规划必须基于整集全集：截断只限制「生成多少镜」，不能改变前后镜的场次关系
         val allShots = dao.shotsOf(episodeId).sortedBy { it.shot_no }
         if (allShots.isEmpty()) return 0
-        val shots = allShots.take(maxShots.coerceAtLeast(1))
+        val shots = if (maxShots > 0) allShots.take(maxShots) else allShots
         val links = SeamPlanner.plan(allShots.map { SeamPlanner.ShotRef(it.shot_no, it.scene_no) })
         val linkByNo = links.associateBy { it.shotNo }
         val byNo = allShots.associateBy { it.shot_no }

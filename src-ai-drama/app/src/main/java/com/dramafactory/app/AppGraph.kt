@@ -385,10 +385,10 @@ object AppGraph {
             // ★第二批 P0：按镜头真实时长/台词生成 sidecar 字幕轨；成片统一做响度归一化。
             val shotsById = runCatching { dao.shotsOf(episodeId).associateBy { it.shot_id } }
                 .getOrDefault(emptyMap())
+            // ★第七批 T4（P1-1）：字幕时间轴统一走 SubtitleTimeline，按 xfade 转场对齐
+            // （第 i 镜起点 = Σd(<i) − i·T；旧手写公式按简单累计，第 i 镜字幕晚 i·T+150ms）。
             val transitionSeconds = 0.30
-            var cursorMs = 0L
-            val cues = mutableListOf<com.dramafactory.core.assemble.MovieAssembler.SubtitleCue>()
-            entries.forEachIndexed { index, (task, clip) ->
+            val timings = entries.map { (task, clip) ->
                 val shot = shotsById[task.shot_id]
                 // ★第二批 P0-D2：优先用 MediaMetadataRetriever 读到的真实镜长，DB 的 duration_seconds 仅兜底
                 val durMs = com.dramafactory.app.videoDurationMs(clip)
@@ -397,17 +397,11 @@ object AppGraph {
                     shot?.dialogue?.takeIf { it.isNotBlank() },
                     shot?.narration?.takeIf { it.isNotBlank() },
                 ).joinToString(" / ")
-                if (text.isNotBlank() && durMs > 250L) {
-                    // 转场区间会让两句字幕打架：后一镜起点让出前一次重叠，避免字幕叠字。
-                    val start = (cursorMs + 150L).coerceAtLeast(0L)
-                    val end = (cursorMs + durMs - 100L -
-                        (if (index > 0) (transitionSeconds * 1000).toLong() else 0L))
-                        .coerceAtLeast(start + 1L)
-                    cues += com.dramafactory.core.assemble.MovieAssembler.SubtitleCue(
-                        text = text, startMs = start, endMs = end)
-                }
-                cursorMs += durMs
+                com.dramafactory.core.assemble.SubtitleTimeline.ShotTiming(
+                    durationMs = durMs, text = text)
             }
+            val cues = com.dramafactory.core.assemble.SubtitleTimeline.build(
+                shots = timings, transitionSeconds = transitionSeconds)
             // ★第三批：项目 BGM 端到端（成片页选曲 → 合成时混音）；文件丢失时自动跳过。
             val (bgmFile, bgmVolume) = bgmForEpisode(episodeId)
             // ★第二批 P0-D2：成片统一落 filesDir/movies（cacheDir 会被系统清理）

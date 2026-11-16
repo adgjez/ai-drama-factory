@@ -5,6 +5,7 @@ import com.dramafactory.core.model.QueueSnapshot
 import com.dramafactory.core.model.ShotMeta
 import com.dramafactory.core.provider.BudgetGuard
 import com.dramafactory.core.provider.RenderQueue
+import com.dramafactory.core.quality.RenderPreflight
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -47,7 +48,15 @@ class QueueLogic(
         val showClearConfirm: Boolean = false,
         /** v1.9.20：storyboard_gate 暂停时，列出哪几镜 sb_check 报 error 及原因（根因直显，省去抓 logcat） */
         val storyboardBlockDetail: List<Pair<String, String>> = emptyList(),
-    )
+        /** 第七批：渲染前预检结果（零付费；null = 尚未刷新或读取失败） */
+        val preflight: RenderPreflight.Report? = null,
+    ) {
+        /** 第七批：预检摘要扁平投影（可渲镜数 / 阻断镜数 / 警告数 / issue 列表） */
+        val preflightRenderable: Int get() = preflight?.renderable ?: 0
+        val preflightBlocked: Int get() = preflight?.blockedShots ?: 0
+        val preflightWarnings: Int get() = preflight?.warningShots ?: 0
+        val preflightIssues: List<RenderPreflight.Issue> get() = preflight?.issues.orEmpty()
+    }
 
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> get() = _state
@@ -65,6 +74,8 @@ class QueueLogic(
     var onClearQueue: suspend (episodeId: String) -> Unit = { }
     /** v1.9.20：storyboard_gate 详情读取器——App层注入（查 shots.sb_check 含 error 的镜 → (shotId, 原因码)） */
     var storyboardBlockReader: suspend (episodeId: String) -> List<Pair<String, String>> = { emptyList() }
+    /** 第七批：渲染前预检读取器——App层注入（本集分镜 + 项目资产 + 预算剩余 → RenderPreflight.Report） */
+    var preflightReader: suspend () -> RenderPreflight.Report? = { null }
 
     /** 订阅队列快照+预算用量，并启动镜状态轮询（2s一次，页面离开时stopWatching） */
     fun startWatching(scope: CoroutineScope) {
@@ -206,6 +217,14 @@ class QueueLogic(
 
     fun clearEnqueueError() {
         _state.value = _state.value.copy(enqueueError = null)
+    }
+
+    // ---------------- 第七批：渲染前预检 ----------------
+
+    /** 刷新预检结果；读取失败保留上一次结果（不把 UI 打成空白） */
+    suspend fun refreshPreflight() {
+        val report = runCatching { preflightReader() }.getOrNull() ?: return
+        _state.value = _state.value.copy(preflight = report)
     }
 }
 

@@ -176,13 +176,64 @@ object AssetCatalog {
         val out = LinkedHashSet<String>()
         // 角色最关键（决定锁脸），场景次之（决定接缝帧背景），道具最后
         for (kind in listOf("character", "scene", "prop")) {
-            for (row in mothers) {
+            val kindRows = mothers.filter { normalizeKind(it.kind) == kind }
+            // ① 全名命中优先（同 kind 内先排全名，再排 token）
+            for (row in kindRows) {
                 if (out.size >= limit) return out.toList()
-                if (normalizeKind(row.kind) != kind) continue
+                if (row.asset_id in out) continue
                 val name = displayName(row.prompt)
-                if (name.isBlank() || name == "未命名" || name.length < 2) continue
-                if (haystack.contains(name)) out.add(row.asset_id)
+                if (isMatchableName(name) && haystack.contains(name)) out.add(row.asset_id)
             }
+            // ② token 命中：资产名常形如「女秘书·职业装女性」「办公室·现代办公区」，
+            // 镜头文本却只写「女秘书」「办公室」——按分隔符切出的短名参与匹配。
+            for (row in kindRows) {
+                if (out.size >= limit) return out.toList()
+                if (row.asset_id in out) continue
+                if (softNameTokens(displayName(row.prompt)).any { haystack.contains(it) }) {
+                    out.add(row.asset_id)
+                }
+            }
+        }
+        return out.toList()
+    }
+
+    // ---- 第七批：软引用短名 / token 匹配 ----
+
+    /** 名字匹配的最小长度：单字（如「张」「李」）误命中率过高，不参与匹配。 */
+    private const val SOFT_NAME_MIN = 2
+
+    /**
+     * 资产名里的通用词：不携带可识别信息，整名与 token 都不参与匹配。
+     * 镜头文本里「人物」「女性」「场景」这类词很常见，不能因此把同 kind 的资产全拉进来。
+     */
+    private val SOFT_GENERIC_TERMS = setOf(
+        "人物", "角色", "场景", "道具", "环境", "背景", "画面", "镜头",
+        "特写", "全景", "中景", "近景", "远景",
+        "女性", "男性", "女生", "男生", "主角", "配角", "路人",
+        "服装", "造型", "状态", "外观", "设定", "风格",
+        "现代", "古代", "古装", "民国", "架空", "中性", "办公",
+    )
+
+    /** 名字 token 分隔符：资产名常形如「女秘书·职业装女性」「办公室：现代办公区（白天）」。 */
+    private val SOFT_NAME_SEPARATORS = Regex("[·・:：()（）、,，/|｜\\s]+")
+
+    /** 整名可参与匹配：非空、非「未命名」、长度 ≥ [SOFT_NAME_MIN] 且不是通用词。 */
+    private fun isMatchableName(name: String): Boolean =
+        name.isNotBlank() && name != "未命名" && name.length >= SOFT_NAME_MIN &&
+            name !in SOFT_GENERIC_TERMS
+
+    /**
+     * 把资产显示名切成可匹配的短名 token（第七批软引用）。
+     *
+     * 例：「女秘书·职业装女性」→ [女秘书, 职业装女性]；
+     * 「办公室：现代办公区」→ [办公室, 现代办公区]。
+     * 去重、去空白；长度 < 2 或通用词（[SOFT_GENERIC_TERMS]）丢弃。
+     */
+    internal fun softNameTokens(name: String): List<String> {
+        val out = LinkedHashSet<String>()
+        for (part in name.split(SOFT_NAME_SEPARATORS)) {
+            val token = part.trim()
+            if (token.length >= SOFT_NAME_MIN && token !in SOFT_GENERIC_TERMS) out.add(token)
         }
         return out.toList()
     }
