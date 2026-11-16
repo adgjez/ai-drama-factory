@@ -24,9 +24,9 @@ class EraDetectorTest {
         val d = EraDetector.ruleBased("少年觉醒系统，开始修炼灵气，踏入修仙之路。")
         assertEquals("fantasy", d.eraKey)
     }
-    @Test fun 规则_西汉兜底() {
+    @Test fun 规则_零命中回退中性() {
         val d = EraDetector.ruleBased("无特征文本")
-        assertEquals("han", d.eraKey)
+        assertEquals("neutral", d.eraKey)
     }
 
     @Test fun 现代预设无时代禁词() {
@@ -34,12 +34,13 @@ class EraDetectorTest {
         val p = EraDetector.presetFor("modern")
         assertFalse(p.negativePrompt.contains("手机"), "现代剧不应禁手机")
     }
-    @Test fun 清代预设含历史禁词() {
+    @Test fun 时代禁词不再折叠进负向() {
+        // v1.9.46：时代约束已移除，任何朝代预设的 negative 都只含通用负向
         val p = EraDetector.presetFor("qing")
-        assertTrue(p.negativePrompt.contains("手机"))
+        assertFalse(p.negativePrompt.contains("手机"), "时代禁词已移除：$p")
     }
-    @Test fun 未知key回退汉() {
-        assertEquals("han", if (EraDetector.presetFor("xyz").name == "cinema") "han" else "unknown")
+    @Test fun 未知key回退中性() {
+        assertEquals("neutral", EraDetector.presetFor("xyz").name)
     }
 
     private fun assertFalse(b: Boolean, msg: String = "") = kotlin.test.assertFalse(b, msg)

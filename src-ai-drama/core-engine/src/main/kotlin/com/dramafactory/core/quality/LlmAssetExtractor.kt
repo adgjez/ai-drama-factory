@@ -1,41 +1,79 @@
 package com.dramafactory.core.quality
 
 /**
- * 第十轮：大模型资产自动提取。
+ * 大模型资产自动提取（影视美术资产拆解口径）。
  *
- * 旧实现（AssetsLogic.ScriptAssetExtractor）为纯正则，只能识别
- * 「角色：/场景：/道具：」清单行——小说原文没有这种结构化标签时提取为 0。
+ * 旧实现（AssetsLogic.ScriptAssetExtractor）为纯正则，只能识别「角色：/场景：/道具：」清单行。
+ * 第十三轮引入 LLM 提取，但 prompt 只要 30 字以内的 desc，产物是「女秘书·职业装女性」这类
+ * 只有身份、没有美术设定的裸卡，直接喂参考图模型必然不专业。
  *
- * 新实现：把文本交给 TextProvider（Agnes 文本 3.0 Flash，按输入规模自动降级），要求输出严格 JSON：
- *   {"characters":[{"name":"...","desc":"..."}],"scenes":[...],"props":[...]}
- * 解析失败/超时回退到正则提取（保底不空手而归）。TextProvider 注入可测。
+ * 本版（资产专业化重写）按影视美术指导的拆解标准产出：
+ * - 角色：姓名·身份标签；desc 60-120 字（性别年龄体型 / 发型发色 / 脸型五官 / 服装形制颜色面料 / 鞋包配饰 / 标志细节）；
+ * - 场景：地点·时段·内景或外景；desc 60-120 字（空间尺度 / 结构材质 / 家具陈设 / 光源方向与时辰 / 主色调）；
+ * - 道具：物名·关键状态；desc 30-60 字（形制 / 材质 / 尺寸比例 / 颜色 / 磨损状态 / 剧情作用）；
+ * - aliases 记录同一实体的其它称呼，用于去重合并，绝不重复建卡；
+ * - 命名禁止只用职业泛称，必须带可见识别特征（便于直接生成参考图与跨镜一致性）。
+ *
+ * 解析失败/超时由调用方回退正则提取（保底不空手而归）。TextProvider 注入可测。
  */
 object LlmAssetExtractor {
 
-    data class Asset(val kind: String, val name: String, val desc: String)   // kind: character/scene/prop
+    data class Asset(
+        val kind: String,          // character / scene / prop
+        val name: String,          // 专业命名：姓名·身份标签 / 地点·时段·内外景 / 物名·状态
+        val desc: String,          // 影视美术外观设定（可含 costume / 时段补充）
+        /** 同一实体的其它称呼（别名），只用于去重合并，不参与生图 prompt */
+        val aliases: List<String> = emptyList(),
+    )
 
     data class ExtractResult(val assets: List<Asset>, val usedLlm: Boolean)
 
-    private const val SYSTEM_PROMPT = """你是短剧制片资产师。从给定的小说/剧本文本中提取制作所需资产清单。
-只输出严格 JSON，不要任何其他文字、不要 markdown 代码块。格式：
-{"characters":[{"name":"角色名","desc":"外貌/服装/气质中文描述，30字内"}],"scenes":[{"name":"场景名","desc":"环境/时间/氛围描述，30字内"}],"props":[{"name":"道具名","desc":"外观描述，20字内"}]}
-要求：characters 2-6个主要角色；scenes 按出现顺序取3-8个；props 只列剧情关键道具；desc 必须具体可直接用于文生图。"""
+    /** 文本截断上限：保留更多原文，避免角色/场景在后半段才出现时被漏提 */
+    private const val MAX_CHARS = 12000
+
+    private const val SYSTEM_PROMPT = """你是资深影视美术指导兼制片资产师，负责把小说/剧本拆成可直接投产的资产清单。
+只输出严格 JSON（不要 markdown 代码块、不要任何解释），格式：
+{"characters":[{"name":"姓名·身份标签","desc":"60-120字影视美术外观设定","aliases":["别名1","别名2"],"costume":"本剧主要造型/换装说明 20-40字"}],"scenes":[{"name":"地点·时段·内景或外景","desc":"60-120字空间美术设定","aliases":["别名"],"time_of_day":"时辰/天光"}],"props":[{"name":"具体物名·关键状态","desc":"30-60字器物设定","aliases":["别名"]}]}
+
+【提取范围】只提取会出现在画面里、且影响叙事的资产：
+- characters 2-8 个：有台词/动作/情绪戏的主要角色；群演、路人不算。
+- scenes 3-10 个：承载戏份的实景空间；同一地点日夜变化合并为一条，在 desc 注明日/夜。
+- props 不超过 10 个：推动剧情或反复出现的道具；一次性背景杂物不算。
+
+【命名规范】禁止只用职业泛称，必须带可见识别特征：
+- 角色：「姓名·身份与标志特征」，如「林见夕·32岁女总裁」「顾沉·退役安保顾问」；剧本无姓名时用「身份·外观特征」。
+- 场景：「地点·时段·内景/外景」，如「总裁办公室·傍晚·内景」「地下车库·深夜·内景」。
+- 道具：「物名·关键状态」，如「手机·屏幕碎裂」「合同·文件夹」。
+
+【desc 必须可直接拍、可直接生成参考图；禁止空泛词：美丽、帅气、气氛神秘、科技感、高级感、精致、绝美】
+- 角色：性别、年龄感、体型身高、发型发色、脸型与五官特征、服装形制/颜色/面料、鞋包配饰、标志性体态或细节；costume 单列本剧主要造型（有换装写「第X场后：…」）。
+- 场景：空间尺度、建筑结构与材质、家具陈设、主要道具、光源方向与时辰天光、主色调与氛围。
+- 道具：形制、材质、尺寸比例、颜色、磨损/使用状态、剧情作用。
+
+【身份 / 变体 / 瞬态 三分法】按短剧美术资产方法论拆：
+- 只建「持续身份」：同一人物只保留一条基础身份卡；换装、受伤、湿污、妆造变化等属于变体，写在该角色卡 costume/desc 的「第X场后：…」，不另建新卡。
+- 场景同理：同一地点只建一条，日夜/天光/天气变化写进 desc；道具只建反复出现且有剧情作用的实体，开合/损坏等状态写进 name 的状态后缀或 desc。
+- 瞬时表情、姿势、视线、景别、镜头角度一律不进资产卡（那是分镜的职责，不是资产）。
+【识别锚点】每条 name/desc 至少给 2 个可见、可生成、可跨镜比对的识别锚点（如发型+服装颜色、招牌+材质、器物缺口+材质），禁止「职业女性」这类无法区分个体的泛称。
+【只写可见事实】只写下游生图/表演真正需要的可见信息；不写心理动机、人物关系、剧情评价。
+【去重】同一人物/地点/道具的不同称呼只保留一条，其它称呼写进 aliases（如「林总」「见夕」）。
+【风格】时代、年代、服饰形制全部以剧本描写为唯一依据：不默认任何朝代模板，也不主动禁现代元素；剧本没写的年代信息不要自行发明。"""
 
     /**
      * LLM 提取主入口。
-     * @param chat 文本模型调用（App层注入 AgnesProvider.chat）
-     * @param text 小说/剧本文本（截断至前8000字防token溢出）
+     * @param chat 文本模型调用（App层注入 Provider.chat）
+     * @param text 小说/剧本文本（截断至 [MAX_CHARS] 字防 token 溢出）
      */
     suspend fun extract(
         text: String,
         chat: suspend (com.dramafactory.core.model.ChatRequest) -> com.dramafactory.core.model.ChatResponse,
     ): ExtractResult {
-        val clipped = if (text.length > 8000) text.take(8000) + "\n…(后文略)" else text
-        // 重试≤2次（网络抖动/JSON不纯）
+        val clipped = if (text.length > MAX_CHARS) text.take(MAX_CHARS) + "\n…(后文略)" else text
+        // 重试≤2次（网络抖动 / JSON 不纯）
         repeat(2) { attempt ->
             runCatching {
                 val resp = chat(com.dramafactory.core.model.ChatRequest(messages = listOf(
-                    com.dramafactory.core.model.ChatMessage("user", "$SYSTEM_PROMPT\n\n【文本】\n$clipped"))))
+                    com.dramafactory.core.model.ChatMessage("user", "$SYSTEM_PROMPT\n\n【剧本/小说文本】\n$clipped"))))
                 val assets = parseJson(resp.content)
                 if (assets.isNotEmpty()) return ExtractResult(assets, usedLlm = true)
             }
@@ -44,7 +82,7 @@ object LlmAssetExtractor {
         return ExtractResult(emptyList(), usedLlm = false)
     }
 
-    /** 容错解析：剥markdown代码栅栏 → 定位首个{…末个} → org.json解析 */
+    /** 容错解析：剥 markdown 代码栅栏 → 定位首个{…末个} → 解析 name/desc/aliases/costume/time_of_day */
     fun parseJson(content: String): List<Asset> {
         var s = content.trim()
         if (s.startsWith("```")) {   // 剥 ```json … ```
@@ -66,16 +104,60 @@ object LlmAssetExtractor {
                         (o[k] as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim() ?: ""
                     val name = str("name")
                     if (name.isEmpty()) continue
-                    val desc = str("desc")
+                    val desc = buildDesc(str("desc"), str("costume"), str("time_of_day"), kind)
+                    val aliases = parseAliases(o["aliases"])
                     // LLM 偶尔会把无人机等可操作物体塞进 characters；这类资产没有人格，
                     // 必须在进入 App 资产库前纠正为道具，避免角色棚拍/锁脸流程误处理。
                     val normalizedKind = normalizeKind(kind, name, desc)
-                    out += Asset(normalizedKind, name, desc)
+                    out += Asset(normalizedKind, name, desc.ifBlank { name }, aliases)
                 }
             }
-            out
+            dedupeByAlias(out)
         } catch (_: Throwable) { emptyList() }
     }
+
+    /** 把 costume（主要造型）/ time_of_day（天光）并入 desc，保证下游一次拿到完整视觉信息。 */
+    private fun buildDesc(desc: String, costume: String, timeOfDay: String, kind: String): String {
+        val sb = StringBuilder(desc.trim())
+        if (costume.isNotBlank() && !sb.contains(costume)) {
+            if (sb.isNotEmpty()) sb.append("；")
+            sb.append("主要造型：").append(costume)
+        }
+        if (kind == "scene" && timeOfDay.isNotBlank() && !sb.contains(timeOfDay)) {
+            if (sb.isNotEmpty()) sb.append("；")
+            sb.append("时段与天光：").append(timeOfDay)
+        }
+        return sb.toString().trim()
+    }
+
+    /** aliases 兼容数组与分隔字符串两种模型输出。 */
+    private fun parseAliases(el: kotlinx.serialization.json.JsonElement?): List<String> {
+        val raw = when (el) {
+            is kotlinx.serialization.json.JsonArray -> el.mapNotNull {
+                (it as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim()
+            }
+            is kotlinx.serialization.json.JsonPrimitive -> el.content.split('、', '，', ',', '/', '／')
+            else -> emptyList()
+        }
+        return raw.map { it.trim() }.filter { it.isNotEmpty() && it.length <= 20 }.distinct()
+    }
+
+    /** 同一实体的别名级去重：name 或 aliases 命中已见集合即视为重复。 */
+    private fun dedupeByAlias(assets: List<Asset>): List<Asset> {
+        val seen = mutableSetOf<String>()
+        val out = mutableListOf<Asset>()
+        for (a in assets) {
+            val keys = (listOf(a.name) + a.aliases).map(::normalizeName).filter { it.isNotBlank() }
+            if (keys.any { it in seen }) continue
+            seen += keys
+            out += a
+        }
+        return out
+    }
+
+    /** 名称归一化（去空白/标点、小写），仅用于去重比较。 */
+    private fun normalizeName(raw: String): String =
+        raw.lowercase().replace(Regex("[\\s\\p{Punct}·・、，,。.；;：:（）()《》【】\\[\\]]"), "")
 
     /** 把明显的非人格实体从 LLM 的 character 误分类中纠正为 prop。 */
     private fun normalizeKind(kind: String, name: String, desc: String): String {
@@ -90,17 +172,29 @@ object LlmAssetExtractor {
     }
 
     /**
-     * 合并策略：LLM结果与正则结果按 kind+小写name 去重合并（LLM优先带desc，正则补漏），
-     * 上限各 kind 12 条防爆量。
+     * 合并策略：LLM 结果与正则结果按「名称+别名」归一化去重合并（LLM 优先带 desc，正则补漏），
+     * 上限各 kind 12 条防爆量。旧实现直接丢弃正则结果，导致 LLM 漏提时无兜底。
      */
     fun merge(llmAssets: List<Asset>, regexNames: List<Triple<String, String, Unit>>): List<Asset> {
         val seen = mutableSetOf<String>()
         val out = mutableListOf<Asset>()
+        fun keysOf(a: Asset): List<String> =
+            (listOf(a.name) + a.aliases).map(::normalizeName).filter { it.isNotBlank() }
         for (a in llmAssets) {
-            val k = "${a.kind}:${a.name.lowercase()}"
-            if (k in seen) continue
-            seen += k; out += a
+            val keys = keysOf(a)
+            if (keys.any { it in seen }) continue
+            seen += keys
+            out += a
+        }
+        for ((kind, name, _) in regexNames) {
+            val k = normalizeName(name)
+            if (k.isBlank() || k in seen) continue
+            seen += k
+            out += Asset(kind, name, "")
         }
         return out.groupBy { it.kind }.flatMap { (_, list) -> list.take(12) }
     }
+
+    /** 资产卡文本（App 落库/展示/下游生图统一口径）：`name：desc`，无 desc 时只用 name。 */
+    fun cardPrompt(a: Asset): String = if (a.desc.isBlank()) a.name else a.name + "：" + a.desc
 }

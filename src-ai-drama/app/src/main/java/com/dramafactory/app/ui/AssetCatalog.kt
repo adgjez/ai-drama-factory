@@ -33,13 +33,20 @@ object AssetCatalog {
      * - 排除判了重生成的卡：review_state == "regen"（用户已否决这张图）；
      * - kind 归一化：仅保留 character / scene / prop / local，未知值当 local。
      */
-    fun build(rows: List<AssetEntity>): List<com.dramafactory.core.quality.AiStoryboardDirector.AssetSnapshot> {
+    fun build(
+        rows: List<AssetEntity>,
+        /** ★第二批 P0：true 时只保留 audit_state=approved（AI 流水线，审计先于分镜）；false 时仍排除 rejected。 */
+        onlyApproved: Boolean = false,
+    ): List<com.dramafactory.core.quality.AiStoryboardDirector.AssetSnapshot> {
+        // ★第二批 P0：给 LLM 的目录不得包含被 QC 判 rejected 的资产
+        val usableRows = rows.filter { it.audit_state != "rejected" }
+            .let { list -> if (onlyApproved) list.filter { it.audit_state == "approved" } else list }
         // v1.7.21：「参考图已出图」的母卡——这些母卡即使自身无图也该进目录
-        val mothersBackedByRefs = rows.asSequence()
+        val mothersBackedByRefs = usableRows.asSequence()
             .filter { !it.parent_id.isNullOrBlank() && it.review_state != "regen" && uriOf(it) != null }
             .mapNotNull { it.parent_id }
             .toSet()
-        return rows.asSequence()
+        return usableRows.asSequence()
             .filter { it.asset_id.isNotBlank() }
             .filter { it.parent_id.isNullOrBlank() && it.pose_role.isNullOrBlank() }
             .filter { uriOf(it) != null || it.asset_id in mothersBackedByRefs }
@@ -134,6 +141,101 @@ object AssetCatalog {
             .mapNotNull { uriOf(it) }
             .distinct()
             .take(limit)
+    }
+
+    /**
+     * ★第六批：渲染期「软绑定」——分镜不再硬绑 asset_id 时，按资产显示名在镜头文本中出现来选母卡。
+     *
+     * 分镜阶段的 asset_ids 已改为可选：LLM 只在确实提及时才填。渲染阶段执行下面两步：
+     * 1. 本方法按 names/action/scene_context/carry_over 里的名字匹配母卡（角色优先，其次场景、道具）；
+     * 2. [resolveRefUris] 再把母卡解析成参考图（优先参考图子卡）。
+     * 匹配不到就返回空——此时该镜不注入参考图，等接缝帧合成阶段仍会用场景图兜底，
+     * 不会像旧实现那样回退到「项目级前 4 张」把别的角色脸串进来。
+     *
+     * @param texts 镜头里可读文本（action/dialogue/narration/scene_context/carry_over/scene_title）
+     * @param limit 最多返回几张母卡
+     */
+    fun softRefIds(
+        rows: List<AssetEntity>,
+        texts: List<String?>,
+        limit: Int = 6,
+    ): List<String> {
+        val haystack = texts.filterNotNull().map { it.trim() }.filter { it.isNotEmpty() }
+            .joinToString(" ")
+        if (haystack.isEmpty()) return emptyList()
+        val usable = rows.filter { it.audit_state != "rejected" }
+        val mothersBackedByRefs = usable.asSequence()
+            .filter { !it.parent_id.isNullOrBlank() && it.review_state != "regen" && uriOf(it) != null }
+            .mapNotNull { it.parent_id }
+            .toSet()
+        val mothers = usable.filter {
+            it.asset_id.isNotBlank() && it.parent_id.isNullOrBlank() && it.pose_role.isNullOrBlank() &&
+                it.review_state != "regen" &&
+                (uriOf(it) != null || it.asset_id in mothersBackedByRefs)
+        }
+        val out = LinkedHashSet<String>()
+        // 角色最关键（决定锁脸），场景次之（决定接缝帧背景），道具最后
+        for (kind in listOf("character", "scene", "prop")) {
+            val kindRows = mothers.filter { normalizeKind(it.kind) == kind }
+            // ① 全名命中优先（同 kind 内先排全名，再排 token）
+            for (row in kindRows) {
+                if (out.size >= limit) return out.toList()
+                if (row.asset_id in out) continue
+                val name = displayName(row.prompt)
+                if (isMatchableName(name) && haystack.contains(name)) out.add(row.asset_id)
+            }
+            // ② token 命中：资产名常形如「女秘书·职业装女性」「办公室·现代办公区」，
+            // 镜头文本却只写「女秘书」「办公室」——按分隔符切出的短名参与匹配。
+            for (row in kindRows) {
+                if (out.size >= limit) return out.toList()
+                if (row.asset_id in out) continue
+                if (softNameTokens(displayName(row.prompt)).any { haystack.contains(it) }) {
+                    out.add(row.asset_id)
+                }
+            }
+        }
+        return out.toList()
+    }
+
+    // ---- 第七批：软引用短名 / token 匹配 ----
+
+    /** 名字匹配的最小长度：单字（如「张」「李」）误命中率过高，不参与匹配。 */
+    private const val SOFT_NAME_MIN = 2
+
+    /**
+     * 资产名里的通用词：不携带可识别信息，整名与 token 都不参与匹配。
+     * 镜头文本里「人物」「女性」「场景」这类词很常见，不能因此把同 kind 的资产全拉进来。
+     */
+    private val SOFT_GENERIC_TERMS = setOf(
+        "人物", "角色", "场景", "道具", "环境", "背景", "画面", "镜头",
+        "特写", "全景", "中景", "近景", "远景",
+        "女性", "男性", "女生", "男生", "主角", "配角", "路人",
+        "服装", "造型", "状态", "外观", "设定", "风格",
+        "现代", "古代", "古装", "民国", "架空", "中性", "办公",
+    )
+
+    /** 名字 token 分隔符：资产名常形如「女秘书·职业装女性」「办公室：现代办公区（白天）」。 */
+    private val SOFT_NAME_SEPARATORS = Regex("[·・:：()（）、,，/|｜\\s]+")
+
+    /** 整名可参与匹配：非空、非「未命名」、长度 ≥ [SOFT_NAME_MIN] 且不是通用词。 */
+    private fun isMatchableName(name: String): Boolean =
+        name.isNotBlank() && name != "未命名" && name.length >= SOFT_NAME_MIN &&
+            name !in SOFT_GENERIC_TERMS
+
+    /**
+     * 把资产显示名切成可匹配的短名 token（第七批软引用）。
+     *
+     * 例：「女秘书·职业装女性」→ [女秘书, 职业装女性]；
+     * 「办公室：现代办公区」→ [办公室, 现代办公区]。
+     * 去重、去空白；长度 < 2 或通用词（[SOFT_GENERIC_TERMS]）丢弃。
+     */
+    internal fun softNameTokens(name: String): List<String> {
+        val out = LinkedHashSet<String>()
+        for (part in name.split(SOFT_NAME_SEPARATORS)) {
+            val token = part.trim()
+            if (token.length >= SOFT_NAME_MIN && token !in SOFT_GENERIC_TERMS) out.add(token)
+        }
+        return out.toList()
     }
 
     /** kind 归一化为 character / scene / prop / local，未知值按 local 处理。 */

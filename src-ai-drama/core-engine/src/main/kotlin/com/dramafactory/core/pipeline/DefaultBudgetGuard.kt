@@ -17,10 +17,17 @@ import kotlinx.coroutines.flow.StateFlow
 class DefaultBudgetGuard(
     /** 构造时快照为只读；后续变更仅经 setLimit */
     limits: Map<String, Int> = emptyMap(),
+    /** ★第五批 P0：进程重启后恢复历史已用条数（App 层从 SharedPreferences 读取） */
+    initialUsed: Map<String, Int> = emptyMap(),
 ) : BudgetGuard {
 
     private val limitsMap = ConcurrentHashMap(limits)
-    private val usedMap = ConcurrentHashMap<String, AtomicInteger>()
+    private val usedMap = ConcurrentHashMap<String, AtomicInteger>().apply {
+        initialUsed.forEach { (pid, used) -> put(pid, AtomicInteger(used)) }
+    }
+
+    /** ★第五批 P0：已用条数变化回调（App 层落 SharedPreferences，重启后预算不归零） */
+    var onUsageChanged: ((projectId: String, used: Int) -> Unit)? = null
 
     private val _usage = MutableStateFlow(BudgetUsage(0, 50))
     override val usage: StateFlow<BudgetUsage> get() = _usage
@@ -28,6 +35,7 @@ class DefaultBudgetGuard(
     fun setLimit(projectId: String, limit: Int) {
         limitsMap[projectId] = limit
         refresh(projectId)
+        onUsageChanged?.invoke(projectId, used(projectId))
     }
 
     fun used(projectId: String): Int = usedMap[projectId]?.get() ?: 0
@@ -44,9 +52,10 @@ class DefaultBudgetGuard(
             if (counter.compareAndSet(cur, cur + 1)) break
         }
         refresh(projectId)
+        onUsageChanged?.invoke(projectId, used(projectId))
     }
 
-    private fun limitOf(projectId: String): Int = limitsMap[projectId] ?: DEFAULT_LIMIT
+    fun limitOf(projectId: String): Int = limitsMap[projectId] ?: DEFAULT_LIMIT
 
     private fun refresh(projectId: String) {
         _usage.value = BudgetUsage(used(projectId), limitOf(projectId))

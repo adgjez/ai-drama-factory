@@ -184,8 +184,8 @@ class QualityEngineTest {
         assertTrue(redline.contains("sunglasses"), "禁遮眼")
         assertTrue(redline.contains("exaggerated expression"), "禁夸张表情（参考图必须中性）")
         assertTrue(redline.contains("watermark"), "禁水印")
-        // 时代红线仍生效：参考图也必须是西汉风貌
-        assertTrue(p.contains(preset.eraPositiveSubjectOnly), "参考图仍受时代红线约束")
+        // v1.9.46：时代红线已删除，参考图不再注入朝代内容
+        assertFalse(p.contains("深衣"), "参考图不应注入朝代服饰红线")
         assertFalse(p.contains("木构与夯土建筑"), "参考图不该诱导描绘建筑环境")
     }
 
@@ -201,24 +201,26 @@ class QualityEngineTest {
     // ============ C. 时代红线 ============
 
     @Test
-    fun c_era负向折叠进negative() {
+    fun c_时代禁词不再折叠进negative() {
         val preset = StylePreset.HAN_DEFAULT
-        assertTrue(preset.negativePrompt.contains("手机"), "era.negative 应折叠进全局 negative")
-        assertTrue(preset.negativePrompt.contains("塑料"), "global_negative 应保留")
+        assertFalse(preset.negativePrompt.contains("手机"), "时代禁词已移除")
+        assertFalse(preset.negativePrompt.contains("塑料"), "时代禁词已移除")
+        assertTrue(preset.negativePrompt.contains("watermark") || preset.negativePrompt.contains("水印"),
+            "global_negative 应保留")
     }
 
     @Test
-    fun c_era正向往suffix() {
+    fun c_时代正向不再进suffix() {
         val preset = StylePreset.HAN_DEFAULT
-        assertTrue(preset.positiveSuffix.contains("西汉末年"), "era.positive 应折叠进 suffix")
+        assertFalse(preset.positiveSuffix.contains("西汉末年"), "时代正向已移除")
+        assertTrue(preset.positiveSuffix.contains("cinematic"), "通用 suffix 应保留")
     }
 
     @Test
-    fun c_按镜放行剔除禁词() {
+    fun c_时代放行表自然失效() {
         val preset = StylePreset.HAN_DEFAULT
         val eff = preset.effectiveForbidden(shotAllowed = listOf("游标卡尺"))
-        assertFalse(eff.contains("游标卡尺"), "放行权应从本镜禁词剔除")
-        assertTrue(eff.contains("手机"), "其余仍禁")
+        assertTrue(eff.isEmpty(), "时代禁词已清空，放行表不再产生剩余禁词：$eff")
     }
 
     @Test
@@ -228,7 +230,8 @@ class QualityEngineTest {
             mapOf("shot_id" to "s1", "action" to "他掏出手机拨号", "dialogue" to listOf(mapOf("text" to "这是现代物品"))),
             mapOf("shot_id" to "s2", "action" to "他拔出青铜剑", "dialogue" to listOf(mapOf("text" to "你这手机从哪来"))),
         )
-        val report = EraConsistencyChecker.check(shots, preset.forbiddenEraTerms)
+        // v1.9.46：预设不再带时代禁词，这里显式传入禁词表以继续覆盖 checker 本身
+        val report = EraConsistencyChecker.check(shots, listOf("手机", "modern object"))
         assertFalse(report.ok, "视觉字段命中手机应 error")
         val err = report.errors.firstOrNull { it.shotId == "s1" }
         assertNotNull(err, "s1 action 命中手机应为 error")
@@ -244,7 +247,7 @@ class QualityEngineTest {
         val shots = listOf(
             mapOf("shot_id" to "s1", "action" to "远处传来钟声", "dialogue" to listOf(mapOf("text" to "policy card 在手"))),
         )
-        val report = EraConsistencyChecker.check(shots, preset.forbiddenEraTerms)
+        val report = EraConsistencyChecker.check(shots, listOf("钟表", "car", "手机"))
         assertTrue(report.ok, "钟声/policy card 不应误报时代红线")
     }
 

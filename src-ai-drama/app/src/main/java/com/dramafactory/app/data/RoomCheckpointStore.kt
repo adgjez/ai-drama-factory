@@ -23,7 +23,7 @@ import kotlinx.coroutines.sync.withLock
         FinishedFilmEntity::class,
         ActionIdempotencyEntity::class,
     ],
-    version = 8,
+    version = 10,
     exportSchema = true,
 )
 abstract class DramaDatabase : RoomDatabase() {
@@ -42,7 +42,9 @@ abstract class DramaDatabase : RoomDatabase() {
                 // 第十轮：v3→v4 shots 新增 visual_prompt + duration_seconds。
                 // T014：v4→v5 新增成片库表 finished_films。
                 // v1.9.12：v5→v6 assets 新增 enriched_prompt 列（LLM 扩写视觉描述永久落盘）。
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
+                // 第三批：v8→v9 shots 新增场次/站位/视线列，projects 新增 BGM 列。
+                // 第五批：v9→v10 render_tasks 新增 remote_video_url（付费成片的远端 URL 落库，clip 丢失可重取）。
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10)
                 .build().also { instance = it }
         }
 
@@ -133,6 +135,45 @@ abstract class DramaDatabase : RoomDatabase() {
                     var found = false
                     while (c.moveToNext()) if (nameIndex >= 0 && c.getString(nameIndex) == "scene_context") found = true
                     if (!found) db.execSQL("ALTER TABLE shots ADD COLUMN scene_context TEXT")
+                }
+            }
+        }
+
+        /** v8→v9：shots 新增场次结构（scene_no/scene_title/screen_side/eyeline），projects 新增 BGM。 */
+        val MIGRATION_8_9 = object : androidx.room.migration.Migration(8, 9) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                val shotColumns = mutableSetOf<String>()
+                db.query("PRAGMA table_info(shots)").use { c ->
+                    val nameIndex = c.getColumnIndex("name")
+                    while (c.moveToNext()) if (nameIndex >= 0) shotColumns += c.getString(nameIndex)
+                }
+                if ("scene_no" !in shotColumns) db.execSQL("ALTER TABLE shots ADD COLUMN scene_no INTEGER NOT NULL DEFAULT 0")
+                if ("scene_title" !in shotColumns) db.execSQL("ALTER TABLE shots ADD COLUMN scene_title TEXT")
+                if ("screen_side" !in shotColumns) db.execSQL("ALTER TABLE shots ADD COLUMN screen_side TEXT")
+                if ("eyeline" !in shotColumns) db.execSQL("ALTER TABLE shots ADD COLUMN eyeline TEXT")
+
+                val projectColumns = mutableSetOf<String>()
+                db.query("PRAGMA table_info(projects)").use { c ->
+                    val nameIndex = c.getColumnIndex("name")
+                    while (c.moveToNext()) if (nameIndex >= 0) projectColumns += c.getString(nameIndex)
+                }
+                if ("bgm_path" !in projectColumns) db.execSQL("ALTER TABLE projects ADD COLUMN bgm_path TEXT")
+                if ("bgm_volume" !in projectColumns) db.execSQL("ALTER TABLE projects ADD COLUMN bgm_volume REAL NOT NULL DEFAULT 0.22")
+            }
+        }
+
+        /** ★第五批 P0（v9→v10）：render_tasks 新增 remote_video_url。
+         *  付费成片的远端 URL 落库后，本地 clip 被系统清理时可重新取回，不必重新提交（重复付费）。
+         *  PRAGMA 守卫保证迁移幂等。 */
+        val MIGRATION_9_10 = object : androidx.room.migration.Migration(9, 10) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                val renderColumns = mutableSetOf<String>()
+                db.query("PRAGMA table_info(render_tasks)").use { c ->
+                    val nameIndex = c.getColumnIndex("name")
+                    while (c.moveToNext()) if (nameIndex >= 0) renderColumns += c.getString(nameIndex)
+                }
+                if ("remote_video_url" !in renderColumns) {
+                    db.execSQL("ALTER TABLE render_tasks ADD COLUMN remote_video_url TEXT")
                 }
             }
         }
@@ -234,38 +275,83 @@ class RoomCheckpointStore(private val dao: DramaDao) : CheckpointStore {
         toEpisodeCheckpoint(episodeId)
     }
 
-    /** P0-1：提交前置意图落库。suspend DAO写返回即已持久化（Room写事务）。 */
+    /** P0-1：提交前置意图落库。suspend DAO写返回即已持久化（Room写事务）。★第五批：整体串行化。 */
     override suspend fun markSubmitting(shotId: String) {
-        upsertByShotId(shotId) { it.copy(state = ShotState.SUBMITTING.name, submitted_at = System.currentTimeMillis()) }
-            ?: throw IllegalStateException("shot $shotId not in any checkpoint")
+        mutex.withLock {
+            upsertByShotId(shotId) {
+                it.copy(state = ShotState.SUBMITTING.name, submitted_at = System.currentTimeMillis())
+            } ?: throw IllegalStateException("shot $shotId not in any checkpoint")
+        }
+    }
+
+    /**
+     * ★第五批 P0：条件化提交意图。已 SUBMITTED/COMPLETED（已付费/已完成）的镜绝不再次提交；
+     * 只有仍可提交的镜像旧 markSubmitting 一样落 SUBMITTING 意图。返回 false=调用方必须跳过。
+     */
+    override suspend fun tryMarkSubmitting(shotId: String): Boolean = mutex.withLock {
+        val row = findAny(shotId) ?: return@withLock false
+        if (row.state == ShotState.SUBMITTED.name || row.state == ShotState.COMPLETED.name) {
+            return@withLock false
+        }
+        dao.upsertRenderTask(row.copy(
+            state = ShotState.SUBMITTING.name,
+            submitted_at = System.currentTimeMillis(),
+        ))
+        true
+    }
+
+    /** ★第五批 P0：清掉已不在当前分镜里的 render_tasks 行（删镜/重生成分镜后的幽灵任务）。 */
+    override suspend fun pruneToShots(episodeId: String, keepShotIds: Collection<String>): Int = mutex.withLock {
+        val stale = dao.renderTasksOf(episodeId).filter { it.shot_id !in keepShotIds }
+        stale.forEach { dao.deleteRenderTask(it.shot_id) }
+        stale.size
     }
 
     override suspend fun markSubmitted(shotId: String, providerTaskId: String) {
-        // ★video_id即刻落库：防重复付费生死线
-        upsertByShotId(shotId) { it.copy(state = ShotState.SUBMITTED.name, provider_task_id = providerTaskId,
-            submitted_at = System.currentTimeMillis()) }
-            ?: throw IllegalStateException("shot $shotId not in any checkpoint")
+        // ★video_id即刻落库：防重复付费生死线（★第五批：读写整体串行化，不与并发 loadOrMerge 交错）
+        mutex.withLock {
+            upsertByShotId(shotId) {
+                it.copy(state = ShotState.SUBMITTED.name, provider_task_id = providerTaskId,
+                    submitted_at = System.currentTimeMillis())
+            } ?: throw IllegalStateException("shot $shotId not in any checkpoint")
+        }
     }
 
     /** P0-1：已计费但video_id解析失败 → 「待对账」，绝不静默归为FAILED后重提 */
     override suspend fun markReconcile(shotId: String, reason: String) {
-        upsertByShotId(shotId) { it.copy(state = ShotState.RECONCILE.name,
-            blocked_reason = reason.take(400)) }
-            ?: throw IllegalStateException("shot $shotId not in any checkpoint")
+        mutex.withLock {
+            upsertByShotId(shotId) {
+                it.copy(state = ShotState.RECONCILE.name, blocked_reason = reason.take(400))
+            } ?: throw IllegalStateException("shot $shotId not in any checkpoint")
+        }
     }
 
     override suspend fun markCompleted(shotId: String, localFileUri: String, fileSize: Long) {
         require(fileSize > 0) { "size>0才算completed（架构§5 render_tasks约束）" }
-        upsertByShotId(shotId) { it.copy(state = ShotState.COMPLETED.name,
-            local_file_uri = localFileUri, file_size = fileSize, completed_at = System.currentTimeMillis()) }
-            ?: throw IllegalStateException("shot $shotId not in any checkpoint")
+        mutex.withLock {
+            upsertByShotId(shotId) {
+                it.copy(
+                    state = ShotState.COMPLETED.name,
+                    local_file_uri = localFileUri,
+                    file_size = fileSize,
+                    completed_at = System.currentTimeMillis(),
+                    // ★第五批：完成即清历史失败/暂停原因，UI 不再把已成功镜显示成失败过
+                    fail_reason = null,
+                    blocked_reason = null,
+                )
+            } ?: throw IllegalStateException("shot $shotId not in any checkpoint")
+        }
     }
 
     override suspend fun markFailed(shotId: String, reason: String) {
-        // FAILED/BLOCKED为权威态：仅在非终态上写入，不翻转既有FAILED
-        upsertByShotIdGuarded(shotId) { row ->
-            if (row.state == ShotState.FAILED.name || row.state == ShotState.BLOCKED.name) null
-            else row.copy(state = ShotState.FAILED.name, fail_reason = reason.take(400))
+        mutex.withLock {
+            // FAILED/BLOCKED为权威态：仅在非终态上写入，不翻转既有FAILED；
+            // ★第五批：COMPLETED/SUBMITTED 也不允许被 FAILED 覆盖（旧实现会把已付费结果抹成失败）
+            upsertByShotIdGuarded(shotId) { row ->
+                if (row.state == ShotState.FAILED.name || row.state == ShotState.BLOCKED.name ||
+                    row.state == ShotState.COMPLETED.name || row.state == ShotState.SUBMITTED.name) null
+                else row.copy(state = ShotState.FAILED.name, fail_reason = reason.take(400))
+            }
         }
     }
 

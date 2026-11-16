@@ -42,6 +42,7 @@ object ShotDirector {
         val opening = frameStart.ifBlank { "the opening scene" }
         val bits = mutableListOf<String>().apply {
             add("Cinematic opening film still of this shot: $opening.")
+            add("场景、人物造型、服装与道具必须严格遵循描述中的原文事实，不得替换成通用场景或通用服装。")
             if (binding.legend.isNotBlank()) {
                 add(
                     "参考图对应关系：@图1=本镜基础画面；${binding.legend}。" +

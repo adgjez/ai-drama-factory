@@ -13,6 +13,13 @@ import kotlinx.coroutines.flow.update
  */
 class AssetsLogic {
 
+    /**
+     * ★去时代锁：参考图套装使用的时代预设（默认中性=不锁朝代）。
+     * App 层在 AssetsViewModel 构造时注入 { eraPreset }，跟随剧本检测结果。
+     */
+    var eraPresetProvider: () -> com.dramafactory.core.quality.StylePreset =
+        { com.dramafactory.core.quality.StylePreset.NEUTRAL_DEFAULT }
+
     enum class Kind(val label: String) { CHARACTER("角色"), SCENE("场景"), PROP("道具"), LOCAL("本地") }
 
     /** 资产卡片数据 */
@@ -260,6 +267,12 @@ class AssetsLogic {
                 parentId = e.parent_id,
                 poseRole = e.pose_role,
                 enrichedPrompt = e.enriched_prompt,
+                // ★第五批：回填质量审计结论——旧实现只回图片字段，重启后所有卡变 pending，
+                // 用户看不到已有 approved/rejected 与拒绝原因（DB 里其实都已落）。
+                auditState = e.audit_state.takeIf { it.isNotBlank() } ?: "pending",
+                qualityScore = e.quality_score,
+                rejectReason = e.q_reject_reason,
+                defectsJson = e.defects_json,
                 // DB 有 media 但内存标记 generating 时，下方合并会纠正；此处先按DB是否有图决定生成态
                 generating = e.remote_url.isNullOrBlank() && e.image_uri.isNullOrBlank() && e.video_uri.isNullOrBlank()
                         && _assets.value.any { it.assetId == e.asset_id && it.generating },
@@ -367,7 +380,7 @@ class AssetsLogic {
     fun buildReferenceSheet(characterId: String, idGen: () -> String): Int {
         val parent = _assets.value.firstOrNull { it.assetId == characterId } ?: return 0
         if (parent.kind != Kind.CHARACTER) return 0
-        val preset = com.dramafactory.core.quality.StylePreset.HAN_DEFAULT
+        val preset = eraPresetProvider()
         var added = 0
         for (shot in preset.referenceShots) {
             val subId = idGen()
@@ -392,7 +405,7 @@ class AssetsLogic {
         characterDesc: String,
         shot: com.dramafactory.core.quality.StylePreset.ReferenceShotSpec,
     ): String = com.dramafactory.core.quality.AssetPromptBuilder
-        .finalReferencePrompt(com.dramafactory.core.quality.StylePreset.HAN_DEFAULT, characterDesc, shot)
+        .finalReferencePrompt(eraPresetProvider(), characterDesc, shot)
 
     /** 取某角色母卡关联的参考图子卡。 */
     fun referenceChildrenOf(characterId: String): List<AssetCard> =
@@ -404,6 +417,26 @@ class AssetsLogic {
             it.copy(auditState = auditState, qualityScore = qualityScore,
                 rejectReason = rejectReason, defectsJson = defectsJson)
         }
+    }
+
+    /**
+     * ★第五批 fail-closed：审计「没有结论/调用失败」时也必须把卡片标成 rejected 并可解释。
+     * 旧实现 file://、下载失败、异常路径直接 return，卡片停在 pending；渲染侧
+     * allowUnreviewedAssets=true 会放行 pending → 等于静默 passed。
+     * @param message 用户可见提示（卡片 ⚠ 红字，建议重新生成/重新审核）
+     */
+    fun markAuditRejected(assetId: String, rejectReason: String?, defectsJson: String?, message: String?) {
+        update(assetId) {
+            it.copy(auditState = "rejected", qualityScore = null,
+                rejectReason = rejectReason ?: it.rejectReason,
+                defectsJson = defectsJson ?: it.defectsJson,
+                errorMessage = message)
+        }
+    }
+
+    /** 只写卡片错误提示（不改变审计状态）；用于「重新审核」入口的前置提示。 */
+    fun setErrorMessage(assetId: String, message: String?) {
+        update(assetId) { it.copy(errorMessage = message) }
     }
 
     /** 删除资产卡片：母卡删除时连带参考图子卡；返回被删的id列表供DB清理 */
@@ -466,7 +499,10 @@ class AssetsLogic {
         }
         update(assetId) {
             when {
-                result.isSuccess -> it.copy(remoteUrl = result.getOrThrow(), generating = false, errorMessage = null)
+                // ★第五批：审计 fail-closed 会在生成过程中把卡标 rejected 并写 errorMessage；
+                // 出图成功不能无条件清空该提示，否则用户看不到「审核未通过/审计不可用」。
+                result.isSuccess -> it.copy(remoteUrl = result.getOrThrow(), generating = false,
+                    errorMessage = if (it.auditState == "rejected") it.errorMessage else null)
                 else -> it.copy(generating = false)   // 失败：URL保持旧值，UI按!success显示重试
             }
         }

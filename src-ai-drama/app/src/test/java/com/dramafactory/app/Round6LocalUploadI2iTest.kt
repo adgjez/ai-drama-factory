@@ -115,6 +115,12 @@ class Round6LocalUploadI2iTest {
         }
         override suspend fun shotKeyframes(shotId: String) = shots.firstOrNull { it.shot_id == shotId }
         override suspend fun shotReferenceVideo(shotId: String) = shots.firstOrNull { it.shot_id == shotId }?.reference_video_uri
+        override suspend fun updateShotSceneInfo(shotId: String, sceneNo: Int, sceneTitle: String?, screenSide: String?, eyeline: String?) {
+            val s = shots.firstOrNull { it.shot_id == shotId } ?: return
+            shots.removeIf { it.shot_id == shotId }
+            shots.add(s.copy(scene_no = sceneNo, scene_title = sceneTitle, screen_side = screenSide, eyeline = eyeline))
+        }
+        override suspend fun setProjectBgm(projectId: String, bgmPath: String?, bgmVolume: Double) {}
         override suspend fun upsertRenderTask(t: com.dramafactory.app.data.RenderTaskEntity) {}
         override suspend fun renderTasksOf(ep: String) = emptyList<com.dramafactory.app.data.RenderTaskEntity>()
         override suspend fun renderTask(shotId: String) = null

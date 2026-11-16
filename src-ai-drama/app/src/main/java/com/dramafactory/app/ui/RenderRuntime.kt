@@ -1,14 +1,18 @@
 package com.dramafactory.app.ui
 
 import com.dramafactory.app.AppGraph
+import com.dramafactory.app.data.ShotEntity
 import com.dramafactory.app.ui.AssetCatalog
 import com.dramafactory.core.pipeline.DefaultPipelineOrchestrator
 import com.dramafactory.core.pipeline.DefaultRenderQueue
 import com.dramafactory.core.provider.SharedHttp
+import com.dramafactory.core.quality.SeamPlanner
 import com.dramafactory.core.quality.StoryboardGate
 import io.ktor.client.request.prepareGet
 import io.ktor.client.statement.bodyAsChannel
 import io.ktor.utils.io.jvm.javaio.toInputStream
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * 渲染队列运行时 —— 按集懒建/复用DefaultRenderQueue实例 + 编排器恢复入口。
@@ -20,6 +24,8 @@ object RenderRuntime {
 
     @Volatile private var orchestrator: DefaultPipelineOrchestrator? = null
     private val queues = HashMap<String, DefaultRenderQueue>()
+    /** ★第七批：关键帧合成互斥（同一时刻只允许一份在跑，防并发重复生图/重复付费） */
+    private val keyframeMutex = Mutex()
 
     /**
      * 取某集的渲染队列（无则创建）。downloader把videoUrl下载到app缓存目录并校验size>0。
@@ -42,17 +48,55 @@ object RenderRuntime {
                 // 取 episodeId 后查 shots 表回填该镜文本。若查不到（如 Room 未初始化）安全退化为空三元组。
                 shotPromptResolver = { shotId ->
                     val shot = runCatching { AppGraph.dao.shotKeyframes(shotId) }.getOrNull()
-                    Triple(
-                        shot?.dialogue ?: "",
-                        shot?.narration ?: "",
-                        listOfNotNull(
-                            shot?.scene_context?.takeIf { !it.isNullOrBlank() }?.let { "场景连续性：$it" },
-                            shot?.action
-                        ).joinToString("；")
-                    )
+                    // ★质量修复 B：scene_context 改由 shotSceneContextProvider 单独传递（避免重复拼接）
+                    Triple(shot?.dialogue ?: "", shot?.narration ?: "", cleanShotAction(shot?.action, shot?.visual_prompt))
                 },
                 // v1.7.18：视频参数透传（设置页可调；每镜提交前读取，改参数即时生效）
                 videoParamsProvider = { _ -> AppGraph.videoParams },
+                // ★质量修复 B/F：镜头语言 / 场景锚点 / 镜头时长（落库字段直通队列；prompt 与帧数都用）
+                shotSceneContextProvider = { shotId ->
+                    runCatching { AppGraph.dao.shotKeyframes(shotId)?.scene_context }.getOrNull() ?: ""
+                },
+                shotCinematicProvider = { shotId ->
+                    runCatching {
+                        val shot = AppGraph.dao.shotKeyframes(shotId)
+                        val visual = shot?.visual_prompt?.takeIf { it.isNotBlank() } ?: ""
+                        val style = AppGraph.currentPreset().globalPromptSuffix
+                        if (visual.isBlank()) style else "景别与运镜：$visual。影调：$style"
+                    }.getOrDefault("")
+                },
+                shotDurationProvider = { shotId ->
+                    runCatching { AppGraph.dao.shotKeyframes(shotId)?.duration_seconds }.getOrNull() ?: 0.0
+                },
+                // ★第五批 P0：空白分镜止损——台词/旁白/动作全空的孤儿镜绝不提交付费任务
+                blockEmptyPrompt = true,
+                // ★第五批 P0：付费 clip 本地丢失自愈（先看旧 cacheDir/clips，兼容升级前已下载的片）
+                clipFileChecker = { uri, _ ->
+                    fun ok(f: java.io.File?): Boolean = f != null && f.isFile && f.length() > 0L
+                    val f = runCatching { java.io.File(uri) }.getOrNull()
+                    if (ok(f)) true else {
+                        val legacy = AppGraph.appContext()?.let { ctx ->
+                            f?.name?.let { name -> java.io.File(java.io.File(ctx.cacheDir, "clips"), name) }
+                        }
+                        ok(legacy)
+                    }
+                },
+                // ★第五批 P0：已落库的远端成片 URL（clip 被清理后可重取，不重新提交付费）
+                recordedRemoteUrlOf = { shotId ->
+                    runCatching {
+                        AppGraph.dao.renderTasksOfShot(shotId).maxByOrNull { it.submitted_at ?: 0L }
+                            ?.remote_video_url
+                    }.getOrNull()
+                },
+                // ★第五批 P0：轮询到成片 URL 就落库（本地下载失败也能追溯/重取）
+                remoteUrlRecorder = { shotId, url ->
+                    runCatching {
+                        val row = AppGraph.dao.renderTasksOfShot(shotId).maxByOrNull { it.submitted_at ?: 0L }
+                        if (row != null && row.remote_video_url != url) {
+                            AppGraph.dao.upsertRenderTask(row.copy(remote_video_url = url))
+                        }
+                    }
+                },
                 // ★v1.8.0 质量三闸接线（对齐 pavo fidelity_gate + storyboard 六铁律 + shot_director 开场帧重渲染）
                 // 提交前保真闸：把该镜分镜条目编译为 StoryboardGate.Entry 跑 FidelityGate。
                 // 未绑定资产的镜 fail-soft 跳过（避免误杀纯场景/动作镜，整集 sb_check 仍覆盖）。
@@ -83,19 +127,37 @@ object RenderRuntime {
                 catalogApprovedIdsProvider = { epId ->
                     val pid = epId.substringBeforeLast("_ep")
                     runCatching { AppGraph.dao.assetsAllOf(pid) }.getOrNull()
+                        // ★质量修复 G：被 QC 拒绝(REJECTED)的资产不算「已批准」，否则差图照样进保真闸/参考图
+                        ?.filter { it.audit_state == "approved" }
                         ?.filter { !it.remote_url.isNullOrBlank() || !it.image_uri.isNullOrBlank() }
                         ?.map { it.asset_id }?.toSet() ?: emptySet()
                 },
+                // ★v1.10：已拒绝资产集合（硬拦）与项目真实资产全集（编造 ID 识别）
+                catalogRejectedIdsProvider = { epId ->
+                    val pid = epId.substringBeforeLast("_ep")
+                    runCatching { AppGraph.dao.assetsAllOf(pid) }.getOrNull()
+                        ?.filter { it.audit_state == "rejected" }
+                        ?.filter { !it.asset_id.isNullOrBlank() }
+                        ?.map { it.asset_id }?.toSet() ?: emptySet()
+                },
+                catalogKnownIdsProvider = { epId ->
+                    val pid = epId.substringBeforeLast("_ep")
+                    runCatching { AppGraph.dao.assetsAllOf(pid) }.getOrNull()
+                        ?.filter { !it.asset_id.isNullOrBlank() }
+                        ?.map { it.asset_id }?.toSet() ?: emptySet()
+                },
+                // ★v1.10：未审核资产放行（只告警不阻断）——修复旧资产 audit_state=pending 导致整集渲染全灭
+                allowUnreviewedAssets = true,
+                // ★第二批 P0（B-G1）：严格目录模式——批准集合为空也必须逐资产校验，不再 fail-open
+                catalogStrict = true,
                 // 整集六铁律：任一镜 sb_check 含 error → 整集中止（fail-closed）
                 storyboardBlockedProvider = { epId ->
                     runCatching { AppGraph.dao.shotsOf(epId) }.getOrNull()?.let { shots ->
                         shots.any { it.sb_check.contains("error", ignoreCase = true) && it.sb_check != "pass" }
                     }
                 },
-                // 开场帧重渲染（不去头改重渲染）：用写回 shot.first_image_uri 的重渲染帧；空=逃生用原始 first
-                openingFrameProvider = { shotId ->
-                    runCatching { AppGraph.dao.shotKeyframes(shotId)?.first_image_uri }.getOrNull()
-                },
+                // 开场帧重渲染（不去头改重渲染）：已有写回首帧→直接用；没有→按剧本 i2i 合成电影开场静帧
+                openingFrameProvider = { shotId -> synthesizeOpeningFrame(shotId) },
                 // v1.9.24 TD-7 修复：资产锁脸三件套此前只在 QueueViewModel 接到 queueFor("default")，
                 // 真实 episode 队列（queueFor(episodeId)）永远拿到空 lambda → 道具 ref 从不注入、跨镜不锁脸。
                 // 现统一在 queueFor 构造期接齐，每个 episode 实例均生效。
@@ -111,8 +173,14 @@ object RenderRuntime {
                     runCatching {
                         val shot = AppGraph.dao.shotKeyframes(shotId)
                             ?: AppGraph.dao.shotsOf(epId).firstOrNull { it.shot_id == shotId }
-                        val refIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
-                        val all = AppGraph.dao.assetsAllOf(projectId)
+                        // ★v1.10：参考图「只认 approved」放宽为「排除 rejected」——未审核资产不再让整集无参考图，
+                        // 质检拒绝的差图仍然硬隔离（配合 fidelity 闸的 gate_asset_rejected）
+                        val all = AppGraph.dao.assetsAllOf(projectId).filter { it.audit_state != "rejected" }
+                        // ★第六批：分镜不再硬绑资产——first_asset_ids 为空时按镜头文本软匹配母卡（防 LLM 引用编造 ID）
+                        val boundRefIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
+                        val refIds = boundRefIds.ifEmpty {
+                            AssetCatalog.softRefIds(all, shot?.let { shotTextsForSoftRefs(it) } ?: emptyList())
+                        }
                         AssetCatalog.resolveRefUris(all, refIds)
                             .ifEmpty { AssetCatalog.fallbackUris(all) }
                     }.getOrDefault(emptyList())
@@ -129,6 +197,192 @@ object RenderRuntime {
                 // 暂时用占位，如果配置了图床服务则上传，否则透传让远端 400（由 ValidationError 捕获）
                 mediaUrlResolver = { uri -> AppGraph.uploadImageToCloud(uri) },
             )
+        }
+    }
+
+    /**
+     * ★第六批：软引用匹配文本。
+     * 分镜不再硬绑资产后，渲染期按「镜头文本里是否出现资产名」回找可用母卡；
+     * 只取展示用文本（软匹配输入是资产名，不是 first_asset_ids 里的 ID）。
+     */
+    private fun shotTextsForSoftRefs(shot: ShotEntity): List<String?> = listOf(
+        shot.action,
+        shot.dialogue,
+        shot.narration,
+        shot.scene_context,
+        shot.carry_over,
+        shot.scene_title,
+    )
+
+    /**
+     * ★质量修复 C：自动开场帧合成（i2i）。
+     * 旧链路 first_image_uri 的唯一真实写入点是 QueuePage 里人工从相册选图 → 流水线产出的镜
+     * 95% 没有首帧，视频模型只能从纯文字起步，人物/场景每镜重掷。
+     * 这里在提交前用「场景底图/接缝帧 + 角色参考图」做一次 img2img，把电影开场静帧写回
+     * first_image_uri 以便复用与审计；任何一步失败返回 null，队列自动回落到原始 first 逻辑
+     * （绝不阻断渲染）。
+     *
+     * ★第六批接缝帧：同场相邻镜共享接缝帧时，[seamInputs] 传入上一镜已生成的首帧作为本镜
+     * 基础画面（图1），本镜在此基础上自然推进到开场动作，保证两镜衔接像素级连续。
+     * 已有 first_image_uri（人工图/已生成接缝帧）直接返回，绝不重掷。
+     */
+    private suspend fun synthesizeOpeningFrame(shotId: String, seamInputs: List<String> = emptyList()): String? {
+        return try {
+        val dao = AppGraph.dao
+        val epId = shotId.substringBeforeLast("_shot").takeIf { it.contains("_ep") } ?: shotId
+        val shot = dao.shotKeyframes(shotId) ?: dao.shotsOf(epId).firstOrNull { it.shot_id == shotId }
+        val existing = shot?.first_image_uri?.takeIf { it.isNotBlank() }
+        if (existing != null) return existing
+        val projectId = epId.substringBeforeLast("_ep").ifBlank { epId }
+        // ★v1.10：同参考图策略——未审核资产可用于开场帧合成，拒绝态仍然排除
+        val all = dao.assetsAllOf(projectId).filter { it.audit_state != "rejected" }
+        // ★第六批：first_asset_ids 为空时按镜头文本软匹配母卡；软解析只补「参考图」，不改绑定关系
+        val boundRefIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
+        val refIds = boundRefIds.ifEmpty {
+            AssetCatalog.softRefIds(all, shot?.let { shotTextsForSoftRefs(it) } ?: emptyList())
+        }
+        val refUris = AssetCatalog.resolveRefUris(all, refIds)
+            .ifEmpty { AssetCatalog.fallbackUris(all) }
+            .filter { it.isNotBlank() }.distinct().take(4)
+        // 无参考图且无接缝帧时不生图：纯文生图必掷脸，交给渲染侧回落（宁可没有首帧）
+        if (refUris.isEmpty() && seamInputs.isEmpty()) return null
+        val sceneBase = all.firstOrNull {
+            it.kind == "scene" && (!it.remote_url.isNullOrBlank() || !it.image_uri.isNullOrBlank())
+        }?.let { it.remote_url?.takeIf { s -> s.isNotBlank() } ?: it.image_uri }
+        // 接缝帧优先做基础画面（承接上一镜尾帧）；否则退回场景底图/首张参考
+        val base = seamInputs.firstOrNull() ?: sceneBase ?: refUris.firstOrNull() ?: return null
+        // 第八批：还原原文细节——首帧描述 = 场景 + 画面（含原文细节）+ 动作节拍，缺一不可。
+        val frameStart = listOfNotNull(
+            shot?.scene_context?.takeIf { it.isNotBlank() },
+            shot?.visual_prompt?.takeIf { it.isNotBlank() },
+            shot?.action?.takeIf { it.isNotBlank() },
+        ).distinct().joinToString("；")
+        // 有接缝帧时图1=上一镜尾帧（本镜基础画面），其余图只做角色/场景一致性约束
+        val legend = if (seamInputs.isNotEmpty()) {
+            "其余图片为角色/场景设定图，仅用于保持人物长相与场景一致，不要照搬棚拍背景；本镜在此基础上自然推进到开场动作。"
+        } else {
+            "参考图片为角色/场景设定图，仅用于保持人物长相与场景一致，不要照搬棚拍背景。"
+        }
+        val (prompt, _) = com.dramafactory.core.quality.ShotDirector.buildOpeningFramePrompt(
+            frameStart = frameStart,
+            binding = com.dramafactory.core.quality.ShotDirector.Binding(
+                baseUri = base,
+                assetUris = (refUris + seamInputs).filter { it != base }.distinct(),
+                legend = legend,
+            ),
+            stylePreset = AppGraph.currentPreset(),
+        )
+        val inputs = (seamInputs.take(1) + listOfNotNull(sceneBase) + refUris).distinct().take(5)
+        val url = try {
+            AppGraph.image.generateImage(com.dramafactory.core.model.ImageGenRequest(
+                prompt = prompt, size = "720x1280", inputImages = inputs))
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // 各图像 Provider 支持的尺寸/参数不同（Agnes 图像端拒绝 negative_prompt、尺寸档位各异）：
+            // 退回默认尺寸且不带负向词再试一次；仍失败由外层 runCatching 返回 null 回落原始首帧逻辑。
+            AppGraph.image.generateImage(com.dramafactory.core.model.ImageGenRequest(
+                prompt = prompt, inputImages = inputs))
+        }
+        val publicUrl = AppGraph.uploadImageToCloud(url)
+        try {
+            // 首帧写回；尾帧这里不动（接缝帧链由 synthesizeEpisodeKeyframes 第二遍统一写）
+            dao.setShotKeyframes(shotId, publicUrl, shot?.last_image_uri)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            // 单镜写库失败不阻断整集，返回 URL 供本次渲染兜底使用
+        }
+        publicUrl
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * ★第二批 P0：编排器分镜落库后自动合成整集关键帧。
+     * 逐镜生成首帧（i2i，复用 [synthesizeOpeningFrame]），再按声明式接缝帧写尾帧链。
+     *
+     * ★第六批接缝帧（SeamPlanner）：
+     * - 同场相邻镜：镜 i 的尾帧 == 镜 i+1 的首帧 == 同一张图，衔接处像素级连续，
+     *   且每镜可单独重渲而不破坏接缝；
+     * - 跨场/集尾：硬切，尾帧写 null，清掉旧的跨场尾帧，避免视频模型把两场插值成一场；
+     * - 下一镜首帧缺失时保留本镜已有尾帧（绝不把人工尾帧覆盖成 null）。
+     *
+     * 任何一镜失败只跳过该镜，绝不阻断流水线；返回本次真正新合成且写库成功的镜数。
+     *
+     * ★第七批加固：
+     * - 默认不截断（maxShots<=0 表示全集；老调用仍可传正整数做限流，不再有 24 镜暗坑）；
+     * - 进程内互斥：编排器重试/用户手动触发并发时只跑一份，绝不重复生图（重复=重复付费）；
+     * - 取消异常继续向上抛，绝不吞掉取消继续合成。
+     */
+    suspend fun synthesizeEpisodeKeyframes(episodeId: String, maxShots: Int = 0): Int =
+        keyframeMutex.withLock { synthesizeEpisodeKeyframesLocked(episodeId, maxShots) }
+
+    private suspend fun synthesizeEpisodeKeyframesLocked(episodeId: String, maxShots: Int): Int {
+        return try {
+        // 无可用图像 Key 时直接跳过：否则会逐镜走到 Provider 才失败，白跑 24 次（A-G4）
+        if (!AppGraph.agnesKeyReady()) return 0
+        val dao = AppGraph.dao
+        // 接缝规划必须基于整集全集：截断只限制「生成多少镜」，不能改变前后镜的场次关系
+        val allShots = dao.shotsOf(episodeId).sortedBy { it.shot_no }
+        if (allShots.isEmpty()) return 0
+        val shots = if (maxShots > 0) allShots.take(maxShots) else allShots
+        val links = SeamPlanner.plan(allShots.map { SeamPlanner.ShotRef(it.shot_no, it.scene_no) })
+        val linkByNo = links.associateBy { it.shotNo }
+        val byNo = allShots.associateBy { it.shot_no }
+        // 第一遍：按镜号顺序生成首帧；同场接缝镜把上一镜刚生成的首帧作为接缝输入
+        val firstByNo = LinkedHashMap<Int, String>()
+        val freshlySynthesized = LinkedHashSet<String>()
+        shots.forEachIndexed { i, shot ->
+            val prevShot = shots.getOrNull(i - 1)
+            val prevLink = prevShot?.let { linkByNo[it.shot_no] }
+            val seamInputs = if (prevShot != null && prevLink != null && prevLink.chainedToNext) {
+                listOfNotNull(firstByNo[prevShot.shot_no])
+            } else {
+                emptyList()
+            }
+            val hadFirst = !shot.first_image_uri.isNullOrBlank()
+            val uri = synthesizeOpeningFrame(shot.shot_id, seamInputs)
+            if (!uri.isNullOrBlank()) {
+                firstByNo[shot.shot_no] = uri
+                if (!hadFirst) freshlySynthesized += shot.shot_id
+            }
+        }
+        // 第二遍：写回首/尾帧。先算完所有首帧再写，保证镜 i 能直接复用镜 i+1 的新首帧做接缝
+        var written = 0
+        shots.forEach { shot ->
+            val first = firstByNo[shot.shot_no]?.takeIf { it.isNotBlank() }
+                ?: shot.first_image_uri?.takeIf { it.isNotBlank() }
+                ?: return@forEach
+            val link = linkByNo[shot.shot_no]
+            val nextNo = link?.lastToShotNo
+            val lastToUse: String? = if (link?.chainedToNext == true && nextNo != null) {
+                // 同场接缝：优先下一镜本次新生成的首帧；其次下一镜库里已有的首帧；
+                // 两者都没有（下一镜生成失败/被截断）时保留本镜旧尾帧，绝不写 null
+                firstByNo[nextNo]
+                    ?: byNo[nextNo]?.first_image_uri?.takeIf { it.isNotBlank() }
+                    ?: shot.last_image_uri
+            } else {
+                // 场尾/集尾/场次号缺失：硬切，清空旧尾帧（否则会跨场插值）
+                null
+            }
+            try {
+                dao.setShotKeyframes(shot.shot_id, first, lastToUse)
+                if (shot.shot_id in freshlySynthesized) written++
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                // 写库失败即视为未合成，不虚报成功（A-G3）
+            }
+        }
+        written
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            0
         }
     }
 
@@ -163,7 +417,9 @@ object RenderRuntime {
      * 失败抛异常 → 队列保持SUBMITTED仅重试取回，绝不重新提交已付费任务。
      */
     private suspend fun downloadClip(videoUrl: String, shotId: String): Pair<String, Long> {
-        val dir = cacheDir()
+        // ★第五批 P0：付费 clip 不再落 cacheDir（系统可随时清理 → 成片页缺镜、只能重渲重付）。
+        // 统一写 filesDir/clips（持久），远端 URL 同时落库，被清理后也能免费重取。
+        val dir = clipDir()
         // ★F5 修复：校验 mkdirs() 结果，目录不可写立即抛明确错误，不再静默丢弃返回值。
         if ((!dir.exists() && !dir.mkdirs()) || !dir.isDirectory) {
             throw IllegalStateException("无法创建/访问 clip 缓存目录：${dir.absolutePath}")
@@ -196,9 +452,10 @@ object RenderRuntime {
      * 不再用 java.io.tmpdir（ART 上取值不可控，且与全项目策略不一致）。
      * 兜底顺序：appContext().cacheDir → appContext().filesDir/clips → 最后才退 java.io.tmpdir。
      */
-    private fun cacheDir(): java.io.File {
+    private fun clipDir(): java.io.File {
         val ctx = AppGraph.appContext()
-        val base = ctx?.cacheDir ?: ctx?.filesDir
+        // 优先持久目录 filesDir/clips；cacheDir 仅在无 filesDir 时兜底（兼容异常环境）
+        val base = ctx?.filesDir ?: ctx?.cacheDir
         if (base != null) return java.io.File(base, "clips")
         return java.io.File(System.getProperty("java.io.tmpdir") ?: "/tmp", "ai-drama-clips")
     }

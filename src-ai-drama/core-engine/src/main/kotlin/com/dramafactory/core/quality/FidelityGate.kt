@@ -71,6 +71,14 @@ object FidelityGate {
         expectedIndex: Int? = null,
         baselineState: Map<String, String>? = null,
         visual: Boolean = false,
+        /** ★第二批 P0（B-G1）：生产端置 true——空 catalog 不再放行资产校验，改为「有绑定资产即报错」 */
+        requireCatalog: Boolean = false,
+        /** ★v1.10：已拒绝（rejected）资产集合——被质检拒绝的资产永不允许进入渲染 */
+        catalogRejectedIds: Set<String> = emptySet(),
+        /** ★v1.10：项目内真实存在的资产 ID 全集；null=未提供，退回旧「仅 approved 判定」逻辑 */
+        catalogKnownIds: Set<String>? = null,
+        /** ★v1.10：已存在但尚未审核（pending）的资产是否放行。false=旧行为（未批准即硬拦） */
+        allowUnreviewedAssets: Boolean = false,
     ): GateReport {
         val sid = entry.shotId
         val report = mutableListOf<Issue>()
@@ -86,8 +94,19 @@ object FidelityGate {
             add("error", "gate_no_asset_bound", "该镜没有绑定任何资产：首尾帧无法做图像条件绑定")
         } else {
             for (aid in entry.associateAssetIds) {
-                if (catalogApprovedIds.isNotEmpty() && aid !in catalogApprovedIds) {
-                    add("error", "gate_asset_not_real", "绑定资产 $aid 不在 catalog['approved'] 中：禁止编造资产 ID")
+                if ((requireCatalog || catalogApprovedIds.isNotEmpty()) && aid !in catalogApprovedIds) {
+                    // ★v1.10 分级：拒绝态硬拦（差图绝不进渲染）/ 已知但未审核可放行并告警 / 未知 ID 仍硬拦
+                    // （背景：旧资产 audit_state 多为 pending，严格「只认 approved」会让整集 15 镜全灭）
+                    when {
+                        aid in catalogRejectedIds ->
+                            add("error", "gate_asset_rejected", "绑定资产 $aid 已被质检拒绝：禁止进入渲染，请到资产页重新生成该资产")
+                        catalogKnownIds != null && aid !in catalogKnownIds ->
+                            add("error", "gate_asset_not_real", "绑定资产 $aid 不在本项目资产库中：禁止编造资产 ID")
+                        allowUnreviewedAssets ->
+                            add("warn", "gate_asset_unreviewed", "绑定资产 $aid 尚未质检通过：本次按未审核放行，建议到资产页复查")
+                        else ->
+                            add("error", "gate_asset_not_real", "绑定资产 $aid 不在 catalog['approved'] 中：禁止编造资产 ID")
+                    }
                 }
             }
             for (ref in entry.unresolvedAssetRefs) {

@@ -21,6 +21,18 @@ import com.dramafactory.core.orchestrate.PipelineStage5
  * 写后按精确 ID 读回并比对关键字段，任一步失败抛 [PersistenceWriteException] 使
  * [DefaultAiOrchestrator] 的 PipelineRun 进入失败契约（success=false），禁止半成功报告。
  */
+/** ★第二批 P0（B-G5）：审计早退（无图/无 Key/取图解码失败/异常）也必须把结论落库，
+ *  否则上一轮可能残留的 approved 会继续让脏图进渲染参考。 */
+private suspend fun AppGraph.markAssetAuditPending(assetId: String, reason: String) {
+    runCatching {
+        dao.setAssetQuality(
+            assetId = assetId, qualityScore = null, auditState = "pending",
+            defectsJson = null, rejectReason = reason, g1ErrorCode = null,
+            faceRatio = null, poseRole = null, updatedAt = System.currentTimeMillis(),
+        )
+    }
+}
+
 internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
     DefaultAiOrchestrator(
         activeTextModelIdProvider = { textModelRouter.activeTextModelId() },
@@ -34,14 +46,8 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
             val gate = requireStorageReady()
             if (gate != null) throw StorageUnavailableException(gate.code, gate.userMessage, gate.diagnosticId)
             val epId = "${projectId}_ep1"
-            // ★F3 修复：按剧本自动推断时代红线（LLM 优先，规则兜底），替换原写死 "han"。
-            // 第十三轮 EraDetector 与人工模式（ViewModels:370-374）同策略。
-            val llmReady = agnesKeyReady()
-            currentEraKey = runCatching {
-                com.dramafactory.core.quality.EraDetector.detect(scriptText, llmReady) { req ->
-                    agnes.chat(req)
-                }
-            }.getOrElse { com.dramafactory.core.quality.EraDetector.Detection("han", "", false) }.eraKey
+            // v1.9.46：时代约束已从生成链路删除，不再做剧本时代检测（恒用 neutral 预设）。
+            currentEraKey = "neutral"
             val flags = DramaDatabase.Companion.AiStageFlags
             val stageFlags =
                 flags.put(flags.putBool("", flags.AI_MANAGED, true),
@@ -80,7 +86,8 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                 r.assets.map { a ->
                     DefaultAiOrchestrator.AiAsset(
                         assetId = "a_${System.nanoTime()}",
-                        kind = a.kind, name = a.name, prompt = a.desc,
+                        kind = a.kind, name = a.name,
+                        prompt = com.dramafactory.core.quality.LlmAssetExtractor.cardPrompt(a),
                     )
                 }
             }
@@ -95,7 +102,7 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                 }
                 val preset = com.dramafactory.core.quality.EraDetector.presetFor(currentEraKey)
                 // TD-5：generateImage 在编排器协程上下文中执行，避免阻塞主线程。
-                // ★F3：按剧本推断时代预设，不写死具体时代。
+                // v1.9.46：preset 恒为 neutral，服化道以剧本为准。
                 com.dramafactory.app.ui.AssetImageGenerator.generate(
                     provider = image, kind = asset.kind,
                     basePrompt = enrichAssetPrompt(asset.kind, asset.prompt), preset = preset)
@@ -112,19 +119,52 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
         auditAsset = { asset ->
             // ★F2 修复：真实质量审计——调用 AssetAuditor.audit（G1 文件级硬校验 + G2 多模态打分），
             // 替换原直接返回 passed=true 的「假通过」（原实现关闭了 PRD F03 两层闸门）。
-            // 未生成图像/未配置 Key 时不阻断流水线，但明确标注未审计（audit_skipped_*）。
+            // ★第二批 P0 fail-closed：未生成图像/未配置 Key/取图解码失败 = 审核未通过（passed=false），
+            // ★第五批 task-21：标记 NON_RETRYABLE，由编排器立即止损（为无图/无 Key 重生成不会通过）。
             // 注意：λ 返回类型必须是 Result<AuditResult>，故整体包在 runCatching 内；
-            // 异常会变为 Result.failure，由编排器 AUDIT 阶段按「未过」处理（WARN 标红放行）。
+            // 异常会变为 Result.failure（NON_RETRYABLE），由编排器 AUDIT 阶段立即止损、不再盲重生成。
             runCatching {
                 val remoteUrl = runCatching { dao.assetRemoteUrl(asset.assetId) }.getOrNull()
-                val llmReady = agnesKeyReady()
-                if (remoteUrl.isNullOrBlank() || !llmReady) {
-                    return@runCatching DefaultAiOrchestrator.AuditResult(passed = true, reason = "audit_skipped_no_image_or_key")
+                // ★第二批 P0 fail-closed："没法审" 不再等于 "通过"。
+                // 旧实现无图/无 Key/取图失败/解码失败一律 passed=true，等于关掉质量闸；
+                // 现在一律 passed=false：前四类（无图/无Key/取图/解码）标 NON_RETRYABLE 立即止损，
+                // 只有画面类缺陷（QualityEngine REJECTED）才走「重生成→再审」，重试用尽落 rejected。
+                if (remoteUrl.isNullOrBlank()) {
+                    markAssetAuditPending(asset.assetId, "audit_no_image")
+                    return@runCatching DefaultAiOrchestrator.AuditResult(
+                        passed = false,
+                        reason = "audit_no_image",
+                        verdict = DefaultAiOrchestrator.AuditVerdict.NON_RETRYABLE,
+                        errorCode = "audit_no_image",
+                    )
+                }
+                if (!agnesKeyReady()) {
+                    markAssetAuditPending(asset.assetId, "audit_no_key")
+                    return@runCatching DefaultAiOrchestrator.AuditResult(
+                        passed = false,
+                        reason = "audit_no_key",
+                        verdict = DefaultAiOrchestrator.AuditVerdict.NON_RETRYABLE,
+                        errorCode = "audit_no_key",
+                    )
                 }
                 val bytes = MediaHelpers.fetchImageBytes(remoteUrl)
-                    ?: return@runCatching DefaultAiOrchestrator.AuditResult(passed = true, reason = "audit_image_fetch_failed")
+                    ?: return@runCatching DefaultAiOrchestrator.AuditResult(
+                        passed = false,
+                        reason = "audit_image_fetch_failed",
+                        verdict = DefaultAiOrchestrator.AuditVerdict.NON_RETRYABLE,
+                        errorCode = "audit_image_fetch_failed",
+                    ).also {
+                        markAssetAuditPending(asset.assetId, "audit_image_fetch_failed")
+                    }
                 val dataUri = MediaHelpers.downscaleToDataUri(bytes)
-                    ?: return@runCatching DefaultAiOrchestrator.AuditResult(passed = true, reason = "audit_image_decode_failed")
+                    ?: return@runCatching DefaultAiOrchestrator.AuditResult(
+                        passed = false,
+                        reason = "audit_image_decode_failed",
+                        verdict = DefaultAiOrchestrator.AuditVerdict.NON_RETRYABLE,
+                        errorCode = "audit_image_decode_failed",
+                    ).also {
+                        markAssetAuditPending(asset.assetId, "audit_image_decode_failed")
+                    }
                 val describer = com.dramafactory.core.quality.AssetAuditor.agnesDescriber(agnes, "")
                 val engine = com.dramafactory.app.ui.QualityEngine()
                 val outcome = engine.auditAsset(
@@ -132,11 +172,48 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                     description = asset.prompt, assetType = asset.kind,
                     describer = describer,
                 )
+                // ★质量修复 G：审计结论必须落库（旧实现只回传不写 DB）。
+                // 否则渲染侧只看到「有 URL」，被 QC 拒绝的图照样被逐镜当参考图（audit_state 永远 pending）。
+                runCatching {
+                    dao.setAssetQuality(
+                        assetId = asset.assetId,
+                        qualityScore = outcome.qualityScore,
+                        auditState = outcome.auditState.name.lowercase(),
+                        defectsJson = outcome.defectsJson(),
+                        rejectReason = outcome.rejectReason,
+                        g1ErrorCode = outcome.g1ErrorCode,
+                        faceRatio = outcome.faceRatio,
+                        poseRole = outcome.poseRole,
+                        updatedAt = System.currentTimeMillis(),
+                    )
+                }
                 DefaultAiOrchestrator.AuditResult(
                     passed = outcome.auditState == com.dramafactory.core.model.AuditState.APPROVED,
                     score = outcome.qualityScore,
                     reason = outcome.rejectReason,
+                    // ★第五批 task-21：质量引擎的未通过属于画面类缺陷（构图/脸崩/风格不符），可重生成；
+                    // 无图/无 Key/取图解码失败走上面的 NON_RETRYABLE 早退，不再为不可修复原因 3 倍付费。
+                    verdict = if (outcome.auditState == com.dramafactory.core.model.AuditState.APPROVED)
+                        DefaultAiOrchestrator.AuditVerdict.PASSED
+                    else DefaultAiOrchestrator.AuditVerdict.RETRYABLE_CONTENT_FAILURE,
+                    defects = outcome.defects,
+                    errorCode = outcome.g1ErrorCode,
                 )
+            }.onFailure { markAssetAuditPending(asset.assetId, it.message ?: "audit_exception") }
+        },
+        onAssetAuditRejected = { assetId, rejectReason, defectsJson, qualityScore ->
+            // ★第五批 P0（task-21）：画面类缺陷重试用尽 → audit_state=rejected + 原因 + defects 落库，
+            // 渲染侧据此硬拦，不再把未过审的图当参考图/关键帧。
+            try {
+                dao.setAssetQuality(
+                    assetId = assetId, qualityScore = qualityScore, auditState = "rejected",
+                    defectsJson = defectsJson, rejectReason = rejectReason, g1ErrorCode = null,
+                    faceRatio = null, poseRole = null, updatedAt = System.currentTimeMillis(),
+                )
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                // 拒绝结论落库失败不阻断流水线（编排器侧已 emit WARN）
             }
         },
         generateShots = { pid, script, _ ->
@@ -146,12 +223,46 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                 // 第十五轮：从 DB 拉本项目已抽取/已生成的资产注入 LLM，让分镜用 asset_id 引用
                 val assets = runCatching { dao.assetsAllOf(pid) }.getOrDefault(emptyList())
                 // v1.7.17：与 StoryboardViewModel 共用同一套目录构造规则
-                val catalog = com.dramafactory.app.ui.AssetCatalog.build(assets)
+                // ★第二批 P0：AI 流水线的分镜目录只用已获批资产（审计阶段先于分镜）
+                // ★v1.10：审计不可用 / 旧资产审核态为 pending 时 approved 目录会为空，分镜将失去全部资产绑定；
+                // 回退到「未拒绝」目录（拒绝态仍排除），保证分镜有资产可绑。
+                val approvedCatalog = com.dramafactory.app.ui.AssetCatalog.build(assets, onlyApproved = true)
+                val catalog = approvedCatalog.ifEmpty {
+                    com.dramafactory.app.ui.AssetCatalog.build(assets, onlyApproved = false)
+                }
                 val r = com.dramafactory.core.quality.AiStoryboardDirector.generate(
                     script, chat = { req -> tp.chat(req) }, assets = catalog)
                 r.shots.map { s ->
-                    DefaultAiOrchestrator.AiShot(s.shotNo, s.action ?: "", s.dialogue, s.assetIds)
+                    // ★质量修复 B：完整映射导演字段（旧实现只传 4 个参数，visual/scene/carry/duration 全丢）
+                    DefaultAiOrchestrator.AiShot(
+                        shotNo = s.shotNo,
+                        action = s.action ?: "",
+                        dialogue = s.dialogue,
+                        assetIds = s.assetIds,
+                        narration = s.narration,
+                        visualPrompt = s.visualPrompt,
+                        sceneContext = s.sceneContext,
+                        carryOver = s.carryOver,
+                        beatRef = s.beatRef,
+                        durationSeconds = s.durationSeconds,
+                        sceneNo = s.sceneNo,
+                        sceneTitle = s.sceneTitle,
+                        screenSide = s.screenSide,
+                        eyeline = s.eyeline,
+                    )
                 }
+            }
+        },
+        // ★第二批 P0：自动关键帧阶段——分镜落库后逐镜合成首帧并做尾帧接力。
+        // 失败/无参考图时返回 0，编排器只发 WARN，渲染侧回落原始首帧逻辑。
+        // ★第七批：不传 shots.size（旧分镜可能多于本次生成），交给合成器按库里全集处理。
+        generateKeyframes = { episodeId, _ ->
+            try {
+                com.dramafactory.app.ui.RenderRuntime.synthesizeEpisodeKeyframes(episodeId)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                0
             }
         },
         enqueueRender = { episodeId, shots ->
@@ -176,7 +287,8 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                     asset_id = a.assetId,
                     project_id = projectId,
                     kind = a.kind,
-                    prompt = a.name + "：" + a.prompt,
+                    // cardPrompt 已含「name：desc」；旧数据/自定义 prompt 才补前缀，避免双前缀
+                    prompt = if (a.prompt.startsWith(a.name)) a.prompt else a.name + "：" + a.prompt,
                     updated_at = System.currentTimeMillis(),
                 )
             }
@@ -195,6 +307,17 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                     shot_no = s.shotNo,
                     action = s.action,
                     dialogue = s.dialogue,
+                    // ★质量修复 B：导演字段落库（旧实现丢弃 visual/scene/carry/duration → 视频端只剩台词+action）
+                    narration = s.narration,
+                    scene_context = s.sceneContext,
+                    visual_prompt = s.visualPrompt,
+                    beat_ref = s.beatRef,
+                    carry_over = s.carryOver,
+                    duration_seconds = s.durationSeconds,
+                    scene_no = s.sceneNo,
+                    scene_title = s.sceneTitle,
+                    screen_side = s.screenSide,
+                    eyeline = s.eyeline,
                     first_asset_ids = AssetCatalog.encodeRefIds(s.assetIds),
                     last_asset_ids = "[]",
                 )

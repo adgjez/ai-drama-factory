@@ -123,6 +123,24 @@ class InMemoryCheckpointStore : CheckpointStore {
         store.keys.toList()
     }
 
+    /** ★第五批 P0：清掉已不在分镜里的 checkpoint 行（防幽灵任务开机重提付费） */
+    override suspend fun pruneToShots(episodeId: String, keepShotIds: Collection<String>): Int = mutex.withLock {
+        val cp = store[episodeId] ?: return@withLock 0
+        val removed = cp.shots.count { it.shotId !in keepShotIds }
+        cp.shots.removeAll { it.shotId !in keepShotIds }
+        if (cp.shots.isEmpty()) store.remove(episodeId)
+        removed
+    }
+
+    /** ★第五批 P0：已 SUBMITTED/COMPLETED 的镜绝不再次转 SUBMITTING（防重复付费） */
+    override suspend fun tryMarkSubmitting(shotId: String): Boolean = mutex.withLock {
+        val entry = findAny(shotId) ?: return@withLock false
+        if (entry.state == ShotState.SUBMITTED || entry.state == ShotState.COMPLETED) return@withLock false
+        entry.state = ShotState.SUBMITTING
+        entry.submittedAt = System.currentTimeMillis()
+        true
+    }
+
     private fun findAny(shotId: String): CheckpointEntry? =
         store.values.asSequence().flatMap { it.shots.asSequence() }.firstOrNull { it.shotId == shotId }
 }

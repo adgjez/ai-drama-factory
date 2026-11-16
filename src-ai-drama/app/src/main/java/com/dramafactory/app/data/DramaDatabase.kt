@@ -22,6 +22,12 @@ data class ProjectEntity(
     val episode_plan: Int = 1,
     val budget_shots: Int = 50,
     val created_at: Long,
+    // ---- 第三批：BGM 端到端（用户在成片页选曲，合成时混音）----
+    /** 选中的背景音乐本地路径（FileProvider/缓存文件）；null=不混 BGM */
+    val bgm_path: String? = null,
+    /** BGM 混音音量（0~1），须与 MIGRATION_8_9 默认值一致 */
+    @ColumnInfo(defaultValue = "0.22")
+    val bgm_volume: Double = 0.22,
 )
 
 @Entity(tableName = "assets")
@@ -98,6 +104,16 @@ data class ShotEntity(
     /** 每镜时长（秒），渲染prompt组装与预算估算用；defaultValue须与MIGRATION_3_4一致 */
     @ColumnInfo(defaultValue = "6.0")
     val duration_seconds: Double = 6.0,
+    // ---- 第三批：场次结构 + 轴线/视线（软提示与故事板分组用）----
+    /** 场次号（从 1 连续，同场同号）；defaultValue 须与 MIGRATION_8_9 一致 */
+    @ColumnInfo(defaultValue = "0")
+    val scene_no: Int = 0,
+    /** 场次标题（4~8 字，如「深夜办公室」） */
+    val scene_title: String? = null,
+    /** 人物画面站位：左 / 右 / 中（轴线检查用） */
+    val screen_side: String? = null,
+    /** 视线方向：左 / 右 / 上 / 下 / 对方（正反打检查用） */
+    val eyeline: String? = null,
 )
 
 /** 渲染任务checkpoint——断点续传核心表，provider_task_id为防重复付费生死线 */
@@ -111,6 +127,8 @@ data class RenderTaskEntity(
     val blocked_reason: String? = null,
     val fail_reason: String? = null,
     val local_file_uri: String? = null,
+    /** ★第五批 P0：远端成片 URL。本地 clip 被系统清理后可重取，避免重新提交付费任务 */
+    val remote_video_url: String? = null,
     val file_size: Long = 0,             // size>0才算completed
     val submitted_at: Long? = null,
     val completed_at: Long? = null,
@@ -204,8 +222,16 @@ interface DramaDao {
     @Query("UPDATE assets SET prompt=:prompt, updated_at=:updatedAt WHERE asset_id=:assetId")
     suspend fun updateAssetPrompt(assetId: String, prompt: String, updatedAt: Long)
 
-    /** 第十一轮：生成结果落盘（remote_url + file_uri 预留本地路径） */
-    @Query("UPDATE assets SET remote_url=:remoteUrl, updated_at=:updatedAt WHERE asset_id=:assetId")
+    /** 第十一轮：生成结果落盘（remote_url + file_uri 预留本地路径）。
+     *  ★第二批 P0（B-G7）：重生成会换图，旧图的审计结论必须同步作废，
+     *  否则新图审计失败/未审时仍带 approved 被渲染引用。 */
+    @Query("""
+        UPDATE assets SET remote_url=:remoteUrl, audit_state='pending', quality_score=NULL,
+        defects_json=NULL, q_reject_reason=NULL, g1_error_code=NULL, face_ratio=NULL,
+        g1_state='none', g2_score=NULL, g2_defects=NULL, review_state='none', reject_reason=NULL,
+        updated_at=:updatedAt
+        WHERE asset_id=:assetId
+    """)
     suspend fun setAssetRemoteUrl(assetId: String, remoteUrl: String, updatedAt: Long)
 
     /** ★F2 修复：读单资产的生成图 remote_url，供 AI 管线质量审计（AssetAuditor.audit）下载多模态打分。 */
@@ -244,6 +270,14 @@ interface DramaDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsertShot(s: ShotEntity)
     @Query("SELECT * FROM shots WHERE episode_id=:episodeId ORDER BY shot_no") suspend fun shotsOf(episodeId: String): List<ShotEntity>
+
+    /** 第三批：分镜编辑对话框保存场次/站位/视线（局部 UPDATE，不动台词动作）。 */
+    @Query("UPDATE shots SET scene_no=:sceneNo, scene_title=:sceneTitle, screen_side=:screenSide, eyeline=:eyeline WHERE shot_id=:shotId")
+    suspend fun updateShotSceneInfo(shotId: String, sceneNo: Int, sceneTitle: String?, screenSide: String?, eyeline: String?)
+
+    /** 第三批：项目 BGM 选曲落库（成片合成时读取）。 */
+    @Query("UPDATE projects SET bgm_path=:bgmPath, bgm_volume=:bgmVolume WHERE project_id=:projectId")
+    suspend fun setProjectBgm(projectId: String, bgmPath: String?, bgmVolume: Double)
     /** 第十轮：重新生成分镜前清空本集旧镜（保留render_tasks历史对账） */
     @Query("DELETE FROM shots WHERE episode_id=:episodeId") suspend fun deleteShotsOf(episodeId: String)
     /** 第十二轮：删除单镜 */

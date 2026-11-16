@@ -2,6 +2,7 @@ package com.dramafactory.app.ui
 import com.dramafactory.core.provider.AgnesRegion
 import com.dramafactory.core.provider.DefaultTextModelRouter
 import com.dramafactory.app.AppGraph
+import com.dramafactory.app.debug.DebugBridge
 
 import kotlinx.coroutines.launch
 import androidx.compose.foundation.layout.Arrangement
@@ -22,6 +23,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.mutableStateOf
@@ -380,6 +382,87 @@ fun SettingsPage(vm: SettingsViewModel = viewModel()) {
                     color = MaterialTheme.colorScheme.outline)
             }
         }
+
+        // ---- 开发者选项（仅 debug 包）：调试桥 token / 开关 ----
+        if (com.dramafactory.app.BuildConfig.DEBUG) {
+            DeveloperDebugBridgeCard()
+        }
+    }
+}
+
+/**
+ * 开发者选项（仅 debug 包可见）：调试桥 token 显示/复制 + 启停开关。
+ * 调试桥只监听 127.0.0.1，所有请求需带 X-Debug-Token 头或 ?token=；
+ * token 由 SecureRandom 生成并存在 SharedPreferences("dsh_debug")，跨重启不变。
+ */
+@Composable
+private fun DeveloperDebugBridgeCard() {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val snackbar = LocalDramaSnackbar.current
+    var enabled by remember { mutableStateOf(DebugBridge.isEnabled(ctx)) }
+    var running by remember { mutableStateOf(DebugBridge.isRunning()) }
+    var token by remember { mutableStateOf(DebugBridge.tokenOrNull(ctx)) }
+    DramaCard(Modifier.fillMaxWidth()) {
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("开发者选项", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "调试桥：http://127.0.0.1:${DebugBridge.PORT}（仅 debug 包，只读 DB）。" +
+                    "请求需带 X-Debug-Token 头或 ?token=。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("启用调试桥", style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.weight(1f))
+                Switch(
+                    checked = enabled,
+                    onCheckedChange = { on ->
+                        enabled = on
+                        DebugBridge.setEnabled(ctx, on)
+                        if (on) {
+                            DebugBridge.start(ctx)
+                            running = DebugBridge.isRunning()
+                            token = DebugBridge.tokenOrNull(ctx)
+                            snackbar.show(
+                                if (running) "调试桥已开启：127.0.0.1:${DebugBridge.PORT}"
+                                else "调试桥启动失败（端口 ${DebugBridge.PORT} 可能被占用）"
+                            )
+                        } else {
+                            DebugBridge.stop()
+                            running = false
+                            snackbar.show("调试桥已关闭")
+                        }
+                    },
+                )
+            }
+            Text(
+                "状态：" + when {
+                    running -> "监听中"
+                    enabled -> "已启用，未监听（重启 App 后自动启动）"
+                    else -> "已关闭"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+            val currentToken = token
+            if (currentToken != null) {
+                Text("token：$currentToken", style = MaterialTheme.typography.bodySmall)
+                OutlinedButton(onClick = {
+                    val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                        as android.content.ClipboardManager
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText(
+                        "dsh-debug-token", currentToken))
+                    snackbar.show("token 已复制")
+                }) { Text("复制 token") }
+            } else {
+                Text("token 尚未生成：开启调试桥或重启 App 后由 SecureRandom 生成。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline)
+            }
+            Text("access 信息：getExternalFilesDir(null)/debug-bridge.txt（baseUrl + token 一行 JSON）",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline)
+        }
     }
 }
 
@@ -545,17 +628,19 @@ fun VideoParamsBlock(vm: SettingsViewModel) {
                 .indexOfFirst { it.second == (p.width ?: 448) && it.third == (p.height ?: 832) }
                 .takeIf { it >= 0 } ?: 0)
     }
-    var frames by remember(p.numFrames) { mutableStateOf((p.numFrames ?: 121).toString()) }
+    // ★第二批 P0（C-G1）：空 = 跟随分镜逐镜时长；旧实现保存时无条件写 121 帧，把所有镜钉死 5.04s。
+    var frames by remember(p.numFrames) { mutableStateOf(p.numFrames?.toString() ?: "") }
     var fps by remember(p.frameRate) { mutableStateOf((p.frameRate ?: 24f).toString()) }
     var savedTip by remember { mutableStateOf(false) }
 
     fun save() {
         val (_, w, h) = com.dramafactory.core.model.VideoParams.PRESETS[presetIdx]
-        val nf = frames.trim().toIntOrNull()
+        // 帧数留空 = 不覆盖逐镜时长（DefaultRenderQueue 用 numFramesForDuration 按 shot.duration_seconds 算 8n+1）
+        val nf = frames.trim().takeIf { it.isNotEmpty() }?.toIntOrNull()
         val fr = fps.trim().toFloatOrNull()
         vm.setVideoParams(com.dramafactory.core.model.VideoParams(
             width = w, height = h,
-            numFrames = nf?.coerceIn(17, 441),
+            numFrames = nf?.coerceIn(9, 441),
             frameRate = fr?.coerceIn(1f, 60f)))
         vm.saveVideoParams()
         savedTip = true
@@ -579,7 +664,7 @@ fun VideoParamsBlock(vm: SettingsViewModel) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 OutlinedTextField(
                     value = frames, onValueChange = { frames = it; savedTip = false },
-                    label = { Text("时长帧数 (8n+1)") }, singleLine = true,
+                    label = { Text("时长帧数 (8n+1，留空=按分镜)") }, singleLine = true,
                     modifier = Modifier.weight(1f),
                 )
                 OutlinedTextField(

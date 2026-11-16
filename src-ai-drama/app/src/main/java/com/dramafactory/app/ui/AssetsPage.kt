@@ -250,7 +250,7 @@ fun AssetsPage(
     val assetsState = vm?.assets?.collectAsState()
     val scriptMode by vm?.scriptMode?.collectAsState() ?: remember { mutableStateOf(false) }
     val eraAllowed by vm?.allowedCrossEra?.collectAsState() ?: remember { mutableStateOf(emptyList<String>()) }
-    val eraLabel by vm?.eraLabel?.collectAsState() ?: remember { mutableStateOf("西汉末年至新莽时期（默认）") }
+    val eraLabel by vm?.eraLabel?.collectAsState() ?: remember { mutableStateOf("服化道以剧本为准") }
     val extractMsg by vm?.extractMessage?.collectAsState() ?: remember { mutableStateOf<String?>(null) }
     // v1.9.2：副标题随剧集动态变化（项目名 + 第几集），不再写死
     val subtitle by vm?.subtitle?.collectAsState() ?: remember { mutableStateOf("资产库") }
@@ -358,7 +358,7 @@ fun AssetsPage(
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Icon(painterResource(R.drawable.ic_shield), contentDescription = "时代红线",
                                 tint = DramaColor.Warning, modifier = Modifier.size(22.dp))
-                            Text("时代红线", style = MaterialTheme.typography.titleMedium)
+                            Text("时代风格", style = MaterialTheme.typography.titleMedium)
                             Surface(
                                 color = DramaColor.Warning.copy(alpha = 0.15f),
                                 shape = MaterialTheme.shapes.extraSmall,
@@ -369,7 +369,7 @@ fun AssetsPage(
                                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp))
                             }
                         }
-                        Text("已根据剧本自动推断时代约束；若剧本为穿越设定，请手动改写红线后再生成图像。",
+                        Text("时代约束已移除：服化道、建筑形制与器物风格完全以剧本和资产描述为准；下方自定义禁词仅本剧生效。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.outline)
                         FlowRow(
@@ -516,6 +516,8 @@ fun AssetsPage(
                         onRegen = { vm.generate(card.assetId) },
                         onKeep = { vm.review(card.assetId, true) },
                         onStopGenerate = { vm.stopGenerate(card.assetId) },
+                        // ★第五批：人工重新审核（已生成图重跑 G1+G2，失败/跳过 fail-closed 落 rejected）
+                        onReaudit = { vm.auditAssetById(card.assetId) },
                         onBuildReferenceSheet = if (card.kind == AssetsLogic.Kind.CHARACTER && card.parentId == null) {
                             { vm.buildCharacterReferenceSheet(card.assetId) }
                         } else null,
@@ -717,6 +719,8 @@ private fun GridAssetCard(
     onKeep: () -> Unit = {},
     /** v1.9.2：生成中「停止」回调 */
     onStopGenerate: () -> Unit = {},
+    /** ★第五批：人工「重新审核」——对已生成图重跑 G1+G2（审计不可用会落 rejected，不静默放过） */
+    onReaudit: () -> Unit = {},
     onBuildReferenceSheet: (() -> Unit)? = null,
     /** v1.9.10：手动「润色」回调（用 LLM 扩写视觉描述） */
     onPolish: () -> Unit = {},
@@ -787,6 +791,17 @@ private fun GridAssetCard(
                 Text(gridStatusLine(card), style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.outline,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
+                // ★第五批：人工「重新审核」——审计不可用 / 未过会 fail-closed 落 rejected 并在此显示原因
+                if ((card.remoteUrl != null || card.imageUri != null) &&
+                    card.kind != AssetsLogic.Kind.LOCAL && !card.generating) {
+                    OutlinedButton(
+                        onClick = onReaudit,
+                        modifier = Modifier.height(26.dp),
+                        contentPadding = PaddingValues(horizontal = 8.dp),
+                        shape = MaterialTheme.shapes.extraSmall,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                    ) { Text("重新审核", style = MaterialTheme.typography.labelSmall) }
+                }
                 card.errorMessage?.let {
                     Text("⚠ $it", style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.error,

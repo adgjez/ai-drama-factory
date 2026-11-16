@@ -57,6 +57,22 @@ class QualityGateWiringTest {
         return q to store
     }
 
+    /**
+     * 等待队列离开 PENDING/SUBMITTING 过渡态。
+     *
+     * 不能用「state != PENDING 即返回」：队列在 markSubmitting 与 markFailed/提交之间有一小段
+     * SUBMITTING 窗口，慢机型/冷 JVM 上该窗口可超过一次轮询间隔，测试会采样到 SUBMITTING 而误判。
+     * 本机（arm64 手机 proot）复现：同一条用例在未打补丁的 main 上同样失败，属测试竞态非业务缺陷。
+     */
+    private suspend fun awaitSettled(store: InMemoryCheckpointStore, episodeId: String): ShotState? {
+        var state = store.getEpisode(episodeId)?.shots?.firstOrNull()?.state
+        while (state == null || state == ShotState.PENDING || state == ShotState.SUBMITTING) {
+            delay(20)
+            state = store.getEpisode(episodeId)?.shots?.firstOrNull()?.state
+        }
+        return state
+    }
+
     @Test
     fun `v1_8_0_参考图套装真注入inputImages`() = runBlocking {
         withTimeout(10_000) {
@@ -64,7 +80,7 @@ class QualityGateWiringTest {
             val video = CapturingVideo()
             val (q, store) = buildQueue(scope, video) { shotAssetImageResolver = { listOf("ref1", "ref2", "ref3", "ref4") } }
             q.enqueueEpisode("ep1", listOf(ShotMeta("s1", "ep1", "")))
-            while (store.getEpisode("ep1")?.shots?.singleOrNull()?.state == ShotState.PENDING) delay(50)
+            awaitSettled(store, "ep1")
             assertEquals(listOf("ref1", "ref2", "ref3", "ref4"), video.requests.single().inputImages,
                 "v1.7.21 生成的 4 张参考图必须进入视频生成 inputImages（不是死资产）")
             scope.cancel()
@@ -88,7 +104,7 @@ class QualityGateWiringTest {
                 catalogApprovedIdsProvider = { emptySet() }
             }
             q.enqueueEpisode("ep1", listOf(ShotMeta("s1", "ep1", "")))
-            while (store.getEpisode("ep1")?.shots?.singleOrNull()?.state == ShotState.PENDING) delay(50)
+            awaitSettled(store, "ep1")
             assertTrue(video.requests.none { it.shotId == "s1" }, "保真闸拦截：该镜未提交视频（不烧钱出废片）")
             val shot = store.getEpisode("ep1")!!.shots.single()
             assertEquals(ShotState.FAILED, shot.state)

@@ -10,15 +10,16 @@ package com.dramafactory.core.quality
  * - 只有 AssetsViewModel 一处把禁词并入正向，其余三处的时代红线形同虚设。
  *
  * 这里收敛成一处，规则如下：
- * 1. 正向顺序即权重：主体描述 → era 红线 → 类型专用 suffix → 类型专用背景指令
+ * 1. 正向顺序即权重：主体描述 → 类型专用 suffix → 类型专用背景指令
  *    → Do NOT include 禁词 → 质量负向（模型对尾部权重最高，故背景指令压在最后）；
  * 2. 禁词一律并入正向（图像端无 negative_prompt 字段），只取 ASCII 项（英文抑制强于中文）。
  *
- * v1.7.19：三类资产各走一套约束。此前 scene / prop 都只走 era 红线，
+ * v1.9.46：时代红线已从生成链路移除，只保留类型专用约束（服化道以剧本为准）。
+ * 三类资产各走一套约束。此前 scene / prop 都只走同一份通用约束，
  * 于是场景被模型自行塞入人物、道具被套上 cinematic 等环境化语义而背景脏：
- * - character：主体版 era（剥离建筑/场景语义）+ 棚拍 suffix + 纯色棚拍底，禁环境杂物；
- * - scene：完整 era（场景本就该有建筑陈设）+ cinematic + 空场无人指令，禁人物；
- * - prop：主体版 era + 道具 suffix（去 cinematic / 9:16）+ 纯色底孤立单品，禁环境人物。
+ * - character：棚拍 suffix + 纯色棚拍底 + 尾部空手强指令，禁环境杂物；
+ * - scene：cinematic + 空场无人指令，禁人物；
+ * - prop：道具 suffix（去 cinematic / 9:16）+ 纯色底孤立单品，禁环境人物。
  */
 object AssetPromptBuilder {
 

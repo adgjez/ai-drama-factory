@@ -4,8 +4,10 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.dramafactory.app.AppGraph
+import com.dramafactory.app.data.RenderTaskEntity
 import com.dramafactory.app.update.UpdateChecker
 import com.dramafactory.core.quality.AssetAuditor
+import com.dramafactory.core.quality.RenderPreflight
 import com.dramafactory.core.quality.StylePreset
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -297,7 +299,8 @@ class QueueViewModel(private val episodeId: String) : ViewModel() {
     // ★第五轮加固：queueFor/budgetGuard构造失败（AppGraph未就绪等）时兜底Fakes队列，
     // VM仍可创建，页面显示空状态而非闪退。
     private val logic = runCatching {
-        QueueLogic(queue = RenderRuntime.queue(), budgetGuard = AppGraph.budgetGuard)
+        // ★第五批：按当前剧集取运行时队列（RenderRuntime.queue() 固定 "default"，多集项目会串集）
+        QueueLogic(queue = RenderRuntime.queueFor(episodeId), budgetGuard = AppGraph.budgetGuard)
     }.getOrElse {
         android.util.Log.e("QueueViewModel", "queue init failed, degraded", it)
         QueueLogic(queue = DegradedRenderQueue(),
@@ -367,7 +370,9 @@ class QueueViewModel(private val episodeId: String) : ViewModel() {
                 runCatching {
                     val shot = AppGraph.dao.shotKeyframes(shotId) ?: AppGraph.dao.shotsOf(epId).firstOrNull { it.shot_id == shotId }
                     val refIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
+                    // ★第二批 P0：被 QC 判 rejected 的资产不得进参考图（与渲染侧 approved 过滤口径一致）
                     val all = AppGraph.dao.assetsAllOf(projectId)
+                        .filter { it.audit_state != "rejected" }
                     // v1.7.21：改走 AssetCatalog.resolveRefUris —— 引用母卡时展开其参考图套装
                     // （front_bust 优先、单角色最多 2 张），否则 v1.7.20 生成的 4 张参考图
                     // 一张都进不了渲染，锁脸还是只靠母卡那一张图。
@@ -386,8 +391,63 @@ class QueueViewModel(private val episodeId: String) : ViewModel() {
                 if (supported) AppGraph.dao.shotReferenceVideo(shotId) else null
             }
         }
+        // 第七批：渲染前预检——本集分镜 + 项目资产（含 rejected）+ 预算剩余 → RenderPreflight.check。
+        // 与 QueueLogic 的 preflightReader 契约一致；任何读取失败返回 null（UI 保持上一次结果）。
+        preflightReader = {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    val projectId = episodeId.substringBeforeLast("_ep").ifBlank { episodeId }
+                    val shots = AppGraph.dao.shotsOf(episodeId).sortedBy { it.shot_no }
+                    val assets = AppGraph.dao.assetsAllOf(projectId)
+                    val guard = AppGraph.budgetGuard
+                    RenderPreflight.check(
+                        shots = shots.map { shot ->
+                            RenderPreflight.ShotInput(
+                                shotNo = shot.shot_no,
+                                shotId = shot.shot_id,
+                                action = shot.action.orEmpty(),
+                                dialogue = shot.dialogue,
+                                narration = shot.narration,
+                                durationSeconds = shot.duration_seconds,
+                                firstImageUri = shot.first_image_uri,
+                                lastImageUri = shot.last_image_uri,
+                                boundAssetIds = AssetCatalog.parseRefIds(shot.first_asset_ids),
+                                sbCheck = shot.sb_check,
+                                sceneNo = shot.scene_no,
+                            )
+                        },
+                        knownAssetIds = assets.map { it.asset_id }.toSet(),
+                        rejectedAssetIds = assets.filter { it.audit_state == "rejected" }
+                            .map { it.asset_id }.toSet(),
+                        budgetRemaining = (guard.limitOf(projectId) - guard.used(projectId))
+                            .coerceAtLeast(0),
+                    )
+                }.getOrNull()
+            }
+        }
     }
     val state: StateFlow<QueueLogic.UiState> get() = logic.state
+
+    /**
+     * 第四批：渲染任务行明细（shotId → RenderTaskEntity）。
+     * QueueLogic.UiState 只暴露状态名与简短原因；逐镜预览还需要 local_file_uri/file_size/时间戳，
+     * 这里单独读 render_tasks 表。QueuePage 在 shotStates 变化时调用 refreshRenderTasks()。
+     */
+    private val _renderTasks = MutableStateFlow<Map<String, RenderTaskEntity>>(emptyMap())
+    val renderTasks: StateFlow<Map<String, RenderTaskEntity>> = _renderTasks
+
+    fun refreshRenderTasks() {
+        viewModelScope.launch {
+            _renderTasks.value = withContext(Dispatchers.IO) {
+                runCatching {
+                    AppGraph.dao.renderTasksOf(episodeId).associateBy { it.shot_id }
+                }.getOrDefault(emptyMap())
+            }
+        }
+    }
+
+    /** 第七批：刷新渲染前预检（零付费只读；页面进入 / 点「开始渲染」前调用） */
+    suspend fun refreshPreflight() = logic.refreshPreflight()
 
     /**
      * 当前视频模型是否支持视频参考（UI 门控「上传参考视频」入口）。
@@ -413,6 +473,35 @@ class QueueViewModel(private val episodeId: String) : ViewModel() {
 
     fun enqueue(shots: List<com.dramafactory.core.model.ShotMeta>) =
         viewModelScope.launch { logic.enqueue(episodeId, shots) }
+
+    /**
+     * ★第五批：直接入队「本集全部分镜」。
+     * 旧入口只接受外部传 meta，QueuePage 由分镜页带入时若为空则什么也不发生；
+     * 这里从 Room 现读本集分镜，按 shot_no 生成与渲染侧一致的 shotId（{episodeId}_shot{n}）。
+     * shotId 契约：AiOrchestratorFactory.persistShots / RenderRuntime 均使用该命名。
+     */
+    fun enqueueCurrentEpisode() = viewModelScope.launch {
+        val metas = withContext(Dispatchers.IO) {
+            runCatching {
+                AppGraph.dao.shotsOf(episodeId).sortedBy { it.shot_no }.map { shot ->
+                    com.dramafactory.core.model.ShotMeta(
+                        shotId = episodeId + "_shot" + shot.shot_no,
+                        episodeId = episodeId,
+                        prompt = shot.action ?: "")
+                }
+            }.getOrDefault(emptyList())
+        }
+        if (metas.isEmpty()) {
+            // QueueLogic.enqueueError 无公开 setter，且 QueuePage 不可改 → 用 Toast 提示
+            AppGraph.appContext()?.let { ctx ->
+                android.widget.Toast.makeText(
+                    ctx, "本集还没有分镜，请先生成分镜再入队",
+                    android.widget.Toast.LENGTH_SHORT).show()
+            }
+            return@launch
+        }
+        logic.enqueue(episodeId, metas)
+    }
     fun pause() = viewModelScope.launch { logic.pause() }
     fun resume() = viewModelScope.launch { logic.resume() }
     fun cancelShot(shotId: String) = logic.cancelShot(shotId)
@@ -523,6 +612,8 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
 
     // 显式类型：generateHandler/enrichHandler 内部需引用本实例，避免 apply 内自引用导致循环类型推断
     private val logic: AssetsLogic = AssetsLogic().apply {
+        // ★去时代锁：参考图套装（pose pack）跟随本集按剧本检测出的时代预设，不再写死西汉
+        eraPresetProvider = { eraPreset }
         // 资产生成：文本通道出细化prompt → 图像通道出图（双Provider桩接线）
         // 第九轮：生成 prompt 折叠 era 红线约束（C）；图生图参考图作为 input_images。
         generateHandler = { card ->
@@ -530,7 +621,10 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
                 val preset = eraPreset   // 第十三轮：按剧本推断的朝代预设
                 // 生图前的 LLM 扩写：把正则抽出的裸名词（如「王莽」）扩成聚焦主体、符合时代红线的
                 // 视觉描述；已有缓存直接用，无缓存则实时扩写并落回卡片（失败回退裸词，不阻断生图）。
-                val basePrompt = logic.ensureEnriched(card)
+                // ★第五批：参考图子卡（parentId 非空）跳过扩写——子卡 prompt 已是
+                // finalReferencePrompt（角度构图+棚拍底+禁词），再被 enricher 改写成
+                // 「聚焦主体」的自由描述会丢构图/服装约束，四张角度图彼此不一致。
+                val basePrompt = if (card.parentId.isNullOrBlank()) logic.ensureEnriched(card) else card.prompt
                 // C. era 红线：正负分离——prompt只带正向，禁词走 negative_prompt API字段
                 // （第十一轮修复：旧实现把禁词表拼进正面prompt，图像模型把"手机/塑料"全画出来了）
                 // T014 任务1：角色类资产额外追加棚拍无干扰背景约束，与场景/环境解耦
@@ -551,8 +645,18 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
                     basePrompt = basePrompt,
                     preset = preset,
                     inputImages = if (card.referenceImageUri != null) listOf(card.referenceImageUri) else emptyList())
-                // A. 资产质量闸门：G1 文件级硬校验 + G2 多模态打分（defects 直接拒，重试≤3）
-                runCatching { auditGeneratedAsset(card.assetId, url, erPrompt, card) }
+                // A. 资产质量闸门：G1 文件级硬校验 + G2 多模态打分，结论落库（audit_state）
+                // ★第五批 P0：审计失败/跳过必须 fail-closed（落 rejected），不得静默放过；
+                // 拒绝原因/提示由 auditGeneratedAsset 内部写入内存卡与 DB，这里只记录日志。
+                val outcome = auditGeneratedAsset(card.assetId, url, erPrompt, card)
+                if (outcome == null) {
+                    android.util.Log.w("AssetsViewModel",
+                        "audit unavailable for ${card.assetId}, marked rejected (fail-closed)")
+                } else if (!outcome.isApproved()) {
+                    android.util.Log.w("AssetsViewModel",
+                        "audit rejected ${card.assetId}: ${outcome.rejectReason}")
+                }
+                // 保留图片（用户可看到结果并点「重新生成」/「重新审核」）；质量态已 rejected，不会被当 approved 引用。
                 Result.success(url)
             }
         }
@@ -560,7 +664,6 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
         enrichHandler = { card ->
             withContext(Dispatchers.IO) {
                 AppGraph.storageGuard.requireReady()
-                val preset = eraPreset
                 val kindKey = when (card.kind) {
                     AssetsLogic.Kind.CHARACTER -> "character"
                     AssetsLogic.Kind.SCENE -> "scene"
@@ -574,8 +677,7 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
                                 com.dramafactory.core.model.ChatMessage("user", msg))))
                         }.getOrNull()?.content ?: ""
                     },
-                    kind = kindKey, name = card.prompt,
-                    eraLabel = preset.era.label, forbidden = preset.forbiddenEraTerms)
+                    kind = kindKey, name = card.prompt)
                 Result.success(enriched)
             }
         }
@@ -627,12 +729,25 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
     /**
      * 对生成结果执行 G1+G2 资产质量闸门，并落库质量状态（A 子模块）。
      * G1 失败直接 rejected（零模型成本）；G2 调 Agnes 文本 3.0 Flash 打分，defects 非空直接拒。
+     * ★第五批 fail-closed：任何“没有结论”的路径（file://、下载失败、解码失败、异常）都落 rejected
+     * 并写用户可见提示；旧实现在这三处静默 return，卡片停在 pending 被渲染侧 allowUnreviewedAssets 放行。
+     * @return 审计结论；null=审计不可用（已按 rejected 落库）
      */
-    private suspend fun auditGeneratedAsset(assetId: String, imageUrl: String, prompt: String, card: AssetsLogic.AssetCard) {
-        // 仅对可下载的 http(s)/data uri 执行（本地 file:// 跳过网络解码，仅记 pending）
-        if (!imageUrl.startsWith("http") && !imageUrl.startsWith("data:image")) return
-        runCatching {
-            val bytes = fetchBytes(imageUrl) ?: return@runCatching
+    private suspend fun auditGeneratedAsset(
+        assetId: String, imageUrl: String, prompt: String, card: AssetsLogic.AssetCard,
+    ): QualityEngine.AssetAuditOutcome? {
+        if (imageUrl.isBlank() ||
+            (!imageUrl.startsWith("http") && !imageUrl.startsWith("data:image"))
+        ) {
+            markAuditFailure(assetId, "AUDIT_SKIPPED: 图像地址不可下载（本地/空 URI），请重新生成后再审核")
+            return null
+        }
+        try {
+            val bytes = fetchBytes(imageUrl)
+            if (bytes == null) {
+                markAuditFailure(assetId, "AUDIT_ERROR: 图片下载/解码失败，请检查网络后点「重新审核」")
+                return null
+            }
             // ★第十轮：图像先降采样到512px内JPEG(quality 80)，base64后约几十KB——
             // 杜绝把百万级base64塞进请求（ContextWindowExceededError 根因）
             val smallUri = runCatching {
@@ -646,26 +761,80 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
                 small.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, bos)
                 "data:image/jpeg;base64," + android.util.Base64.encodeToString(
                     bos.toByteArray(), android.util.Base64.NO_WRAP)
-            }.getOrNull() ?: return@runCatching
+            }.getOrNull()
+            if (smallUri == null) {
+                markAuditFailure(assetId, "AUDIT_ERROR: 图片解码失败（格式不受支持），请重新生成")
+                return null
+            }
             val dataUri = if (imageUrl.startsWith("data:image") && imageUrl.length < smallUri.length * 4) imageUrl
                 else smallUri
             val outcome = qualityEngine.auditAsset(
                 imageBytes = bytes, imageDataUri = dataUri, description = prompt,
                 assetType = card.kind.name.lowercase(), pose = card.poseRole ?: "",
                 describer = describer)
+            // 任务契约：defects 词表必须进 q_reject_reason（UI 展示/复盘用），不只写 defects_json
+            val defectsText = outcome.defects.takeIf { it.isNotEmpty() }?.joinToString("；")
+            val rejectReason = if (outcome.isApproved()) {
+                outcome.rejectReason
+            } else {
+                listOfNotNull(outcome.rejectReason, defectsText?.let { "defects: " + it })
+                    .joinToString("；").ifBlank { "QUALITY_BELOW_THRESHOLD" }
+            }
             AppGraph.dao.setAssetQuality(
                 assetId = assetId,
                 qualityScore = outcome.qualityScore,
                 auditState = outcome.auditState.name.lowercase(),
                 defectsJson = outcome.defectsJson(),
-                rejectReason = outcome.rejectReason,
+                rejectReason = rejectReason,
                 g1ErrorCode = outcome.g1ErrorCode,
                 faceRatio = outcome.faceRatio,
                 poseRole = outcome.poseRole,
                 updatedAt = System.currentTimeMillis())
             // 同步到内存卡（UI 显示评分/拒绝原因）
             logic.updateQuality(assetId, outcome.auditState.name.lowercase(), outcome.qualityScore,
-                outcome.rejectReason, outcome.defectsJson())
+                rejectReason, outcome.defectsJson())
+            if (!outcome.isApproved()) {
+                logic.setErrorMessage(assetId,
+                    "审核未通过：" + (rejectReason ?: "质量未达标").take(160) + "，建议重新生成")
+            }
+            return outcome
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce   // 取消必须上抛，不能当成审计失败吞掉
+        } catch (t: Throwable) {
+            android.util.Log.w("AssetsViewModel",
+                "audit error for " + assetId + ": " + t.javaClass.simpleName + ": " + t.message)
+            markAuditFailure(assetId, "AUDIT_ERROR: " + (t.message?.take(160) ?: t.javaClass.simpleName))
+            return null
+        }
+    }
+
+    /** fail-closed 落库：审计无结论 → rejected（DB + 内存），用户可直接看到原因并重新审核/生成。 */
+    private suspend fun markAuditFailure(assetId: String, reason: String) {
+        runCatching {
+            AppGraph.dao.setAssetQuality(
+                assetId = assetId, qualityScore = null, auditState = "rejected",
+                defectsJson = null, rejectReason = reason, g1ErrorCode = null,
+                faceRatio = null, poseRole = null, updatedAt = System.currentTimeMillis())
+        }.onFailure {
+            android.util.Log.w("AssetsViewModel", "markAuditFailure persist failed: " + it.message)
+        }
+        logic.markAuditRejected(assetId, reason, null, reason + "（可重新生成或点「重新审核」重试）")
+    }
+
+    /**
+     * ★第五批：手工「重新审核」入口（AssetsPage 卡片按钮）。
+     * 复用生成后审计同一套 G1+G2；审计不可用同样 fail-closed 落 rejected。
+     */
+    fun auditAssetById(assetId: String) = viewModelScope.launch {
+        val card = logic.assets.value.firstOrNull { it.assetId == assetId } ?: return@launch
+        val url = card.remoteUrl?.takeIf { it.isNotBlank() } ?: card.imageUri
+        if (url.isNullOrBlank()) {
+            logic.setErrorMessage(assetId, "尚未生成图片，请先生成再审核")
+            return@launch
+        }
+        logic.updateQuality(assetId, "pending", null, card.rejectReason, card.defectsJson)
+        withContext(Dispatchers.IO) {
+            auditGeneratedAsset(assetId, url, card.enrichedPrompt ?: card.prompt, card)
         }
     }
 
@@ -688,11 +857,11 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
     val allowedCrossEra: kotlinx.coroutines.flow.StateFlow<List<String>> get() = _allowedCrossEra
 
     /**
-     * 第十三轮：按剧本自动推断的时代预设（默认西汉，init 时 LLM/规则检测后更新）。
-     * 生成链路一律用 [eraPreset] 而非写死的 HAN_PRESET。
+     * v1.9.46：时代约束已从生成链路删除，[eraKey] 恒为 neutral。
+     * [eraPreset] 仅作签名兼容，提示词不再按朝代注入红线；服化道以剧本与资产描述为准。
      */
-    @Volatile private var eraKey: String = "han"
-    private val _eraLabel = kotlinx.coroutines.flow.MutableStateFlow("西汉末年至新莽时期（默认）")
+    @Volatile private var eraKey: String = "neutral"
+    private val _eraLabel = kotlinx.coroutines.flow.MutableStateFlow("服化道以剧本为准（无时代锁）")
     val eraLabel: kotlinx.coroutines.flow.StateFlow<String> get() = _eraLabel
     private val eraPreset: com.dramafactory.core.quality.StylePreset
         get() = com.dramafactory.core.quality.EraDetector.presetFor(eraKey)
@@ -746,18 +915,6 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
                     imageUri = e.image_uri,
                     videoUri = e.video_uri,
                     prompt = e.prompt)
-            }
-            // ★第十三轮：按剧本自动推断时代红线（LLM优先，规则兜底）
-            val scriptForEra = row?.script_json
-            if (!scriptForEra.isNullOrBlank()) {
-                val llmReady = AppGraph.isInitialized && AppGraph.agnesKeyReady()
-                val det = runCatching {
-                    com.dramafactory.core.quality.EraDetector.detect(scriptForEra, llmReady) { req ->
-                        AppGraph.text.chat(req)
-                    }
-                }.getOrElse { com.dramafactory.core.quality.EraDetector.Detection("han", "", false) }
-                eraKey = det.eraKey
-                _eraLabel.value = det.label + if (det.usedLlm) "" else "（规则推断）"
             }
             // ★第十一轮：回填全部已落库资产（含生成的 remote_url），重进项目不丢卡不丢图
             runCatching {
@@ -817,7 +974,7 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
                     "scene" -> AssetsLogic.Kind.SCENE
                     else -> AssetsLogic.Kind.PROP
                 }
-                val desc = if (a.desc.isBlank()) a.name else "${a.name}·${a.desc}"
+                val desc = com.dramafactory.core.quality.LlmAssetExtractor.cardPrompt(a)
                 val key = "${kind.name}:$desc"
                 if (logic.assets.value.any { "${it.kind.name}:${it.prompt}" == key }) continue
                 logic.addAsset(idGen(), kind, desc)
@@ -910,20 +1067,72 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
      *
      * 每张各自成图、绝不拼图：视频模型对拼图 / 多小人识别失败，会直接搞废锁脸。
      *
-     * 异步执行，无返回值：实际工作在 viewModelScope.launch 里，返回时任务还没跑完，
-     * 与真实新增数量无关；调用点也只当点击回调用，故签名用 Unit，不再说谎。
+     * ★第五批 P0 锚链修复：旧实现对 4 张子卡各自独立 t2i，四张图可能完全不是同一个人。
+     * 现在顺序：① 先把 4 张子卡落库；② front_bust 优先以母卡已生成图作 i2i 并等它出图；
+     * ③ 其余 3 张以 front_bust 结果为 input_images 再生成（锁同一张脸/同一套服装）；
+     * ④ 单张失败只写自己的 errorMessage，不阻塞其余卡。
+     * 注：任务期望“统一 seed”，但 core ImageGenRequest 无 seed 字段（Models.kt:144-149），
+     * 本批无法实现，已在报告中标注。
      */
     fun buildCharacterReferenceSheet(characterId: String) {
         viewModelScope.launch {
             var seq = 0
-            logic.buildReferenceSheet(characterId) { "ref_${System.currentTimeMillis()}_${seq++}" }
-            for (child in logic.referenceChildrenOf(characterId)) {
+            logic.buildReferenceSheet(characterId) { "ref_" + System.currentTimeMillis() + "_" + seq++ }
+            val children = logic.referenceChildrenOf(characterId)
+            if (children.isEmpty()) return@launch
+            // ① 先落库：后续 setAssetReferenceImage 是 UPDATE，行不存在会静默无操作
+            for (child in children) {
                 val asset = com.dramafactory.app.data.AssetEntity(
                         asset_id = child.assetId, project_id = projectId, kind = "character",
                         parent_id = child.parentId, pose_role = child.poseRole,
                         prompt = child.prompt, updated_at = System.currentTimeMillis())
-                com.dramafactory.app.data.PersistenceActionExecutor.writeAsset(
-                    AppGraph.dao, AppGraph.storageGuard, asset, "build_pose_pack")
+                runCatching {
+                    com.dramafactory.app.data.PersistenceActionExecutor.writeAsset(
+                        AppGraph.dao, AppGraph.storageGuard, asset, "build_pose_pack")
+                }.onFailure {
+                    android.util.Log.w("AssetsViewModel", "write ref child failed: " + it.message)
+                }
+            }
+            // ② 锚图 = front_bust（锁脸基准）；没有该角度时退化为第一张
+            val anchor = children.firstOrNull { it.poseRole == "front_bust" } ?: children.first()
+            val parentUrl = logic.assets.value.firstOrNull { it.assetId == characterId }?.remoteUrl
+            if (!parentUrl.isNullOrBlank() && anchor.referenceImageUri.isNullOrBlank()) {
+                logic.setReferenceImage(anchor.assetId, parentUrl)
+                runCatching {
+                    withContext(Dispatchers.IO) {
+                        AppGraph.dao.setAssetReferenceImage(
+                            anchor.assetId, parentUrl, System.currentTimeMillis())
+                    }
+                }
+            }
+            // 等锚卡出图：若已有生成中的请求，先等它落 remoteUrl（最多 90s），避免重复付费生成
+            var anchorUrl = anchor.remoteUrl
+            var waited = 0
+            while (anchorUrl.isNullOrBlank() && waited < 90 &&
+                logic.assets.value.firstOrNull { it.assetId == anchor.assetId }?.generating == true) {
+                kotlinx.coroutines.delay(1000)
+                waited++
+                anchorUrl = logic.assets.value.firstOrNull { it.assetId == anchor.assetId }?.remoteUrl
+            }
+            if (anchorUrl.isNullOrBlank()) {
+                withContext(Dispatchers.IO) { runCatching { logic.generate(anchor.assetId) } }
+                anchorUrl = logic.assets.value.firstOrNull { it.assetId == anchor.assetId }?.remoteUrl
+            }
+            // ③ 其余子卡以锚卡结果为参考图再生成；锚图失败则退化为独立 t2i（不阻塞）
+            for (child in children) {
+                if (child.assetId == anchor.assetId) continue
+                if (!anchorUrl.isNullOrBlank()) {
+                    logic.setReferenceImage(child.assetId, anchorUrl)
+                    runCatching {
+                        withContext(Dispatchers.IO) {
+                            AppGraph.dao.setAssetReferenceImage(
+                                child.assetId, anchorUrl, System.currentTimeMillis())
+                        }
+                    }
+                } else {
+                    android.util.Log.w("AssetsViewModel",
+                        "reference anchor failed for " + characterId + ", child " + child.assetId + " falls back to t2i")
+                }
                 AppGraph.backgroundScope.launch { logic.generate(child.assetId) }
             }
         }

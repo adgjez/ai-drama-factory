@@ -15,44 +15,214 @@ object StoryCoherence {
             if (previous != null && shot.carryOver.isNullOrBlank())
                 issues += Issue("carry_over_missing", shot.shotNo, "跨镜上下文缺少 carry_over")
             if (previous != null && previous.sceneContext?.isNotBlank() == true && shot.sceneContext.isNullOrBlank())
-                issues += Issue("scene_context_missing", shot.shotNo, "跨镜缺少时间/天气/空间/光线上下文")
+                issues += Issue("scene_context_missing", shot.shotNo, "跨镜缺少时间/天气/空间上下文")
             if (previous != null && environmentChangedWithoutTransition(previous, shot))
-                issues += Issue("scene_context_conflict", shot.shotNo, "跨镜时间/天气/明暗发生变化但缺少转场依据")
+                issues += Issue("scene_context_conflict", shot.shotNo, "跨镜时间/天气/空间位置发生变化但缺少转场依据")
             if (approvedAssetIds.isNotEmpty() && shot.assetIds.any { it !in approvedAssetIds })
                 issues += Issue("asset_unbound", shot.shotNo, "镜头包含未批准资产")
-            if (shot.durationSeconds !in 5.0..10.0)
-                issues += Issue("rhythm_duration", shot.shotNo, "单镜时长应为5-10秒")
+            if (shot.durationSeconds !in 4.0..10.0)
+                issues += Issue("rhythm_duration", shot.shotNo, "单镜时长应为4-10秒")
             previous = shot
         }
+        issues += designIssues(shots.sortedBy { it.shotNo })
         return issues
+    }
+
+    // ---------------------------------------------------------------------
+    // 场景连续性判定（v2）
+    // 旧实现把“室内/室外/灯光/明暗”等任意词面差异都当冲突，且只在 carry_over 里找转场词。
+    // 结果：同一间办公室从「电脑屏幕蓝光」换成「手机屏幕光」、或旁白已交代时间流逝，也会误报
+    // scene_context_conflict，而任一镜报错会整集中止渲染。这里改为结构化比较：
+    //   1) 只比较真正影响连续性的事实：室内/室外、时间段、天气；
+    //   2) 明暗/光源变化（灯光、屏幕光、台灯…）不再单独判冲突——同一场景内光线变化是正常拍法；
+    //   3) 转场依据在前后镜的 action/dialogue/narration/carry_over 里找，不只看 carry_over。
+    // ---------------------------------------------------------------------
+    private data class EnvState(
+        val indoor: Boolean,
+        val outdoor: Boolean,
+        val timeSlot: String?,
+        val weather: Set<String>,
+    )
+
+    private val INDOOR = Regex("室内|屋内|房间内|办公室内|室内|门厅|堂屋|客厅|卧室|机房|车厢|电梯|店里|店里")
+    private val OUTDOOR = Regex("室外|户外|门外|院门外|院内|院中|庭院|院子|街道|巷|野外|林中|雨中|雪中|天台|阳台|车外")
+
+    private val WEATHER_RULES = listOf(
+        "雨" to Regex("雨"),
+        "雪" to Regex("雪"),
+        "雾" to Regex("雾"),
+        "晴" to Regex("晴|阳光明媚|阳光"),
+        "阴" to Regex("阴天|阴云|阴沉|天色阴沉"),
+    )
+
+    private val TIME_SLOT_RULES = listOf(
+        "清晨" to Regex("清晨|黎明|拂晓|早晨|上午"),
+        "正午" to Regex("中午|正午|午间"),
+        "下午" to Regex("下午|午后"),
+        "傍晚" to Regex("傍晚|黄昏|夕阳|日落|天色渐暗"),
+        "夜晚" to Regex("夜晚|晚上|深夜|夜里|入夜|夜色|雨夜|雪夜|夜"),
+        "白天" to Regex("白天|日间|阳光明媚|天亮"),
+    )
+
+    private val TRANSITION = Regex("进入|离开|推门|开门|关门|转场|切换|来到|走进|走出|穿过|回到|转身|冲进|闯进|跨进|迈入")
+    private val TIME_SHIFT = Regex("过了|随后数小时|天亮|次日|翌日|第二天|时间推移|多年后|不知不觉|一分一秒|到晚上|入夜|天色|夕阳|时间.*过去|许久|良久|过了一会儿")
+    private val WEATHER_SHIFT = Regex("雨停|放晴|转晴|转阴|下起|天色|风起|乌云")
+
+    /** 越轴依据：动作/承接里明确写了反打、过肩、越轴、绕到另一侧等，就不算错误越轴。 */
+    private val CROSS_AXIS = Regex("越轴|反打|过肩|换位|绕到|另一侧|转到另一边|走到对面|坐到对面")
+
+    /** 开场钩子要素：冲突、悬念、反转、强动作、疑问。 */
+    private val HOOK_WORDS = Regex("突然|却|竟|居然|没想到|竟然|冲突|争吵|质问|威胁|追|逃|摔|砸|抢|夺|？！|\\?!|！|？")
+
+    private fun envStateOf(text: String): EnvState {
+        val s = text.trim()
+        return EnvState(
+            indoor = INDOOR.containsMatchIn(s),
+            outdoor = OUTDOOR.containsMatchIn(s),
+            timeSlot = TIME_SLOT_RULES.firstOrNull { it.second.containsMatchIn(s) }?.first,
+            weather = WEATHER_RULES.filter { it.second.containsMatchIn(s) }.map { it.first }.toSet(),
+        )
     }
 
     private fun environmentChangedWithoutTransition(
         previous: AiStoryboardDirector.Shot,
         current: AiStoryboardDirector.Shot,
     ): Boolean {
-        val before = previous.sceneContext?.trim().orEmpty()
-        val after = current.sceneContext?.trim().orEmpty()
-        if (before.isBlank() || after.isBlank() || before == after) return false
-        val transition = "进入|离开|推门|开门|关门|转场|切换|来到|走进|走出|穿过|回到|转身"
-        val timeShift = "过了|随后数小时|天亮|次日|翌日|第二天|时间推移|多年后"
-        val weatherOrLight = "雨|晴|雪|雾|夜|昼|白天|阳光|明亮|昏暗|阴天|闪电|室外|室内"
-        val weatherChanged = (Regex("雨|雪|雾|晴|阴天").containsMatchIn(before) &&
-            Regex("雨|雪|雾|晴|阴天").containsMatchIn(after) &&
-            Regex("雨|雪|雾|晴|阴天").findAll(before).map { it.value }.toSet() !=
-            Regex("雨|雪|雾|晴|阴天").findAll(after).map { it.value }.toSet())
-        val timeChanged = (Regex("夜|昼|白天|清晨|黎明|深夜").containsMatchIn(before) &&
-            Regex("夜|昼|白天|清晨|黎明|深夜").containsMatchIn(after) &&
-            Regex("夜|昼|白天|清晨|黎明|深夜").findAll(before).map { it.value }.toSet() !=
-            Regex("夜|昼|白天|清晨|黎明|深夜").findAll(after).map { it.value }.toSet())
-        val lightChanged = (Regex("阳光|明亮|昏暗|阴暗|灯光|自然光").containsMatchIn(before) &&
-            Regex("阳光|明亮|昏暗|阴暗|灯光|自然光").containsMatchIn(after) &&
-            Regex("阳光|明亮|昏暗|阴暗|灯光|自然光").findAll(before).map { it.value }.toSet() !=
-            Regex("阳光|明亮|昏暗|阴暗|灯光|自然光").findAll(after).map { it.value }.toSet())
-        return Regex(weatherOrLight).containsMatchIn(before) &&
-            Regex(weatherOrLight).containsMatchIn(after) &&
-            (weatherChanged || timeChanged || lightChanged) &&
-            !Regex(transition).containsMatchIn(current.carryOver.orEmpty()) &&
-            !Regex(timeShift).containsMatchIn(current.carryOver.orEmpty())
+        val beforeText = previous.sceneContext?.trim().orEmpty()
+        val afterText = current.sceneContext?.trim().orEmpty()
+        if (beforeText.isBlank() || afterText.isBlank() || beforeText == afterText) return false
+        val before = envStateOf(beforeText)
+        val after = envStateOf(afterText)
+
+        val placeChanged = (before.indoor && after.outdoor) || (before.outdoor && after.indoor)
+        val weatherChanged = before.weather.isNotEmpty() && after.weather.isNotEmpty() && before.weather != after.weather
+        val timeChanged = before.timeSlot != null && after.timeSlot != null && before.timeSlot != after.timeSlot
+        if (!placeChanged && !weatherChanged && !timeChanged) return false
+
+        // 转场/时间推移依据：前后镜的动作、台词、旁白、承接都算；scene_context 自身不算（否则等于自证）。
+        val evidence = listOfNotNull(
+            previous.action, previous.dialogue, previous.narration, previous.carryOver,
+            current.action, current.dialogue, current.narration, current.carryOver,
+        ).joinToString(" ")
+        if (TRANSITION.containsMatchIn(evidence)) return false
+        if (timeChanged && !placeChanged && !weatherChanged && TIME_SHIFT.containsMatchIn(evidence)) return false
+        if (weatherChanged && !placeChanged && WEATHER_SHIFT.containsMatchIn(evidence)) return false
+        // 同一地点、同一时间段内的明暗/光源差异不判冲突。
+        return true
+    }
+
+    // ---------------------------------------------------------------------
+    // 分镜设计软提示（只提示、不自动修复）：
+    //   rhythm_monotone      连续 3 镜以上同景别 → 空间层次丢失
+    //   rhythm_flat          连续 4 镜以上同时长 → 成片匀速像 PPT
+    //   establishing_missing 场次切换后的首镜不是全景/中景 → 空间没交代
+    //   dialogue_pace        台词/旁白朗读时长超过镜头时长 → 成片会被加速或截断
+    //   axis_jump            相邻镜人物站位左右互换且无越轴依据 → 观众空间感断裂
+    //   eyeline_mismatch     正反打双方视线同向 → 看起来像在看同一个方向
+    //   scene_single_shot    一场只有一镜 → 场次没有展开，像硬切素材
+    //   hook_weak            开场镜没有冲突/悬念/台词/强动作 → 前 3 秒抓不住人
+    //   ending_weak          收尾镜偏短且没有情绪落点 → 结尾泄气
+    // 这些码不在 AiStoryboardDirector 的修复清单里，分镜页按软提示显示，不阻断渲染。
+    // ---------------------------------------------------------------------
+    private fun designIssues(shots: List<AiStoryboardDirector.Shot>): List<Issue> {
+        if (shots.isEmpty()) return emptyList()
+        val issues = mutableListOf<Issue>()
+
+        var sizeStart = 0
+        for (i in 1..shots.size) {
+            val size = ShotDesigner.shotSizeOf(shots[i - 1])
+            val nextSize = if (i < shots.size) ShotDesigner.shotSizeOf(shots[i]) else null
+            val same = i < shots.size && size != null && size == nextSize
+            if (!same) {
+                val run = i - sizeStart
+                if (run >= 3 && size != null)
+                    issues += Issue("rhythm_monotone", shots[sizeStart].shotNo, "连续${run}镜同一景别（${size}），建议拉开景别层次")
+                sizeStart = i
+            }
+        }
+
+        var durationStart = 0
+        for (i in 1..shots.size) {
+            val same = i < shots.size && shots[i].durationSeconds == shots[i - 1].durationSeconds
+            if (!same) {
+                val run = i - durationStart
+                if (run >= 4)
+                    issues += Issue("rhythm_flat", shots[durationStart].shotNo, "连续${run}镜同为${shots[durationStart].durationSeconds}秒，节奏偏平")
+                durationStart = i
+            }
+        }
+
+        for (shot in shots) {
+            val spoken = ShotDesigner.spokenSeconds(shot.dialogue, shot.narration)
+            if (spoken > 0.0 && shot.durationSeconds > 0.0 && shot.durationSeconds < spoken - 0.8) {
+                issues += Issue(
+                    "dialogue_pace",
+                    shot.shotNo,
+                    "台词/旁白约" + String.format(java.util.Locale.US, "%.1f", spoken) +
+                        "秒，镜头仅" + String.format(java.util.Locale.US, "%.1f", shot.durationSeconds) + "秒，建议加长或拆镜",
+                )
+            }
+        }
+
+        for (i in 1 until shots.size) {
+            val before = envStateOf(shots[i - 1].sceneContext?.trim().orEmpty())
+            val after = envStateOf(shots[i].sceneContext?.trim().orEmpty())
+            if (!envChanged(before, after)) continue
+            val size = ShotDesigner.shotSizeOf(shots[i])
+            if (size == null || size == "特写" || size == "大特写" || size == "近景")
+                issues += Issue("establishing_missing", shots[i].shotNo, "场次切换后首镜缺少全景/中景建立镜头")
+        }
+
+        // 场次结构：一场只有一镜说明这场没有展开（整集只有一镜的极端情况不提示）。
+        if (shots.size > 1) {
+            var sceneStart = 0
+            for (i in 1..shots.size) {
+                val sceneEnded = i == shots.size ||
+                    (shots[i].sceneNo > 0 && shots[sceneStart].sceneNo > 0 && shots[i].sceneNo != shots[sceneStart].sceneNo)
+                if (sceneEnded) {
+                    if (i - sceneStart <= 1) {
+                        val label = if (shots[sceneStart].sceneNo > 0) "第" + shots[sceneStart].sceneNo + "场" else "本场"
+                        issues += Issue("scene_single_shot", shots[sceneStart].shotNo, label + "只有1镜，建议补建立镜/反应镜")
+                    }
+                    sceneStart = i
+                }
+            }
+        }
+
+        // 轴线与视线：相邻镜左右站位互换必须有越轴/反打依据；正反打双方视线同向属于剪辑错误。
+        for (i in 1 until shots.size) {
+            val before = shots[i - 1]
+            val after = shots[i]
+            if (before.sceneNo > 0 && after.sceneNo > 0 && before.sceneNo != after.sceneNo) continue
+            val sideA = before.screenSide
+            val sideB = after.screenSide
+            if (sideA != null && sideB != null && ((sideA == "左" && sideB == "右") || (sideA == "右" && sideB == "左"))) {
+                val evidence = listOfNotNull(before.action, before.carryOver, after.action, after.carryOver).joinToString(" ")
+                if (!CROSS_AXIS.containsMatchIn(evidence))
+                    issues += Issue("axis_jump", after.shotNo, "相邻镜人物站位从" + sideA + "侧跳到" + sideB + "侧，缺少越轴/反打依据")
+            }
+            val eyeA = before.eyeline
+            val eyeB = after.eyeline
+            if (!before.dialogue.isNullOrBlank() && !after.dialogue.isNullOrBlank() &&
+                eyeA != null && eyeB != null && eyeA == eyeB && eyeA != "对方")
+                issues += Issue("eyeline_mismatch", after.shotNo, "正反打双方视线同为「" + eyeA + "」，会像在看同一方向")
+        }
+
+        // 开场/收尾：钩子与落点。
+        val first = shots.first()
+        if (first.dialogue.isNullOrBlank() && !ShotDesigner.hasActionWords(first.action) &&
+            !HOOK_WORDS.containsMatchIn(first.action + " " + (first.narration ?: "")))
+            issues += Issue("hook_weak", first.shotNo, "开场镜缺少冲突/悬念/台词，前3秒可能抓不住人")
+        val last = shots.last()
+        if (last.durationSeconds < 6.0 && last.dialogue.isNullOrBlank() && !ShotDesigner.hasEmotionWords(last.action))
+            issues += Issue("ending_weak", last.shotNo, "收尾镜偏短且没有情绪落点，建议留一个停顿/反应镜")
+        return issues
+    }
+
+    private fun envChanged(before: EnvState, after: EnvState): Boolean {
+        val placeChanged = (before.indoor && after.outdoor) || (before.outdoor && after.indoor)
+        val weatherChanged = before.weather.isNotEmpty() && after.weather.isNotEmpty() && before.weather != after.weather
+        val timeChanged = before.timeSlot != null && after.timeSlot != null && before.timeSlot != after.timeSlot
+        return placeChanged || weatherChanged || timeChanged
     }
 }

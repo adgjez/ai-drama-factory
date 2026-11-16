@@ -38,6 +38,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.put
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
@@ -163,6 +164,10 @@ class AgnesProvider(
         const val NUM_FRAMES_MOD = 8      // 必须 8n+1
         const val DIMENSION_MULTIPLE = 64 // 宽高必须64的倍数
 
+        /** 2.5 协议无 negative_prompt 字段：负向约束折进正向 prompt 的固定兜底句（不可重复追加） */
+        const val VIDEO25_NEGATIVE_FALLBACK =
+            "画面要求：人物面部与身份保持稳定，双手结构正确、手指数量正常，画面清晰，无水印、无文字。"
+
         // 视频提交长退避参数（对齐pavo VIDEO_SUBMIT_BACKOFF_*）
         const val SUBMIT_BACKOFF_BASE_MS = 30_000L
         const val SUBMIT_BACKOFF_CAP_MS = 180_000L
@@ -204,11 +209,35 @@ class AgnesProvider(
         fun video25Seconds(numFrames: Int, frameRate: Float): String =
             (numFrames / maxOf(1f, frameRate)).roundToInt().coerceIn(4, 12).toString()
 
-        /** v1.9.27：2.5 宽高 → 官方画幅白名单（9:16 / 16:9 / 1:1，默认 16:9） */
-        fun video25AspectRatio(w: Int, h: Int): String = when {
-            w >= h * 1.2 -> "16:9"
-            h >= w * 1.2 -> "9:16"
-            else -> "1:1"
+        /**
+         * v1.9.32：2.5 宽高 → 官方画幅白名单（9:16/16:9/1:1/3:4/4:3/21:9）。
+         * 取相对误差最近的比例（容忍 64 归一带来的轻微偏差）；超出白名单范围视为未知，回退竖屏 9:16。
+         */
+        fun video25AspectRatio(w: Int, h: Int): String {
+            if (w <= 0 || h <= 0) return "9:16"
+            val ratio = w.toDouble() / h.toDouble()
+            val candidates = listOf(
+                "9:16" to 9.0 / 16.0, "16:9" to 16.0 / 9.0, "1:1" to 1.0,
+                "3:4" to 3.0 / 4.0, "4:3" to 4.0 / 3.0, "21:9" to 21.0 / 9.0,
+            )
+            val matched = candidates
+                .map { it to abs(it.second - ratio) / it.second }
+                .filter { (_, relErr) -> relErr <= 0.18 }
+                .minByOrNull { (_, relErr) -> relErr }
+            return matched?.first?.first ?: "9:16"
+        }
+
+        /**
+         * v1.9.32：2.5（非 flash）size 档位——按归一后画面**短边**推导：
+         * 短边≤720 → 720P，≤960 → 960P，否则 2K。flash 仅支持 720P（其他值 400），由调用方分流。
+         */
+        fun video25Size(w: Int, h: Int): String {
+            val shortSide = minOf(w, h)
+            return when {
+                shortSide <= 720 -> "720P"
+                shortSide <= 960 -> "960P"
+                else -> "2K"
+            }
         }
 
         /** v1.9.27：2.5 reference 模式 images 上限——flash 5 张（超出 400），2.5 官方 8 张 */
@@ -437,7 +466,14 @@ class AgnesProvider(
         val h = closestValidDimension(req.height)
 
         // 决议Q9：中文配音指令注入（中文台词主导开头+显式指令追加）
-        val prompt = ChineseAudioInjector.inject(req.prompt)
+        val basePrompt = ChineseAudioInjector.inject(req.prompt)
+        // ★质量修复 D：2.5 协议没有 negative_prompt 字段，旧代码把默认 11 个锁脸负向词整体丢弃，
+        // 人物漂移/手崩/水印无任何抑制。这里在 2.5 分支把负向补偿折进正向 prompt。
+        val prompt = if (isAgnesVideo25(effectiveVideoModel) && !req.negativePrompt.isNullOrBlank()) {
+            // 幂等：重试/重入时 prompt 可能已带上兜底句，避免重复拼接稀释正向描述
+            if (basePrompt.contains(VIDEO25_NEGATIVE_FALLBACK)) basePrompt
+            else "$basePrompt $VIDEO25_NEGATIVE_FALLBACK"
+        } else basePrompt
 
         // v1.9.27：2.5/2.5-flash 官方独立协议（wiki agnes-video-25）——
         // 顶层禁止 width/height/fps/num_frames（400 forbidden field），尺寸=size档位+aspect_ratio，时长=seconds。
@@ -448,21 +484,32 @@ class AgnesProvider(
             if (isAgnesVideo25(effectiveVideoModel)) {
                 // ---- Agnes Video 2.5 / 2.5-flash：官方参数集（mode 必填 + 媒体字段顶层）----
                 put("seconds", video25Seconds(nf, req.frameRate))
-                put("size", "720P")   // flash 仅支持 720P（其他值 400）；2.5 同档保守
+                // flash 仅支持 720P（其他值 400）；2.5 按画面短边推导 720P/960P/2K，尊重设置页分辨率
+                put("size", if (effectiveVideoModel.contains("flash", ignoreCase = true)) "720P" else video25Size(w, h))
                 put("aspect_ratio", video25AspectRatio(w, h))
-                // 模式互斥：首+尾且无资产参考→keyframe（保构图）；有资产参考→reference（锁脸优先）；无图→text
-                val extraRefs = req.inputImages.filter { it != req.firstImageUri && it != req.lastImageUri }
-                val refMedia = (listOfNotNull(req.firstImageUri ?: req.referenceImageUri) + req.inputImages).distinct()
+                // 模式优先级（2026-11 真实 keyframe 协议实测）：
+                // ① 有 first_frame/last_frame 任一 → keyframe 最高优先，即使同时带资产参考图；
+                //    keyframe 模式禁 images/videos，接缝帧不能被静默丢弃（批六 RenderRuntime 会同时传接缝帧+参考图）。
+                // ② 仅资产参考图 → reference；③ 仅参考视频 → reference；④ 全无 → text。
+                val refMedia = (listOfNotNull(req.referenceImageUri) + req.inputImages).distinct()
                 val maxRefs = video25MaxImages(effectiveVideoModel)
                 when {
-                    req.lastImageUri != null && extraRefs.isEmpty() -> {
+                    req.firstImageUri != null || req.lastImageUri != null -> {
                         put("prompt", prompt)
                         put("mode", "keyframe")
-                        put("first_frame", req.firstImageUri ?: req.lastImageUri!!)
-                        put("last_frame", req.lastImageUri)
+                        val first = req.firstImageUri
+                        val last = req.lastImageUri
+                        when {
+                            first != null && last != null -> {
+                                put("first_frame", first); put("last_frame", last)
+                            }
+                            first != null -> put("first_frame", first)
+                            // 只有尾帧（人工设了场尾帧但无首帧）：按旧行为当首帧用，避免 keyframe 缺 first_frame 被 400
+                            else -> put("first_frame", last!!)
+                        }
                     }
                     refMedia.isNotEmpty() -> {
-                        // <Picture N> 指代 images 数组（从1编号）：首帧=Picture 1 为视觉主体
+                        // <Picture N> 指代 images 数组（从1编号）：首图=Picture 1 为视觉主体
                         put("prompt", "画面构图与主体外观以 <Picture 1> 为准，其余图片为角色与风格参考。$prompt")
                         put("mode", "reference")
                         val kept = refMedia.take(maxRefs)
@@ -474,12 +521,6 @@ class AgnesProvider(
                             })
                         }
                         println("AgnesProvider submitVideo[2.5] reference mode: media=${kept.size}/${refMedia.size} video=${req.referenceVideoUri != null}")
-                    }
-                    req.firstImageUri != null || req.lastImageUri != null -> {
-                        put("prompt", prompt)
-                        put("mode", "keyframe")
-                        req.firstImageUri?.let { put("first_frame", it) }
-                        req.lastImageUri?.let { put("last_frame", it) }
                     }
                     req.referenceVideoUri != null -> {
                         val v = req.referenceVideoUri
@@ -554,7 +595,9 @@ class AgnesProvider(
         repeat(SUBMIT_MAX_ATTEMPTS) { attempt ->
             try {
                 // maxRetries语义=1：本层不做HTTP快重试，429/5xx全走长退避
-                val out = postJson("/videos", body)
+                // maxRetries = 1：外层已有 SUBMIT_MAX_ATTEMPTS 长退避，这里绝不能再叠 postJson 的默认 HTTP 重试，
+                // 否则一次提交最多 3×3=9 次 POST，失败时重复扣费。
+                val out = postJson("/videos", body, maxRetries = 1)
                 val videoId = out["video_id"]?.jsonPrimitive?.content
                     ?: throw ProviderError.ReconcileRequired(
                         rawBody = out.toString().take(400),

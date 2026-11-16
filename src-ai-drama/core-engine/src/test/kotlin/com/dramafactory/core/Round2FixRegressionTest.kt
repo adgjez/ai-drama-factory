@@ -156,7 +156,11 @@ class Round2FixRegressionTest {
         )
         queue.enqueueEpisode("ep1", shots("s1"))
         withTimeout(5_000) {
-            while (queue.state.value.running && store.getEpisode("ep1")!!.byId("s1")!!.state == ShotState.SUBMITTING) delay(10)
+            // 等待状态机落定：worker 可能尚未从 PENDING 起跑，也可能正处在 SUBMITTING→RECONCILE 的过渡窗口。
+            // 旧写法把 running 放在条件里，慢机上会在 worker 起跑前就退出循环 → 断言到 PENDING 而假失败。
+            while (store.getEpisode("ep1")!!.byId("s1")!!.state.let {
+                    it == ShotState.PENDING || it == ShotState.SUBMITTING
+                }) delay(10)
         }
         assertEquals(ShotState.RECONCILE, store.getEpisode("ep1")!!.byId("s1")!!.state,
             "计费风险场景必须落库待对账，不得归为可重提状态")

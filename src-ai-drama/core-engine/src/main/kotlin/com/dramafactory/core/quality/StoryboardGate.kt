@@ -102,6 +102,8 @@ object StoryboardGate {
         storyboard: List<Entry>,
         catalogApprovedIds: Set<String> = emptySet(),
         characterAssetIds: Set<String> = emptySet(),
+        /** ★第二批 P0（B-G1）：生产端置 true——空 catalog 不再放行资产校验 */
+        requireCatalog: Boolean = false,
     ): Report {
         val issues = mutableListOf<Issue>()
         var prevBeatIndex = 0
@@ -111,7 +113,7 @@ object StoryboardGate {
 
             // 六铁律⑥：资产必须是 catalog 真实 ID（禁编造）
             for (aid in entry.associateAssetIds) {
-                if (catalogApprovedIds.isNotEmpty() && aid !in catalogApprovedIds) {
+                if ((requireCatalog || catalogApprovedIds.isNotEmpty()) && aid !in catalogApprovedIds) {
                     issues.add(Issue("error", "missing_asset", sid, "绑定资产 $aid 不在 catalog['approved'] 中：禁止编造资产 ID"))
                 }
             }

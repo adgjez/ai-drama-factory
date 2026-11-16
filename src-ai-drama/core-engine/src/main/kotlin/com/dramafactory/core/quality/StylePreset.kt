@@ -165,14 +165,19 @@ data class StylePreset(
     /** 道具母图尺寸 */
     val propImageSize: String = "768x768"
 
-    /** 折叠后的 negative prompt（global + era.negative） */
-    val negativePrompt: String get() = (globalNegativePrompt + era.negative).distinct().joinToString(", ")
+    /**
+     * 折叠后的 negative prompt。
+     *
+     * v1.9.46：时代约束已从生成链路彻底移除——negative 只保留画质/一致性类通用负向，
+     * 不再折叠 era.negative（朝代禁词表）。服化道一律以剧本为准。
+     */
+    val negativePrompt: String get() = globalNegativePrompt.distinct().joinToString(", ")
 
-    /** 折叠后的 positive suffix（global + era.positive） */
-    val positiveSuffix: String get() = listOf(globalPromptSuffix, era.positive).filter { it.isNotBlank() }.joinToString(" ")
+    /** 折叠后的 positive suffix（v1.9.46 起只含通用风格 suffix，不再折叠 era.positive） */
+    val positiveSuffix: String get() = globalPromptSuffix
 
-    /** 时代红线禁词（供闸口扫描） */
-    val forbiddenEraTerms: List<String> get() = era.negative
+    /** 时代红线禁词——生成链路已解除时代约束，恒为空（保留 API 供调用方兼容）。 */
+    val forbiddenEraTerms: List<String> get() = emptyList()
 
     /** 该预设默认放行权为空（全禁）；按场景/剧集独立声明。 */
     fun resolveAllowed(shotAllowed: List<String> = emptyList(), sceneAllowed: List<String> = emptyList(), episodeAllowed: List<String> = emptyList()): Set<String> =
@@ -185,11 +190,13 @@ data class StylePreset(
     }
 
     /**
-     * 生成 prompt 时挂上 era 约束（仅正向内容）。
-     * ★第十一轮修复（角色生成负面词全当正面用的根因）：旧实现把 [negative] 禁词表
-     * 拼进返回的正面 prompt 尾部，图像模型将"手机、塑料、现代招牌"等全部当成了要画的主体，
-     * 导致时代红线全面踩线。现返回值只含正向描述；禁词一律经 [ImageGenRequest.negativePrompt]
-     * 走独立的 negative_prompt API 通道。
+     * v1.9.46：时代约束已彻底移除。
+     *
+     * 历史版本在这里拼接 era.positive（朝代形制红线）与「本镜放行跨时代器物」注记，
+     * 导致现代剧资产被强行套上汉代服化道、任何朝代剧本都被写死一种历史风貌。
+     * 现在正向只追加通用风格 suffix（或调用方给的专用 suffix），服化道全部以剧本/资产描述为准。
+     *
+     * 参数保留仅为兼容既有调用点：[allowed] / [eraPositiveOverride] 已不参与拼接。
      */
     fun withEraConstraints(
         basePrompt: String,
@@ -197,59 +204,27 @@ data class StylePreset(
         suffixOverride: String? = null,
         eraPositiveOverride: String? = null,
     ): String {
-        // suffixOverride 非空时（角色棚拍 / 道具），丢弃 globalPromptSuffix 的场景化语义，
-        // 只保留 era 正向红线 + 调用方给的专用 suffix。
-        // eraPositiveOverride：角色 / 道具改用主体版红线，避免红线正文里的
-        // 「建筑、场景」语义诱导模型补背景（v1.7.19）。
-        val eraPos = eraPositiveOverride ?: era.positive
-        val pos = if (suffixOverride.isNullOrBlank()) listOf(globalPromptSuffix, eraPos).filter { it.isNotBlank() }.joinToString(" ")
-                  else listOf(eraPos, suffixOverride).filter { it.isNotBlank() }.joinToString(" ")
-        val allowedNote = if (allowed.isNotEmpty())
-            "。本镜依剧本设定允许出现跨时代器物：${allowed.joinToString("、")}；其余仍须符合本剧时代风貌" else ""
+        val suffix = if (suffixOverride.isNullOrBlank()) globalPromptSuffix else suffixOverride
         return buildString {
             append(basePrompt)
-            if (pos.isNotBlank()) append("。$pos")
-            append(allowedNote)
+            if (suffix.isNotBlank()) append("。$suffix")
         }
     }
 
     /**
-     * 某次生成应使用的完整 negative_prompt（global + era禁词 − 放行项）。
+     * 某次生成应使用的完整 negative_prompt（v1.9.46 起只含通用负向，时代禁词已移除）。
      * 与 [withEraConstraints] 配对使用：正负分离，各走各的API字段。
      */
     fun negativePromptFor(allowed: List<String> = emptyList()): String =
         (globalNegativePrompt + effectiveForbidden(allowed)).distinct().joinToString(", ")
 
     /**
-     * 资产图正向红线（随当前 preset 的朝代动态生成）。
+     * v1.9.46：时代约束已从生成链路移除，此方法恒返回空串。
      *
-     * ★污染修复：此前的 [eraPositiveScene]/[eraPositiveCharacter]/[eraPositiveProp] 写死为
-     * 西汉常量，而 [EraDetector.PRESETS] 里唐/宋/明/清等 preset 构造时只覆盖了 [era.positive]
-     * （完整版，走视频端），**未覆盖这三段资产图分家版** → 这些朝代的场景/角色/道具卡红线
-     * 仍是「西汉末年至新莽」，与剧本朝代冲突，正是「场景卡时代红线污染」的根因。
-     *
-     * 本方法以 [era.label] 为唯一事实源：
-     * - 西汉（默认 cinema）仍走精编详细常量，保留木构/简牍/青铜等正向引导，避免回归。
-     * - 其余朝代用「本剧设定为 {era.label} …该时代风貌」通用版，彻底消除跨朝代污染。
-     * - 「无电力、无工业、无现代器物」仅在 [era.negative] 非空时附加（modern/fantasy 不禁现代物）。
+     * 保留方法签名与 eraPositiveCharacter/Scene/Prop 字段只为兼容旧调用方与单测数据；
+     * 人物服饰、建筑形制、器物工艺全部以剧本与资产描述为唯一依据，不再套用任何朝代红线。
      */
-    fun eraPositiveFor(kind: String): String {
-        val label = era.label
-        val isHan = label.contains("西汉") || label.contains("新莽")
-        val noModern = if (era.negative.isEmpty()) "" else "；无电力、无工业、无现代器物"
-        return when (kind.trim().lowercase()) {
-            AssetPromptBuilder.KIND_CHARACTER ->
-                if (isHan) eraPositiveCharacter else
-                    "【严格历史时代约束】本剧设定为$label，图中人物的服饰形制、发式冠巾、面料质地必须严格符合该时代风貌$noModern。只描绘这一个人本身：不得描绘任何背景、环境、建筑、陈设、器物、火光或其他角色；双手自然垂于身侧且完全空置，不持握任何器物、兵器、刀剑、简牍、书卷、杯盏、杖或其他物件。"
-            AssetPromptBuilder.KIND_SCENE ->
-                if (isHan) eraPositiveScene else
-                    "【严格历史时代约束】本剧设定为$label，画面中的建筑形制、空间陈设与道具器物必须严格符合该时代风貌$noModern。这是空场空镜，画面中不得出现任何人物。"
-            AssetPromptBuilder.KIND_PROP ->
-                if (isHan) eraPositiveProp else
-                    "【严格历史时代约束】本剧设定为$label，该器物的形制、材质与工艺必须严格符合该时代风貌$noModern。只描绘这一件器物本身：不得描绘任何人物、服饰、背景、环境、建筑或其他物件。"
-            else -> era.positive
-        }
-    }
+    fun eraPositiveFor(kind: String): String = ""
 
     /**
      * 角色棚拍专用约束（T014 任务1）：在 era 正向约束之外，额外追加纯色无干扰背景指令，
@@ -441,7 +416,7 @@ data class StylePreset(
             "人物", "人影", "人群", "行人", "角色", "人脸",
         )
         /** 场景图精简禁词（v1.7.21）：高频时代词 + 空场无人干扰词，控制在 25 项内。 */
-        val DEFAULT_SCENE_CORE_FORBIDDEN = DEFAULT_ERA_NEGATIVE_ASSET + listOf(
+        val DEFAULT_SCENE_CORE_FORBIDDEN = listOf(
             "people", "person", "human", "human figure", "man", "woman", "child",
             "character", "crowd", "silhouette", "pedestrian", "portrait", "face",
         )
@@ -458,7 +433,7 @@ data class StylePreset(
             "人物", "人", "手", "环境", "场景", "背景", "室内", "家具",
         )
         /** 道具图精简禁词（v1.7.21）：高频时代词 + 纯色底/孤立单品干扰词。 */
-        val DEFAULT_PROP_CORE_FORBIDDEN = DEFAULT_ERA_NEGATIVE_ASSET + listOf(
+        val DEFAULT_PROP_CORE_FORBIDDEN = listOf(
             "people", "person", "human", "hand holding", "model", "character", "face",
             "scene background", "environment", "landscape", "furniture", "room interior",
             "complex background", "detailed background", "outdoor", "tabletop",
@@ -472,7 +447,7 @@ data class StylePreset(
          * 默认就把器物塞进手里，于是角色卡频出手持刀剑/简牍/杯盏。
          * 具体清单放在 [DEFAULT_CHARACTER_TAIL_ANCHOR]（尾部权重最高），这里只留高频钩子。
          */
-        val DEFAULT_CHARACTER_CORE_FORBIDDEN = DEFAULT_ERA_NEGATIVE_ASSET + listOf(
+        val DEFAULT_CHARACTER_CORE_FORBIDDEN = listOf(
             "scene background", "environment", "landscape", "furniture", "props around",
             "complex background", "outdoor", "interior setting", "decorated room",
             "background scenery", "detailed background", "busy background",
@@ -616,8 +591,29 @@ data class StylePreset(
                 "face close-up, expression: sorrowful, slightly lowered brows, downcast eyes, pressed lips, somber demeanor", expression = true),
         )
 
-        /** 默认西汉预设单例。 */
+        /** 默认西汉预设单例（仅显式选择汉朝时使用；检测零命中不再回退到这里）。 */
         val HAN_DEFAULT = StylePreset()
+
+        // ---------------- 中性预设（未指定时代） ----------------
+        const val NEUTRAL_NAME = "neutral"
+        val NEUTRAL_NEGATIVE = listOf(
+            "watermark", "text", "low quality", "speckles", "blurry", "水印", "文字", "低质", "模糊")
+
+        /**
+         * ★去时代锁：剧本没有历史朝代线索 / 检测零命中时的默认预设。
+         * 只保留「单主体、空场、单件器物、可商用画质」约束，服化道一律以剧本描述为准，
+         * 绝不默认任何朝代形制（这正是此前现代剧被要求穿深衣曲裾的根因）。
+         */
+        val NEUTRAL_DEFAULT = StylePreset(
+            name = NEUTRAL_NAME,
+            era = EraSpec(
+                label = "时代未指定（以剧本设定为准）",
+                positive = "【时代约束】本剧未指定具体历史朝代，所有服饰、发式、建筑、器物严格以剧本描述为准；剧本未描述时用现代/通用影视质感，不得默认任何朝代形制。",
+                negative = NEUTRAL_NEGATIVE),
+            eraPositiveCharacter = "只描绘这一个人本身：服饰、发式、装扮与身份严格以剧本描述为准，不默认任何朝代形制；不得描绘任何背景、环境、建筑、陈设、器物、火光或其他角色；双手自然垂于身侧且完全空置，不持握任何器物、兵器、刀剑、简牍、书卷、杯盏、杖或其他物件。",
+            eraPositiveScene = "画面中的建筑形制、空间陈设与道具器物严格以剧本描述为准，不默认任何朝代形制。这是空场空镜，画面中不得出现任何人物。",
+            eraPositiveProp = "该器物的形制、材质与工艺严格以剧本描述为准，不默认任何朝代形制。只描绘这一件器物本身：不得描绘任何人物、服饰、背景、环境、建筑或其他物件。",
+        )
 
         /** 从 style_cinema.json 兼容 dict 构造（MVP 仅取 era 块，其余用默认值）。 */
         fun fromJson(json: Map<String, Any?>): StylePreset {

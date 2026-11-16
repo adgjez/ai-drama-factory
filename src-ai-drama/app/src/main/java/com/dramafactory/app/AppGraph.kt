@@ -17,6 +17,7 @@ import com.dramafactory.app.storage.StorageState
 import com.dramafactory.core.assemble.MovieAssembler
 import com.dramafactory.core.assemble.MovieAssemblerImpl
 import com.dramafactory.core.assemble.androidFfmpegKitExecutor
+import com.dramafactory.core.assemble.androidFfmpegKitProbe
 import com.dramafactory.core.model.ChatRequest
 import com.dramafactory.core.pipeline.DefaultBudgetGuard
 import com.dramafactory.core.provider.AgnesProvider
@@ -210,6 +211,46 @@ object AppGraph {
     @Volatile private var appContextRef: Context? = null
     fun appContext(): Context? = appContextRef
 
+    // ---- ★第五批 P0：渲染预算（条数型）持久化 ----
+    // 预算只存内存时：杀进程/崩溃重启后 used 归零，用户可以无限提交付费任务；上限也无 UI 可调。
+    private const val BUDGET_PREFS = "render_budget"
+    private const val LIMIT_PREFIX = "limit_"
+    private const val USED_PREFIX = "used_"
+
+    private fun budgetPrefs(): android.content.SharedPreferences? =
+        appContext()?.getSharedPreferences(BUDGET_PREFS, android.content.Context.MODE_PRIVATE)
+
+    /** 某项目当前预算上限（条）。未设置过 = DefaultBudgetGuard.DEFAULT_LIMIT。 */
+    fun budgetLimit(projectId: String): Int =
+        runCatching { budgetPrefs()?.getInt(LIMIT_PREFIX + projectId, DefaultBudgetGuard.DEFAULT_LIMIT) }
+            .getOrNull() ?: DefaultBudgetGuard.DEFAULT_LIMIT
+
+    /** 调整某项目预算上限（条，1..200）：落 SharedPreferences + 立即生效到内存 guard。 */
+    fun setBudgetLimit(projectId: String, limit: Int) {
+        val v = limit.coerceIn(1, 200)
+        runCatching { budgetPrefs()?.edit()?.putInt(LIMIT_PREFIX + projectId, v)?.apply() }
+        runCatching { budgetGuard.setLimit(projectId, v) }
+    }
+
+    /** 构造预算闸门：恢复已用条数与自定义上限，并在每次扣减时落盘。 */
+    private fun buildBudgetGuard(): DefaultBudgetGuard {
+        val prefs = budgetPrefs()
+        val initialUsed = mutableMapOf<String, Int>()
+        prefs?.all?.forEach { (k, v) ->
+            if (v is Int && k.startsWith(USED_PREFIX)) initialUsed[k.removePrefix(USED_PREFIX)] = v
+        }
+        val guard = DefaultBudgetGuard(initialUsed = initialUsed)
+        prefs?.all?.forEach { (k, v) ->
+            if (v is Int && k.startsWith(LIMIT_PREFIX)) {
+                runCatching { guard.setLimit(k.removePrefix(LIMIT_PREFIX), v) }
+            }
+        }
+        guard.onUsageChanged = { projectId, used ->
+            runCatching { prefs?.edit()?.putInt(USED_PREFIX + projectId, used)?.apply() }
+        }
+        return guard
+    }
+
     // ---- v1.7.18：视频参数（设置页可调，渲染按镜透传）----
     @Volatile
     var videoParams: com.dramafactory.core.model.VideoParams = com.dramafactory.core.model.VideoParams()
@@ -273,22 +314,22 @@ object AppGraph {
     }.getOrNull()
 
     /**
-     * ★F3 修复：当前 AI 管线的时代红线 key（由 createEpisode 按剧本自动推断，
-     * 不再写死西汉）。generateImage 生成链路一律用 presetFor(currentEraKey) 组装约束。
-     * 单活跃 run 假设下用 @Volatile 保证可见性；并发多 run 由上层串行保证。
+     * v1.9.46：时代约束已从生成链路删除。
+     * 该 key 恒为 neutral，仅用于兼容既有调用点（presetFor / AssetPromptBuilder 签名保留）；
+     * 服化道、建筑形制、器物风格一律以剧本与资产描述为准，不再按朝代注入红线。
      */
-    @Volatile internal var currentEraKey: String = "han"
+    @Volatile internal var currentEraKey: String = "neutral"
 
-    /** 当前时代红线预设（AI 助手/资产生成共用；由 createEpisode 按剧本推断更新） */
+    /** 当前风格预设（v1.9.46 起恒为 neutral；保留给资产生成/提示词组装的既有调用点） */
     fun currentPreset(): com.dramafactory.core.quality.StylePreset =
         com.dramafactory.core.quality.EraDetector.presetFor(currentEraKey)
 
     /**
-     * v1.9.10：用已接好的文本 LLM 把资产裸名词扩写成聚焦主体、符合时代红线的视觉描述，
+     * v1.9.10：用已接好的文本 LLM 把资产裸名词扩写成聚焦主体、符合剧本设定的视觉描述，
      * 供各生图入口统一复用。失败（未配 Key / 401 / 超时）安全回退裸词，不阻断生图。
+     * v1.9.46：不再传时代/禁词参数——扩写只描述主体，年代风格完全以剧本为准。
      */
     internal suspend fun enrichAssetPrompt(kind: String, baseName: String): String {
-        val preset = currentPreset()
         return runCatching {
             com.dramafactory.core.quality.AssetPromptEnricher.enrich(
                 chat = { msg ->
@@ -298,8 +339,7 @@ object AppGraph {
                             com.dramafactory.core.model.ChatMessage("user", msg))))
                     }.getOrNull()?.content ?: ""
                 },
-                kind = kind, name = baseName,
-                eraLabel = preset.era.label, forbidden = preset.forbiddenEraTerms)
+                kind = kind, name = baseName)
         }.getOrDefault(baseName)
     }
 
@@ -308,39 +348,104 @@ object AppGraph {
      * 返回成片 File；无可用镜头/合成失败返回 null。
      * 复用成片库(S7)逻辑，供 AI 模式跑完自动产出成品展示。
      */
+    /**
+     * 第三批：读取本集所属项目的 BGM 配置。
+     * 文件可能已被用户删除（返回 null 文件），音量仍返回（便于 UI 回显默认值 0.22）。
+     */
+    suspend fun bgmForEpisode(episodeId: String): Pair<java.io.File?, Double> {
+        val projectId = episodeId.substringBefore("_ep")
+        val row = runCatching { dao.project(projectId) }.getOrNull()
+        val file = row?.bgm_path?.takeIf { it.isNotBlank() }?.let { java.io.File(it) }
+            ?.takeIf { it.exists() && it.length() > 0L }
+        return file to (row?.bgm_volume ?: 0.22)
+    }
+
     suspend fun composeFilmIfReady(episodeId: String, ctx: Context): java.io.File? {
         val composer = movieAssembler
         if (composer is EmptyMovieAssembler) return null
         // v1.6.9 修：assemble 内部 executor 用 CountDownLatch.await 阻塞等 ffmpeg，
         // 必须在 IO 线程跑，否则在 Dispatchers.Main 上调用会 ANR/闪退。
         val res = runCatching {
+            // ★第二批 P0-D1：按数字 shot_no 排序（shot_id 字典序会把 shot10 排到 shot2 前）。
+            val shotNoById = runCatching {
+                dao.shotsOf(episodeId).associate { it.shot_id to it.shot_no }
+            }.getOrDefault(emptyMap())
             val tasks = dao.renderTasksOf(episodeId)
                 .filter { it.state == "COMPLETED" && !it.local_file_uri.isNullOrBlank() }
-                .sortedBy { it.shot_id }
-            val clips = tasks.mapNotNull { java.io.File(it.local_file_uri ?: "") }
-                .filter { it.exists() && it.length() > 0L }
-            if (clips.isEmpty()) return@runCatching null
-            val outDir = java.io.File(ctx.cacheDir, "movies")
-            if (!outDir.exists()) outDir.mkdirs()
-            val out = java.io.File(outDir, "$episodeId.mp4")
-            withContext(kotlinx.coroutines.Dispatchers.IO) { composer.assemble(clips, out) } to out
+                .sortedWith(
+                    compareBy<com.dramafactory.app.data.RenderTaskEntity> {
+                        shotNoById[it.shot_id] ?: Int.MAX_VALUE
+                    }.thenBy { it.shot_id })
+            val entries = tasks.mapNotNull { t ->
+                val f = java.io.File(t.local_file_uri ?: "")
+                if (f.exists() && f.length() > 0L) t to f else null
+            }
+            if (entries.isEmpty()) return@runCatching null
+            val clips = entries.map { it.second }
+            // ★第二批 P0：按镜头真实时长/台词生成 sidecar 字幕轨；成片统一做响度归一化。
+            val shotsById = runCatching { dao.shotsOf(episodeId).associateBy { it.shot_id } }
+                .getOrDefault(emptyMap())
+            // ★第七批 T4（P1-1）：字幕时间轴统一走 SubtitleTimeline，按 xfade 转场对齐
+            // （第 i 镜起点 = Σd(<i) − i·T；旧手写公式按简单累计，第 i 镜字幕晚 i·T+150ms）。
+            val transitionSeconds = 0.30
+            val timings = entries.map { (task, clip) ->
+                val shot = shotsById[task.shot_id]
+                // ★第二批 P0-D2：优先用 MediaMetadataRetriever 读到的真实镜长，DB 的 duration_seconds 仅兜底
+                val durMs = com.dramafactory.app.videoDurationMs(clip)
+                    ?: (((shot?.duration_seconds?.takeIf { it > 0.0 } ?: 5.0) * 1000).toLong())
+                val text = listOfNotNull(
+                    shot?.dialogue?.takeIf { it.isNotBlank() },
+                    shot?.narration?.takeIf { it.isNotBlank() },
+                ).joinToString(" / ")
+                com.dramafactory.core.assemble.SubtitleTimeline.ShotTiming(
+                    durationMs = durMs, text = text)
+            }
+            val cues = com.dramafactory.core.assemble.SubtitleTimeline.build(
+                shots = timings, transitionSeconds = transitionSeconds)
+            // ★第三批：项目 BGM 端到端（成片页选曲 → 合成时混音）；文件丢失时自动跳过。
+            val (bgmFile, bgmVolume) = bgmForEpisode(episodeId)
+            // ★第二批 P0-D2：成片统一落 filesDir/movies（cacheDir 会被系统清理）
+            val out = FilmPaths.film(ctx, episodeId)
+            withContext(kotlinx.coroutines.Dispatchers.IO) {
+                composer.assemble(
+                    clips, out,
+                    com.dramafactory.core.assemble.MovieAssembler.AssembleOptions(
+                        subtitles = cues,
+                        bgm = bgmFile,
+                        bgmVolume = bgmVolume,
+                        loudnessNormalize = true,
+                        transition = com.dramafactory.core.assemble.MovieAssembler.Transition.FADE,
+                        transitionSeconds = transitionSeconds,
+                    ),
+                )
+            } to out
         }.getOrNull() ?: return null
-        val out = res.second
         return runCatching {
             when (val r = res.first) {
                 is com.dramafactory.core.assemble.MovieAssembler.AssembleResult.Success -> {
-                    if (r.output.exists()) {
+                    // ★第二批 P0-D3/D2：Success.output 才是真实成片（可能是 _norm.mp4），统一落库到 films/movies。
+                    val finalFilm = FilmPaths.persistFilm(ctx, episodeId, r.output) ?: return@runCatching null
+                    r.subtitleFile?.takeIf { it.exists() }?.let { srt ->
+                        runCatching {
+                            val dst = FilmPaths.subtitle(ctx, episodeId)
+                            if (srt.absolutePath != dst.absolutePath) srt.copyTo(dst, overwrite = true)
+                        }
+                    }
+                    if (r.warnings.isNotEmpty()) {
+                        Log.w("AppGraph", "composeFilmIfReady warnings: " + r.warnings.joinToString("; "))
+                    }
+                    if (finalFilm.exists() && finalFilm.length() > 0L) {
                         runCatching {
                             movieLibraryDao.upsertFilmOf(
                                 com.dramafactory.app.data.FinishedFilmEntity(
                                     film_id = episodeId, episode_id = episodeId,
                                     project_id = episodeId.substringBefore("_ep"),
-                                    filePath = out.absolutePath, fileSize = out.length(),
+                                    filePath = finalFilm.absolutePath, fileSize = finalFilm.length(),
                                     durationMs = (r.durationSeconds * 1000).toLong(),
                                     createdAt = System.currentTimeMillis(),
                                 ))
                         }
-                        out
+                        finalFilm
                     } else null
                 }
                 else -> null
@@ -384,7 +489,8 @@ object AppGraph {
         val tp = textProviderFor()
         val r = com.dramafactory.core.quality.LlmAssetExtractor.extract(text) { req -> tp.chat(req) }
         return r.assets.map { a ->
-            DefaultAiOrchestrator.AiAsset(assetId = "a_${System.nanoTime()}", kind = a.kind, name = a.name, prompt = a.desc)
+            DefaultAiOrchestrator.AiAsset(assetId = "a_${System.nanoTime()}", kind = a.kind, name = a.name,
+                prompt = com.dramafactory.core.quality.LlmAssetExtractor.cardPrompt(a))
         }
     }
 
@@ -589,13 +695,17 @@ object AppGraph {
             // 必须在 initialized=true 之后跑（refreshConfiguredProviders 内部早退保护），
             // 故挂 ioScope 异步执行；init 同步跑到置位后才轮到它调度。
             ioScope.launch { refreshConfiguredProviders() }
-            budgetGuard = DefaultBudgetGuard()
+            // ★第五批 P0：预算上限/已用持久化（旧实现纯内存，进程重启后预算归零可无限烧钱）
+            budgetGuard = buildBudgetGuard()
 
             // v1.8.4：激活文本模型已落盘（saveActiveModel 写 KeyVault），factory 已同步预热进内存，
             // 保证 initialized=true 之前内存已是持久值，避免任何 UI 首帧读到默认 agnes 再跳变。
 
             try {
-                movieAssembler = MovieAssemblerImpl(executor = androidFfmpegKitExecutor())
+                movieAssembler = MovieAssemblerImpl(
+                    executor = androidFfmpegKitExecutor(),
+                    probe = androidFfmpegKitProbe(),
+                )
             } catch (t: Throwable) {
                 Log.e("AppGraph", "movieAssembler init failed", t)
             }
@@ -609,6 +719,64 @@ object AppGraph {
     /** T014：Room 初始化失败时的空 MovieAssembler 兜底。 */
     var roomInitError: String? = null; private set
 
+}
+
+/**
+ * ★第二批 P0-D2：成片与字幕的唯一落盘路径（filesDir/movies）。
+ *
+ * 之前自动合成写 cacheDir/movies、手动合成写 filesDir/movies、预览/分享又读 cacheDir/{ep}.mp4，
+ * 三处不一致导致「自动合成后预览/分享报未合成」，且 cacheDir 被系统清理后成片直接丢失。
+ * 这里统一为 filesDir/movies，分享时再复制到 cacheDir（FileProvider 白名单走 cache）。
+ */
+internal object FilmPaths {
+    fun moviesDir(ctx: Context): java.io.File =
+        java.io.File(ctx.filesDir, "movies").also { if (!it.exists()) it.mkdirs() }
+
+    fun film(ctx: Context, episodeId: String): java.io.File =
+        java.io.File(moviesDir(ctx), "$episodeId.mp4")
+
+    fun subtitle(ctx: Context, episodeId: String): java.io.File =
+        java.io.File(moviesDir(ctx), "$episodeId.srt")
+
+    /** 兼容历史版本：先找 filesDir/movies，再回退旧的 cacheDir 位置。 */
+    fun resolveExisting(ctx: Context, episodeId: String): java.io.File? =
+        listOf(
+            film(ctx, episodeId),
+            java.io.File(ctx.cacheDir, "movies/$episodeId.mp4"),
+            java.io.File(ctx.cacheDir, "$episodeId.mp4"),
+        ).firstOrNull { it.exists() && it.length() > 0L }
+
+    /** 把 assembler 的真实输出（可能是 _norm.mp4）落到约定路径；返回最终成片。 */
+    fun persistFilm(ctx: Context, episodeId: String, src: java.io.File): java.io.File? {
+        if (!src.exists() || src.length() <= 0L) return null
+        val dst = film(ctx, episodeId)
+        if (src.absolutePath == dst.absolutePath) return dst
+        return runCatching {
+            val tmp = java.io.File(dst.parentFile, dst.name + ".tmp")
+            src.copyTo(tmp, overwrite = true)
+            if (dst.exists()) dst.delete()
+            if (!tmp.renameTo(dst)) {
+                tmp.copyTo(dst, overwrite = true)
+                tmp.delete()
+            }
+            if (dst.exists() && dst.length() > 0L) dst else src
+        }.getOrElse { src }
+    }
+}
+
+/** ★第二批 P0：用系统 MediaMetadataRetriever 读视频真实时长（毫秒），失败返回 null。 */
+internal fun videoDurationMs(file: java.io.File): Long? {
+    if (!file.exists() || file.length() <= 0L) return null
+    val retriever = android.media.MediaMetadataRetriever()
+    return try {
+        retriever.setDataSource(file.absolutePath)
+        retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
+            ?.toLongOrNull()?.takeIf { it > 0L }
+    } catch (t: Throwable) {
+        null
+    } finally {
+        runCatching { retriever.release() }
+    }
 }
 
 // ---- 文本 Provider 解析（文件级纯函数，便于 JVM 单测，不触发 object AppGraph 的 init）----

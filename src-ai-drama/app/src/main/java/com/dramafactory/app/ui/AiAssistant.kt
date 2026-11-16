@@ -336,7 +336,8 @@ class AiAssistantViewModel : ViewModel() {
                     dao.assetsAllOf(pid).firstOrNull { it.asset_id == cid }
                 } ?: return "（找不到角色 $cid）"
                 if (parent.kind != "character") return "（$cid 不是角色资产，参考图只给角色建）"
-                val preset = com.dramafactory.core.quality.StylePreset.HAN_DEFAULT
+                // ★去时代锁：pose pack 跟随当前项目按剧本检测出的预设
+                val preset = AppGraph.currentPreset()
                 val n = withContext(Dispatchers.IO) {
                     var added = 0
                     for (shot in preset.referenceShots) {
@@ -395,13 +396,12 @@ class AiAssistantViewModel : ViewModel() {
                     com.dramafactory.app.data.ShotEntity(
                         shot_id = "${e}_shot${s.shotNo}", episode_id = e, project_id = pid,
                         shot_no = s.shotNo, dialogue = s.dialogue, narration = s.narration,
-                        action = listOfNotNull(s.action, s.visualPrompt?.let { "［$it］" }).joinToString("；"),
+                        action = s.action,
                         beat_ref = s.beatRef, carry_over = s.carryOver, scene_context = s.sceneContext,
                         first_asset_ids = AssetCatalog.encodeRefIds(s.assetIds),
                         last_asset_ids = "[]",
                         visual_prompt = s.visualPrompt, duration_seconds = s.durationSeconds,
-                        sb_check = if (result.gateErrors[s.shotNo].isNullOrEmpty()) "pass"
-                                    else "error:${result.gateErrors[s.shotNo]!!.joinToString(",")}")
+                        sb_check = sbCheckFromResult(result.gateErrors[s.shotNo]))
                 }
                 PersistenceActionExecutor.writeShotsBatch(dao, AppGraph.storageGuard, e, newShots, "gen_shots")
                 val noAssetNote = if (catalog.isEmpty())

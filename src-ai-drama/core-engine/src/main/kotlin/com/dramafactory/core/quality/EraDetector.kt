@@ -20,8 +20,9 @@ object EraDetector {
     data class Detection(val eraKey: String, val label: String, val usedLlm: Boolean)
 
     private const val PROMPT = """判断这个剧本/小说的故事时代背景。只输出严格 JSON，不要markdown：
-{"era":"han|tang|song|ming|qing|roc|modern|fantasy","label":"一句话时代描述"}
-判定标准：以主体剧情所处时代为准（穿越题材按主角穿越后主体时代）；完全架空的虚构世界用 fantasy。"""
+{"era":"han|tang|song|ming|qing|roc|modern|fantasy|neutral","label":"一句话时代描述"}
+判定标准：以主体剧情所处时代为准（穿越题材按主角穿越后主体时代）；完全架空的虚构世界用 fantasy。
+判断不出明显时代特征、或现代通用题材没有朝代线索时用 neutral（中性，不锁任何朝代）。"""
 
     /**
      * LLM 检测 + 规则兜底。
@@ -60,7 +61,7 @@ object EraDetector {
         } catch (_: Throwable) { null }
     }
 
-    /** 规则兜底：朝代特征词命中计数，取最高；全零回退汉（保守历史向）。 */
+    /** 规则兜底：朝代特征词命中计数，取最高；全零回退 neutral（不锁朝代，避免默认汉服化道）。 */
     internal fun ruleBased(script: String): Detection {
         val signals = mapOf(
             "han" to listOf("匈奴", "长安未央", "新莽", "西域都护", "丝绸之路", "大汉", "汉军", "单于", "和亲"),
@@ -72,7 +73,7 @@ object EraDetector {
             "modern" to listOf("手机", "地铁", "电脑", "微信", "公司", "汽车", "写字楼", "视频通话", "外卖"),
             "fantasy" to listOf("修炼", "灵气", "法术", "修仙", "斗气", "魔法", "异世界", "系统", "穿越"),
         )
-        var best = "han"; var bestHits = 0
+        var best = "neutral"; var bestHits = 0
         for ((k, words) in signals) {
             val hits = words.count { it in script }
             if (hits > bestHits) { best = k; bestHits = hits }
@@ -89,7 +90,8 @@ object EraDetector {
 
     /** 各朝代预设：key → StylePreset（仅 era 块不同，姿态/全局负向共用） */
     val PRESETS: Map<String, StylePreset> = mapOf(
-        "han" to StylePreset(),   // 西汉末—新莽默认
+        "neutral" to StylePreset.NEUTRAL_DEFAULT,   // ★零命中兜底：不锁朝代，服化道以剧本为准
+        "han" to StylePreset(),   // 西汉末—新莽
         "tang" to StylePreset(name = "tang", era = ancientEra("盛唐时期（约公元8世纪）",
             "【严格历史时代约束】本剧设定为唐代，人物服饰为唐制圆领袍、齐胸襦裙、幞头；建筑为斗拱木构、里坊制；器物含唐三彩、金银器、卷轴；无电力、无工业、无现代器物。")),
         "song" to StylePreset(name = "song", era = ancientEra("宋代（北宋/南宋）",
@@ -110,6 +112,6 @@ object EraDetector {
             negative = listOf("watermark", "text", "low quality", "speckles", "水印", "文字", "低质"))),  // 架空不限时代
     )
 
-    /** 按检测key取预设；未知key回退西汉默认 */
-    fun presetFor(eraKey: String): StylePreset = PRESETS[eraKey.lowercase()] ?: StylePreset.HAN_DEFAULT
+    /** 按检测key取预设；未知key回退 neutral（不锁朝代，绝不回退西汉）。 */
+    fun presetFor(eraKey: String): StylePreset = PRESETS[eraKey.lowercase()] ?: StylePreset.NEUTRAL_DEFAULT
 }

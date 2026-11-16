@@ -36,9 +36,9 @@ import kotlin.test.assertTrue
 
 class P0FixRegressionTest {
 
+    /** 断言必须冒泡：旧实现用 Thread + join，失败只进 system-err，JUnit 仍报 PASSED（假通过）。 */
     private fun runSuspend(block: suspend () -> Unit) {
-        val t = Thread { runBlocking { block() } }
-        t.start(); t.join(30_000)
+        runBlocking { withTimeout(30_000) { block() } }
     }
 
     /** 假 VideoProvider：捕获 submitVideo 收到的完整请求（含 prompt）。 */
