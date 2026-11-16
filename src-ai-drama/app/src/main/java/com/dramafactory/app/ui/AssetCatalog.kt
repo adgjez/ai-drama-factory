@@ -143,6 +143,50 @@ object AssetCatalog {
             .take(limit)
     }
 
+    /**
+     * ★第六批：渲染期「软绑定」——分镜不再硬绑 asset_id 时，按资产显示名在镜头文本中出现来选母卡。
+     *
+     * 分镜阶段的 asset_ids 已改为可选：LLM 只在确实提及时才填。渲染阶段执行下面两步：
+     * 1. 本方法按 names/action/scene_context/carry_over 里的名字匹配母卡（角色优先，其次场景、道具）；
+     * 2. [resolveRefUris] 再把母卡解析成参考图（优先参考图子卡）。
+     * 匹配不到就返回空——此时该镜不注入参考图，等接缝帧合成阶段仍会用场景图兜底，
+     * 不会像旧实现那样回退到「项目级前 4 张」把别的角色脸串进来。
+     *
+     * @param texts 镜头里可读文本（action/dialogue/narration/scene_context/carry_over/scene_title）
+     * @param limit 最多返回几张母卡
+     */
+    fun softRefIds(
+        rows: List<AssetEntity>,
+        texts: List<String?>,
+        limit: Int = 6,
+    ): List<String> {
+        val haystack = texts.filterNotNull().map { it.trim() }.filter { it.isNotEmpty() }
+            .joinToString(" ")
+        if (haystack.isEmpty()) return emptyList()
+        val usable = rows.filter { it.audit_state != "rejected" }
+        val mothersBackedByRefs = usable.asSequence()
+            .filter { !it.parent_id.isNullOrBlank() && it.review_state != "regen" && uriOf(it) != null }
+            .mapNotNull { it.parent_id }
+            .toSet()
+        val mothers = usable.filter {
+            it.asset_id.isNotBlank() && it.parent_id.isNullOrBlank() && it.pose_role.isNullOrBlank() &&
+                it.review_state != "regen" &&
+                (uriOf(it) != null || it.asset_id in mothersBackedByRefs)
+        }
+        val out = LinkedHashSet<String>()
+        // 角色最关键（决定锁脸），场景次之（决定接缝帧背景），道具最后
+        for (kind in listOf("character", "scene", "prop")) {
+            for (row in mothers) {
+                if (out.size >= limit) return out.toList()
+                if (normalizeKind(row.kind) != kind) continue
+                val name = displayName(row.prompt)
+                if (name.isBlank() || name == "未命名" || name.length < 2) continue
+                if (haystack.contains(name)) out.add(row.asset_id)
+            }
+        }
+        return out.toList()
+    }
+
     /** kind 归一化为 character / scene / prop / local，未知值按 local 处理。 */
     fun normalizeKind(raw: String?): String = when (raw?.trim()?.lowercase()) {
         "character" -> "character"

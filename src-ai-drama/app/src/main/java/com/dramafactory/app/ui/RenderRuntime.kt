@@ -1,10 +1,12 @@
 package com.dramafactory.app.ui
 
 import com.dramafactory.app.AppGraph
+import com.dramafactory.app.data.ShotEntity
 import com.dramafactory.app.ui.AssetCatalog
 import com.dramafactory.core.pipeline.DefaultPipelineOrchestrator
 import com.dramafactory.core.pipeline.DefaultRenderQueue
 import com.dramafactory.core.provider.SharedHttp
+import com.dramafactory.core.quality.SeamPlanner
 import com.dramafactory.core.quality.StoryboardGate
 import io.ktor.client.request.prepareGet
 import io.ktor.client.statement.bodyAsChannel
@@ -167,10 +169,14 @@ object RenderRuntime {
                     runCatching {
                         val shot = AppGraph.dao.shotKeyframes(shotId)
                             ?: AppGraph.dao.shotsOf(epId).firstOrNull { it.shot_id == shotId }
-                        val refIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
                         // ★v1.10：参考图「只认 approved」放宽为「排除 rejected」——未审核资产不再让整集无参考图，
                         // 质检拒绝的差图仍然硬隔离（配合 fidelity 闸的 gate_asset_rejected）
                         val all = AppGraph.dao.assetsAllOf(projectId).filter { it.audit_state != "rejected" }
+                        // ★第六批：分镜不再硬绑资产——first_asset_ids 为空时按镜头文本软匹配母卡（防 LLM 引用编造 ID）
+                        val boundRefIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
+                        val refIds = boundRefIds.ifEmpty {
+                            AssetCatalog.softRefIds(all, shot?.let { shotTextsForSoftRefs(it) } ?: emptyList())
+                        }
                         AssetCatalog.resolveRefUris(all, refIds)
                             .ifEmpty { AssetCatalog.fallbackUris(all) }
                     }.getOrDefault(emptyList())
@@ -191,13 +197,32 @@ object RenderRuntime {
     }
 
     /**
+     * ★第六批：软引用匹配文本。
+     * 分镜不再硬绑资产后，渲染期按「镜头文本里是否出现资产名」回找可用母卡；
+     * 只取展示用文本（软匹配输入是资产名，不是 first_asset_ids 里的 ID）。
+     */
+    private fun shotTextsForSoftRefs(shot: ShotEntity): List<String?> = listOf(
+        shot.action,
+        shot.dialogue,
+        shot.narration,
+        shot.scene_context,
+        shot.carry_over,
+        shot.scene_title,
+    )
+
+    /**
      * ★质量修复 C：自动开场帧合成（i2i）。
      * 旧链路 first_image_uri 的唯一真实写入点是 QueuePage 里人工从相册选图 → 流水线产出的镜
      * 95% 没有首帧，视频模型只能从纯文字起步，人物/场景每镜重掷。
-     * 这里在提交前用「场景底图 + 角色参考图」做一次 img2img，把电影开场静帧写回 first_image_uri
-     * 以便复用与审计；任何一步失败返回 null，队列自动回落到原始 first 逻辑（绝不阻断渲染）。
+     * 这里在提交前用「场景底图/接缝帧 + 角色参考图」做一次 img2img，把电影开场静帧写回
+     * first_image_uri 以便复用与审计；任何一步失败返回 null，队列自动回落到原始 first 逻辑
+     * （绝不阻断渲染）。
+     *
+     * ★第六批接缝帧：同场相邻镜共享接缝帧时，[seamInputs] 传入上一镜已生成的首帧作为本镜
+     * 基础画面（图1），本镜在此基础上自然推进到开场动作，保证两镜衔接像素级连续。
+     * 已有 first_image_uri（人工图/已生成接缝帧）直接返回，绝不重掷。
      */
-    private suspend fun synthesizeOpeningFrame(shotId: String): String? {
+    private suspend fun synthesizeOpeningFrame(shotId: String, seamInputs: List<String> = emptyList()): String? {
         return try {
         val dao = AppGraph.dao
         val epId = shotId.substringBeforeLast("_shot").takeIf { it.contains("_ep") } ?: shotId
@@ -207,30 +232,42 @@ object RenderRuntime {
         val projectId = epId.substringBeforeLast("_ep").ifBlank { epId }
         // ★v1.10：同参考图策略——未审核资产可用于开场帧合成，拒绝态仍然排除
         val all = dao.assetsAllOf(projectId).filter { it.audit_state != "rejected" }
-        val refIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
+        // ★第六批：first_asset_ids 为空时按镜头文本软匹配母卡；软解析只补「参考图」，不改绑定关系
+        val boundRefIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
+        val refIds = boundRefIds.ifEmpty {
+            AssetCatalog.softRefIds(all, shot?.let { shotTextsForSoftRefs(it) } ?: emptyList())
+        }
         val refUris = AssetCatalog.resolveRefUris(all, refIds)
             .ifEmpty { AssetCatalog.fallbackUris(all) }
             .filter { it.isNotBlank() }.distinct().take(4)
-        if (refUris.isEmpty()) return null
+        // 无参考图且无接缝帧时不生图：纯文生图必掷脸，交给渲染侧回落（宁可没有首帧）
+        if (refUris.isEmpty() && seamInputs.isEmpty()) return null
         val sceneBase = all.firstOrNull {
             it.kind == "scene" && (!it.remote_url.isNullOrBlank() || !it.image_uri.isNullOrBlank())
         }?.let { it.remote_url?.takeIf { s -> s.isNotBlank() } ?: it.image_uri }
-        val base = sceneBase ?: refUris.first()
+        // 接缝帧优先做基础画面（承接上一镜尾帧）；否则退回场景底图/首张参考
+        val base = seamInputs.firstOrNull() ?: sceneBase ?: refUris.firstOrNull() ?: return null
         // 场景锚点 + 导演镜头语言一起作为「本镜开场画面描述」（旧链路两者都没有）
         val frameStart = listOfNotNull(
             shot?.scene_context?.takeIf { it.isNotBlank() },
             shot?.visual_prompt?.takeIf { it.isNotBlank() },
         ).ifEmpty { listOfNotNull(shot?.action) }.joinToString("；")
-        val (prompt, negative) = com.dramafactory.core.quality.ShotDirector.buildOpeningFramePrompt(
+        // 有接缝帧时图1=上一镜尾帧（本镜基础画面），其余图只做角色/场景一致性约束
+        val legend = if (seamInputs.isNotEmpty()) {
+            "其余图片为角色/场景设定图，仅用于保持人物长相与场景一致，不要照搬棚拍背景；本镜在此基础上自然推进到开场动作。"
+        } else {
+            "参考图片为角色/场景设定图，仅用于保持人物长相与场景一致，不要照搬棚拍背景。"
+        }
+        val (prompt, _) = com.dramafactory.core.quality.ShotDirector.buildOpeningFramePrompt(
             frameStart = frameStart,
             binding = com.dramafactory.core.quality.ShotDirector.Binding(
                 baseUri = base,
-                assetUris = refUris.filter { it != base },
-                legend = "参考图片为角色/场景设定图，仅用于保持人物长相与场景一致，不要照搬棚拍背景。",
+                assetUris = (refUris + seamInputs).filter { it != base }.distinct(),
+                legend = legend,
             ),
             stylePreset = AppGraph.currentPreset(),
         )
-        val inputs = (listOfNotNull(sceneBase) + refUris).distinct()
+        val inputs = (seamInputs.take(1) + listOfNotNull(sceneBase) + refUris).distinct().take(5)
         val url = try {
             AppGraph.image.generateImage(com.dramafactory.core.model.ImageGenRequest(
                 prompt = prompt, size = "720x1280", inputImages = inputs))
@@ -244,6 +281,7 @@ object RenderRuntime {
         }
         val publicUrl = AppGraph.uploadImageToCloud(url)
         try {
+            // 首帧写回；尾帧这里不动（接缝帧链由 synthesizeEpisodeKeyframes 第二遍统一写）
             dao.setShotKeyframes(shotId, publicUrl, shot?.last_image_uri)
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
@@ -260,40 +298,67 @@ object RenderRuntime {
 
     /**
      * ★第二批 P0：编排器分镜落库后自动合成整集关键帧。
-     * 逐镜生成首帧（i2i，复用 [synthesizeOpeningFrame]），再做尾帧接力：
-     * 镜 N 的尾帧 = 镜 N+1 的首帧，保证图生视频首尾连续。
-     * 任何一镜失败只跳过该镜，绝不阻断流水线；返回成功合成的镜数。
+     * 逐镜生成首帧（i2i，复用 [synthesizeOpeningFrame]），再按声明式接缝帧写尾帧链。
+     *
+     * ★第六批接缝帧（SeamPlanner）：
+     * - 同场相邻镜：镜 i 的尾帧 == 镜 i+1 的首帧 == 同一张图，衔接处像素级连续，
+     *   且每镜可单独重渲而不破坏接缝；
+     * - 跨场/集尾：硬切，尾帧写 null，清掉旧的跨场尾帧，避免视频模型把两场插值成一场；
+     * - 下一镜首帧缺失时保留本镜已有尾帧（绝不把人工尾帧覆盖成 null）。
+     *
+     * 任何一镜失败只跳过该镜，绝不阻断流水线；返回本次真正新合成且写库成功的镜数。
      */
     suspend fun synthesizeEpisodeKeyframes(episodeId: String, maxShots: Int = 24): Int {
         return try {
         // 无可用图像 Key 时直接跳过：否则会逐镜走到 Provider 才失败，白跑 24 次（A-G4）
         if (!AppGraph.agnesKeyReady()) return 0
         val dao = AppGraph.dao
-        val shots = dao.shotsOf(episodeId).sortedBy { it.shot_no }
-            .take(maxShots.coerceAtLeast(1))
-        if (shots.isEmpty()) return 0
-        val byId = shots.associateBy { it.shot_id }
-        val firsts = LinkedHashMap<String, String>()
+        // 接缝规划必须基于整集全集：截断只限制「生成多少镜」，不能改变前后镜的场次关系
+        val allShots = dao.shotsOf(episodeId).sortedBy { it.shot_no }
+        if (allShots.isEmpty()) return 0
+        val shots = allShots.take(maxShots.coerceAtLeast(1))
+        val links = SeamPlanner.plan(allShots.map { SeamPlanner.ShotRef(it.shot_no, it.scene_no) })
+        val linkByNo = links.associateBy { it.shotNo }
+        val byNo = allShots.associateBy { it.shot_no }
+        // 第一遍：按镜号顺序生成首帧；同场接缝镜把上一镜刚生成的首帧作为接缝输入
+        val firstByNo = LinkedHashMap<Int, String>()
         val freshlySynthesized = LinkedHashSet<String>()
-        for (shot in shots) {
+        shots.forEachIndexed { i, shot ->
+            val prevShot = shots.getOrNull(i - 1)
+            val prevLink = prevShot?.let { linkByNo[it.shot_no] }
+            val seamInputs = if (prevShot != null && prevLink != null && prevLink.chainedToNext) {
+                listOfNotNull(firstByNo[prevShot.shot_no])
+            } else {
+                emptyList()
+            }
             val hadFirst = !shot.first_image_uri.isNullOrBlank()
-            val uri = synthesizeOpeningFrame(shot.shot_id)
+            val uri = synthesizeOpeningFrame(shot.shot_id, seamInputs)
             if (!uri.isNullOrBlank()) {
-                firsts[shot.shot_id] = uri
+                firstByNo[shot.shot_no] = uri
                 if (!hadFirst) freshlySynthesized += shot.shot_id
             }
         }
-        val ids = shots.map { it.shot_id }
+        // 第二遍：写回首/尾帧。先算完所有首帧再写，保证镜 i 能直接复用镜 i+1 的新首帧做接缝
         var written = 0
-        ids.forEachIndexed { i, sid ->
-            val first = firsts[sid] ?: return@forEachIndexed
-            // 尾帧接力：下一镜首帧优先；下一镜失败或末镜时保留本镜已有尾帧，
-            // 绝不把人工设置的尾帧覆盖成 null（A-G2）。
-            val nextFirst = ids.getOrNull(i + 1)?.let { firsts[it] }
-            val lastToUse = nextFirst ?: byId[sid]?.last_image_uri
+        shots.forEach { shot ->
+            val first = firstByNo[shot.shot_no]?.takeIf { it.isNotBlank() }
+                ?: shot.first_image_uri?.takeIf { it.isNotBlank() }
+                ?: return@forEach
+            val link = linkByNo[shot.shot_no]
+            val nextNo = link?.lastToShotNo
+            val lastToUse: String? = if (link?.chainedToNext == true && nextNo != null) {
+                // 同场接缝：优先下一镜本次新生成的首帧；其次下一镜库里已有的首帧；
+                // 两者都没有（下一镜生成失败/被截断）时保留本镜旧尾帧，绝不写 null
+                firstByNo[nextNo]
+                    ?: byNo[nextNo]?.first_image_uri?.takeIf { it.isNotBlank() }
+                    ?: shot.last_image_uri
+            } else {
+                // 场尾/集尾/场次号缺失：硬切，清空旧尾帧（否则会跨场插值）
+                null
+            }
             try {
-                dao.setShotKeyframes(sid, first, lastToUse)
-                if (sid in freshlySynthesized) written++
+                dao.setShotKeyframes(shot.shot_id, first, lastToUse)
+                if (shot.shot_id in freshlySynthesized) written++
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (_: Throwable) {

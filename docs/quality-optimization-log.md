@@ -1,6 +1,6 @@
-# 质量优化流水账（第一～第四批）
+# 质量优化流水账（第一～第六批）
 
-> 记录 2026-11 起对生成质量与工程稳定性的连续四批优化，便于回溯「为什么这么改」与验收口径。
+> 记录 2026-11 起对生成质量与工程稳定性的连续多批优化，便于回溯「为什么这么改」与验收口径。
 > 每批都按「审计 → 补丁 → 本地 core 测试 → GitHub Actions 编译出 APK → 真机抽检」推进。
 
 ## 第一批：质量修复 A–G
@@ -38,5 +38,20 @@
 - 工程：app 单测 forkEvery=1 + maxParallelForks=1 + 失败全栈（隔离 flaky 的跨类协程异常污染）；CI 上传 app/schemas 为 room-schemas artifact（补齐 9.json 基准）。
 - 验证：core 317 tests / 0 failures（含 ShotFieldRewriterTest 7 例）；app 层由 CI 编译验证。
 
+## 第五批：P0 止血（渲染/付费/安全/审计）
+- 渲染队列：入队加 Mutex；checkpoint 幽灵行清理（pruneToShots）；提交前 tryMarkSubmitting 防重复付费；空 prompt 不提交；缺失本地 clip 用已记录远端 URL 重取（不重新提交）。
+- 预算：DefaultBudgetGuard 支持 initialUsed + onUsageChanged 落 SharedPreferences（重启不丢）；渲染页可调预算上限。
+- 安全与发布：debug/release 签名分离（缺密钥时 release 构建期报错）；DebugBridge 加 token 鉴权、去 CORS 通配、仅 debug 启动；file_paths 补 files-path 修成片播放崩溃；删未用媒体权限；CI 增可选 release job；Room v10（remote_video_url）。
+- 资产/审计：参考图套装锚链（母卡→front_bust→其余）；审核 fail-closed；审计三分类止损（不可重试立即停、内容缺陷最多重生成 2 次）。
+- 分镜联动：编辑/重写/删除分镜后清理对应 render_task；开始渲染前预检并确认已渲染镜数。
+- 验证：core 全量 tests 0 failures（含 Batch5P0Test 7 例）；CI 出 APK。
+
+## 第六批：声明式接缝帧（分镜不硬绑资产）
+- 背景：4s keyframe 实测（几何图 MSE≈2/38、人物图 MSE≈12/136）证明 provider 会把首/尾帧精确落回声明的帧 → 同场相邻镜共享同一张接缝帧（镜 i 尾帧 = 镜 i+1 首帧），无需抽帧，且每镜可独立重渲。
+- core：新增 SeamPlanner（同场相邻链、跨场/场次号缺失/集尾硬切）+ 单测；AiStoryboardDirector 的 asset_ids 改为可选（只在该镜确实提及资产时填，禁止编造；未绑定不影响渲染）。
+- app 渲染：AssetCatalog.softRefIds —— first_asset_ids 为空时按资产名在 action/dialogue/narration/scene_context/carry_over/scene_title 里软匹配母卡；RenderRuntime.synthesizeOpeningFrame 支持 seam 输入（上一镜首帧做图1基础画面，i2i 推进到本镜开场）；synthesizeEpisodeKeyframes 改两遍式：先按全集 SeamPlanner 生成所有首帧，再统一写尾帧链（同场 last=下一镜 first；跨场/集尾 last=null 清掉旧跨场尾帧；下一镜生成失败保留旧尾帧，绝不写 null）。
+- UI：分镜页场组头接缝说明、卡片「接缝帧·首 / 接缝帧·尾 / 场尾硬切」标签、引用为空改为「渲染期按角色名软解析资产」（不再告警）。
+- 验证：core 337 tests / 0 failures；app 由 CI 编译验证。
+
 ## 回滚
-各批均为独立 commit；回滚单批用 `git revert <sha>`，或 `git checkout <上一批 sha> -- <path>` 取回单文件。数据库仅第三批升到 v9（带 8→9 迁移），回滚 APK 前请先备份数据。
+各批均为独立 commit；回滚单批用 `git revert <sha>`，或 `git checkout <上一批 sha> -- <path>` 取回单文件。数据库自第三批起升到 v9、第五批升到 v10（8→9、9→10 迁移）；回滚 APK 前请先备份数据。

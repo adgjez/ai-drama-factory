@@ -174,6 +174,26 @@ private fun SceneGroupHeader(
     }
 }
 
+/**
+ * 第六批：场组头下方的接缝说明。同场相邻镜共享接缝帧（镜 i 尾帧 = 镜 i+1 首帧），
+ * 场尾 / 集尾硬切、不写尾帧；单镜成场时前后都硬切。只做解释，不参与渲染决策。
+ * 注意 scene_no<=0（未分场）不参与接缝链，SeamPlanner 一律按硬切处理。
+ */
+@Composable
+private fun SceneSeamHint(sceneNo: Int, rows: List<com.dramafactory.app.data.ShotEntity>) {
+    val text = when {
+        sceneNo <= 0 -> "未分场 · 前后硬切（不参与接缝链）"
+        rows.size >= 2 -> "接缝帧：场内接力 ×${rows.size - 1} · 场尾硬切"
+        else -> "单镜成场 · 前后硬切"
+    }
+    Text(
+        text,
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.fillMaxWidth().padding(start = 24.dp, bottom = 2.dp),
+    )
+}
+
 /** 第四批：可 AI 重写的字段 → 中文名（编辑框按钮/弹窗标题用）。 */
 private fun shotFieldRewriteLabel(field: String): String = when (field) {
     ShotFieldRewriter.FIELD_ACTION -> "动作"
@@ -532,8 +552,11 @@ fun StoryboardPage(
                     onMergeToPrevious = { vm.mergeSceneIntoPrevious(sceneNo) },
                     onSplitClick = { splitSceneNo = sceneNo },
                 )
+                SceneSeamHint(sceneNo, groupShots)
             }
             items(groupShots, key = { it.shot_id }) { shot ->
+                // 第六批：组内最后一镜 = 场尾（最后一组时也是集尾），尾帧按硬切处理
+                val isSceneTail = shot.shot_id == groupShots.last().shot_id
                 DramaCard(
                     onClick = { viewingShotId = shot.shot_id },   // v1.9.2：点卡=查看详情
                     modifier = Modifier.fillMaxWidth(),
@@ -571,6 +594,19 @@ fun StoryboardPage(
                                 }
                                 shot.screen_side?.takeIf { it.isNotBlank() }?.let { InfoChip("站位：$it") }
                                 shot.eyeline?.takeIf { it.isNotBlank() }?.let { InfoChip("视线：$it") }
+                                // 第六批：接缝帧链状态（首/尾帧由渲染前 synthesizeEpisodeKeyframes 统一写回）
+                                if (!shot.first_image_uri.isNullOrBlank()) {
+                                    Text("接缝帧·首", style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.tertiary)
+                                }
+                                if (!shot.last_image_uri.isNullOrBlank()) {
+                                    Text("接缝帧·尾（=下一镜首帧）", style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.tertiary)
+                                }
+                                if (shot.last_image_uri.isNullOrBlank() && isSceneTail) {
+                                    Text("场尾硬切（不写尾帧）", style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.outline)
+                                }
                             }
                         }
                         shot.action?.let { Text("动作：${displayAction(shot)}", style = MaterialTheme.typography.bodyMedium) }
@@ -599,8 +635,8 @@ fun StoryboardPage(
                             }
                         }
                         // v1.7.17：把「本镜引用了哪些资产」显式摆出来。
-                        // 此前这层完全不可见——LLM 引错（或引了还没生图的卡）用户无从察觉，
-                        // 只会在成片里看到角色换脸。引用为空即代表渲染时回退项目级前4张，锁不住脸。
+                        // 第六批：显式绑定不再是必需项——为空表示渲染期按角色名软解析资产（AssetCatalog.softRefIds），
+                        // 不再回退项目级前 4 张，所以这里只提示「未绑定」，不再当错误告警。
                         val refs = AssetCatalog.parseRefIds(shot.first_asset_ids)
                         if (refs.isNotEmpty()) {
                             Row(
@@ -618,11 +654,11 @@ fun StoryboardPage(
                                 verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                             ) {
-                                Icon(Icons.Default.Warning, contentDescription = "未引用资产",
-                                    tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(16.dp))
-                                Text("未引用资产：渲染将回退项目级前4张",
+                                Icon(Icons.Default.Info, contentDescription = "资产软解析",
+                                    tint = MaterialTheme.colorScheme.tertiary, modifier = Modifier.size(16.dp))
+                                Text("引用：未绑定（渲染期按角色名软解析资产）",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.error)
+                                    color = MaterialTheme.colorScheme.tertiary)
                             }
                         }
                         shot.dialogue?.let { Text("台词：「$it」", style = MaterialTheme.typography.bodySmall) }
@@ -765,11 +801,11 @@ fun StoryboardPage(
                             verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp),
                         ) {
-                            Icon(Icons.Default.Warning, contentDescription = null,
-                                tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(16.dp))
-                            Text("未引用资产：渲染将回退项目级前4张",
+                            Icon(Icons.Default.Info, contentDescription = null,
+                                tint = MaterialTheme.colorScheme.tertiary, modifier = Modifier.size(16.dp))
+                            Text("引用：未绑定（渲染期按角色名软解析资产）",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.error)
+                                color = MaterialTheme.colorScheme.tertiary)
                         }
                     } else {
                         for (refId in refs) {
