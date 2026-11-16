@@ -82,16 +82,17 @@ class AssetPromptBuilderTest {
             assertFalse(p.contains("skateboard"))
             assertFalse(p.contains("airplane"))
         }
-        // 完整红线仍完整保留在视频端 negative 通道，未被裁掉
-        assertTrue(preset.sceneNegativePromptFor().contains("refrigerator"), "视频端仍用完整红线")
-        assertTrue(preset.studioNegativePromptFor().contains("refrigerator"))
+        // v1.9.46：时代红线已从生成链路移除，视频端 negative 也不再折叠时代禁词
+        assertFalse(preset.sceneNegativePromptFor().contains("手机"), "场景负向不应再含时代禁词")
+        assertFalse(preset.studioNegativePromptFor().contains("smartphone"))
     }
 
-    @Test fun `角色 prompt 带主体版 era 且不诱导环境`() {
+    @Test fun `角色 prompt 不注入时代红线`() {
         val p = AssetPromptBuilder.finalPrompt(preset, "character", "张角")
-        assertTrue(p.contains(preset.eraPositiveSubjectOnly), "时代红线不能因为去背景而丢失")
-        assertFalse(p.contains(preset.era.positive), "角色卡应收窄为主体版红线")
-        assertFalse(p.contains("木构与夯土建筑"), "完整 era 的建筑诱导词不该出现在角色卡")
+        assertFalse(p.contains("西汉"), "不应注入朝代 positive")
+        assertFalse(p.contains("深衣"), "不应注入汉代服饰红线")
+        assertFalse(p.contains("木构与夯土建筑"), "不应注入建筑诱导词")
+        assertTrue(p.contains("plain solid color background"), "棚拍纯色底约束仍保留")
     }
 
     @Test fun `场景与道具不受棚拍约束影响`() {
@@ -129,32 +130,22 @@ class AssetPromptBuilderTest {
         val p = AssetPromptBuilder.finalPrompt(preset, "character", "张角")
         assertTrue(p.contains("Do NOT include"), "英文禁词应并入正向（图像端无 negative_prompt 字段）")
         assertFalse(p.contains("手机"), "中文禁词并入正向只会稀释权重")
-        assertTrue(p.contains("smartphone"), "应有对应的英文禁词")
+        assertTrue(p.contains("holding"), "类型专用英文禁词（持握类）仍应并入")
     }
 
     /**
-     * v1.7.21：era 正向按资产类型分家。
-     *
-     * 旧版三类共用一份（场景用完整版），导致：
-     * - 场景 era 首句「所有**人物**、服饰、建筑…」——正向在喊「画人」，no people 压不住；
-     * - 道具 era 含「汉代衣冠」——等于请模型画个穿衣的人；
-     * - 角色 era 含「简牍竹简、青铜/漆木/陶器、火烛照明」——诱导模型在人物周围补器物与火光。
+     * v1.9.46：时代红线整体删除——三类资产卡都不再注入任何朝代/形制内容，
+     * 建筑、服饰、器物风格完全由剧本与资产描述本身决定。
      */
-    @Test fun `era 正向按类型分家，互不串味`() {
-        val c = AssetPromptBuilder.finalPrompt(preset, "character", "张角")
-        assertFalse(c.contains("简牍竹简"), "角色卡提器物会诱导模型在人物周围补道具")
-        assertFalse(c.contains("火烛照明"), "火光是环境元素，角色卡不该提")
-        assertTrue(c.contains("深衣"), "服饰红线必须保留")
-
-        val s = AssetPromptBuilder.finalPrompt(preset, "scene", "破庙内景")
-        assertFalse(s.contains(preset.era.positive), "场景不该再用完整 era（首句就在喊「人物」）")
-        assertTrue(s.contains("木构与夯土建筑"), "建筑红线是场景的本分")
-        assertFalse(s.substringBefore("Do NOT include").contains("所有人物"), "场景正向不得出现「人物」二字")
-
-        val p = AssetPromptBuilder.finalPrompt(preset, "prop", "墨玉书简")
-        assertFalse(p.contains("深衣"), "道具卡提衣冠等于请模型画个穿衣的人")
-        assertFalse(p.contains("火烛照明"), "道具卡不该提环境照明")
-        assertTrue(p.contains("简牍竹简"), "器物形制红线是道具的本分")
+    @Test fun `三类资产卡都不注入时代红线`() {
+        for (kind in listOf("character", "scene", "prop")) {
+            val p = AssetPromptBuilder.finalPrompt(preset, kind, "测试")
+            assertFalse(p.contains("西汉"), "[$kind] 不应注入朝代名")
+            assertFalse(p.contains("深衣"), "[$kind] 不应注入汉代服饰红线")
+            assertFalse(p.contains("木构与夯土建筑"), "[$kind] 不应注入建筑红线")
+            assertFalse(p.contains("简牍竹简"), "[$kind] 不应注入汉代器物红线")
+            assertFalse(p.contains("火烛照明"), "[$kind] 不应注入时代照明")
+        }
     }
 
     @Test fun `constrained 版本不含禁词与质量负向`() {
@@ -172,49 +163,22 @@ class AssetPromptBuilderTest {
         assertEquals("1024x1024", AssetPromptBuilder.sizeFor(preset, "CHARACTER"), "大小写不敏感")
     }
 
-    // ---------- v1.9.32：跨朝代红线污染修复 ----------
-    // 根因：eraPositiveScene/Character/Prop 写死为西汉常量，非 han preset 未覆盖，
-    // 导致唐/宋/明/清剧本的资产卡红线仍是「西汉末年至新莽」。修复后资产图红线随 era.label 走。
+    // ---------- v1.9.46：各时代预设都不再注入时代红线 ----------
 
-    @Test fun `唐代场景卡红线随朝代走，不残留西汉`() {
-        val tang = EraDetector.presetFor("tang")
-        val scene = AssetPromptBuilder.finalPrompt(tang, "scene", "朱雀大街")
-        assertTrue(scene.contains("盛唐"), "场景卡应注入唐代红线（label=盛唐时期），实际: $scene")
-        assertFalse(scene.contains("西汉"), "场景卡不得残留西汉时代名")
-        assertFalse(scene.contains("简牍"), "唐代场景不写汉代简牍")
-        assertTrue(scene.contains("no people"), "空场无人约束必须保留")
-    }
-
-    @Test fun `唐代角色卡红线随朝代走，不残留汉代衣冠`() {
-        val tang = EraDetector.presetFor("tang")
-        val char = AssetPromptBuilder.finalPrompt(tang, "character", "武媚娘")
-        assertTrue(char.contains("盛唐"), "角色卡应注入唐代红线（label=盛唐时期）")
-        assertFalse(char.contains("西汉"), "角色卡不得残留西汉")
-        assertFalse(char.contains("深衣"), "角色卡不写汉代深衣曲裾")
-        assertTrue(char.contains("双手"), "空手约束保留")
-    }
-
-    @Test fun `唐代道具卡红线随朝代走，不残留汉代器物`() {
-        val tang = EraDetector.presetFor("tang")
-        val prop = AssetPromptBuilder.finalPrompt(tang, "prop", "三彩马")
-        assertTrue(prop.contains("盛唐"), "道具卡应注入唐代红线（label=盛唐时期）")
-        assertFalse(prop.contains("简牍竹简"), "唐代道具不写汉代简牍")
-        assertTrue(prop.contains("plain solid color background"), "纯色底约束保留")
-    }
-
-    @Test fun `现代剧资产卡不禁现代物`() {
-        val modern = EraDetector.presetFor("modern")
-        val scene = AssetPromptBuilder.finalPrompt(modern, "scene", "写字楼大厅")
-        assertTrue(scene.contains("当代"), "现代场景应注入现代设定（label=当代）")
-        assertFalse(scene.contains("无现代器物"), "现代剧不禁现代物")
+    @Test fun `各时代预设资产卡都不注入时代红线`() {
+        for (key in listOf("han", "tang", "modern")) {
+            val pr = EraDetector.presetFor(key)
+            for (kind in listOf("character", "scene", "prop")) {
+                val p = AssetPromptBuilder.finalPrompt(pr, kind, "测试")
+                assertFalse(p.contains("西汉") || p.contains("盛唐") || p.contains("当代"),
+                    "[$key/$kind] 不应注入时代名：$p")
+                assertFalse(p.contains("木构与夯土建筑"), "[$key/$kind] 不应注入建筑红线")
+                assertFalse(p.contains("深衣"), "[$key/$kind] 不应注入服饰红线")
+            }
+        }
+        val scene = AssetPromptBuilder.finalPrompt(EraDetector.presetFor("modern"), "scene", "写字楼大厅")
         assertTrue(scene.contains("no people"), "空场无人约束保留")
-    }
-
-    @Test fun `汉朝资产卡仍保留精编西汉红线，不回归`() {
-        val han = EraDetector.presetFor("han")
-        val scene = AssetPromptBuilder.finalPrompt(han, "scene", "未央宫前殿")
-        assertTrue(scene.contains("西汉"), "汉朝场景卡应保留西汉红线")
-        assertTrue(scene.contains("木构与夯土建筑"), "西汉场景建筑红线保留")
-        assertTrue(AssetPromptBuilder.finalPrompt(han, "character", "王莽").contains("深衣"), "汉朝角色服饰红线保留")
+        assertTrue(AssetPromptBuilder.finalPrompt(EraDetector.presetFor("han"), "prop", "墨玉书简")
+            .contains("plain solid color background"), "道具纯色底约束保留")
     }
 }

@@ -626,7 +626,6 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
         enrichHandler = { card ->
             withContext(Dispatchers.IO) {
                 AppGraph.storageGuard.requireReady()
-                val preset = eraPreset
                 val kindKey = when (card.kind) {
                     AssetsLogic.Kind.CHARACTER -> "character"
                     AssetsLogic.Kind.SCENE -> "scene"
@@ -640,9 +639,7 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
                                 com.dramafactory.core.model.ChatMessage("user", msg))))
                         }.getOrNull()?.content ?: ""
                     },
-                    kind = kindKey, name = card.prompt,
-                    eraLabel = preset.era.label, forbidden = preset.forbiddenEraTerms,
-                    modernAllowed = preset.name == "neutral" || preset.name == "modern" || preset.name == "fantasy")
+                    kind = kindKey, name = card.prompt)
                 Result.success(enriched)
             }
         }
@@ -822,11 +819,11 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
     val allowedCrossEra: kotlinx.coroutines.flow.StateFlow<List<String>> get() = _allowedCrossEra
 
     /**
-     * 第十三轮：按剧本自动推断的时代预设（默认西汉，init 时 LLM/规则检测后更新）。
-     * 生成链路一律用 [eraPreset] 而非写死的 HAN_PRESET。
+     * v1.9.46：时代约束已从生成链路删除，[eraKey] 恒为 neutral。
+     * [eraPreset] 仅作签名兼容，提示词不再按朝代注入红线；服化道以剧本与资产描述为准。
      */
     @Volatile private var eraKey: String = "neutral"
-    private val _eraLabel = kotlinx.coroutines.flow.MutableStateFlow("时代待判定（按剧本）")
+    private val _eraLabel = kotlinx.coroutines.flow.MutableStateFlow("服化道以剧本为准（无时代锁）")
     val eraLabel: kotlinx.coroutines.flow.StateFlow<String> get() = _eraLabel
     private val eraPreset: com.dramafactory.core.quality.StylePreset
         get() = com.dramafactory.core.quality.EraDetector.presetFor(eraKey)
@@ -880,18 +877,6 @@ class AssetsViewModel(private val episodeId: String) : ViewModel() {
                     imageUri = e.image_uri,
                     videoUri = e.video_uri,
                     prompt = e.prompt)
-            }
-            // ★第十三轮：按剧本自动推断时代红线（LLM优先，规则兜底）
-            val scriptForEra = row?.script_json
-            if (!scriptForEra.isNullOrBlank()) {
-                val llmReady = AppGraph.isInitialized && AppGraph.agnesKeyReady()
-                val det = runCatching {
-                    com.dramafactory.core.quality.EraDetector.detect(scriptForEra, llmReady) { req ->
-                        AppGraph.text.chat(req)
-                    }
-                }.getOrElse { com.dramafactory.core.quality.EraDetector.Detection("neutral", "", false) }
-                eraKey = det.eraKey
-                _eraLabel.value = det.label + if (det.usedLlm) "" else "（规则推断）"
             }
             // ★第十一轮：回填全部已落库资产（含生成的 remote_url），重进项目不丢卡不丢图
             runCatching {

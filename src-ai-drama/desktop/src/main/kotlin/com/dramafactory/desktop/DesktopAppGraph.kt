@@ -81,7 +81,7 @@ object DesktopAppGraph {
             },
             generateImage = { asset ->
                 runCatching {
-                    val preset = EraDetector.presetFor("han")
+                    val preset = EraDetector.presetFor("neutral")
                     // v1.7.17：与 app 共用 core 的组装规则。
                     // 原实现给图像接口传 negativePrompt，Agnes 图像端不支持（400）。
                     agnes.generateImage(

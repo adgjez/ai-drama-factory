@@ -46,14 +46,8 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
             val gate = requireStorageReady()
             if (gate != null) throw StorageUnavailableException(gate.code, gate.userMessage, gate.diagnosticId)
             val epId = "${projectId}_ep1"
-            // ★F3 修复：按剧本自动推断时代红线（LLM 优先，规则兜底），替换原写死 "han"。
-            // 第十三轮 EraDetector 与人工模式（ViewModels:370-374）同策略。
-            val llmReady = agnesKeyReady()
-            currentEraKey = runCatching {
-                com.dramafactory.core.quality.EraDetector.detect(scriptText, llmReady) { req ->
-                    agnes.chat(req)
-                }
-            }.getOrElse { com.dramafactory.core.quality.EraDetector.Detection("neutral", "", false) }.eraKey
+            // v1.9.46：时代约束已从生成链路删除，不再做剧本时代检测（恒用 neutral 预设）。
+            currentEraKey = "neutral"
             val flags = DramaDatabase.Companion.AiStageFlags
             val stageFlags =
                 flags.put(flags.putBool("", flags.AI_MANAGED, true),
@@ -108,7 +102,7 @@ internal fun AppGraph.buildAiOrchestrator(): DefaultAiOrchestrator =
                 }
                 val preset = com.dramafactory.core.quality.EraDetector.presetFor(currentEraKey)
                 // TD-5：generateImage 在编排器协程上下文中执行，避免阻塞主线程。
-                // ★F3：按剧本推断时代预设，不写死具体时代。
+                // v1.9.46：preset 恒为 neutral，服化道以剧本为准。
                 com.dramafactory.app.ui.AssetImageGenerator.generate(
                     provider = image, kind = asset.kind,
                     basePrompt = enrichAssetPrompt(asset.kind, asset.prompt), preset = preset)

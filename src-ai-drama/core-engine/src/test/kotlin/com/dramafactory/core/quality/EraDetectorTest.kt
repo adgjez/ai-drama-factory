@@ -34,9 +34,10 @@ class EraDetectorTest {
         val p = EraDetector.presetFor("modern")
         assertFalse(p.negativePrompt.contains("手机"), "现代剧不应禁手机")
     }
-    @Test fun 清代预设含历史禁词() {
+    @Test fun 时代禁词不再折叠进负向() {
+        // v1.9.46：时代约束已移除，任何朝代预设的 negative 都只含通用负向
         val p = EraDetector.presetFor("qing")
-        assertTrue(p.negativePrompt.contains("手机"))
+        assertFalse(p.negativePrompt.contains("手机"), "时代禁词已移除：$p")
     }
     @Test fun 未知key回退中性() {
         assertEquals("neutral", EraDetector.presetFor("xyz").name)

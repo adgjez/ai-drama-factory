@@ -21,8 +21,7 @@ class AssetPromptEnricherTest {
     fun enrich_正常返回英文视觉描述并清洗() = runTest {
         val fakeChat: suspend (String) -> String = { "```\nA weathered wooden gate tower, rammed-earth walls, Han dynasty\n```" }
         val result: String = AssetPromptEnricher.enrich(
-            chat = fakeChat, kind = "scene", name = "城楼",
-            eraLabel = "西汉末年至新莽时期（约公元1世纪—公元23年）", forbidden = listOf("塑料", "玻璃幕墙"))
+            chat = fakeChat, kind = "scene", name = "城楼")
         assertTrue(result.contains("gate tower") && result.contains("rammed-earth"), "应保留模型产出的主体描述: $result")
         assertFalse(result.startsWith("```"), "不应残留代码块标记")
     }
@@ -43,32 +42,30 @@ class AssetPromptEnricherTest {
 
     @Test
     fun instruction_按类型注入不同侧重点() {
-        val charInstr: String = AssetPromptEnricher.instruction("character", "西汉", emptyList())
-        val sceneInstr: String = AssetPromptEnricher.instruction("scene", "西汉", emptyList())
-        val propInstr: String = AssetPromptEnricher.instruction("prop", "西汉", emptyList())
+        val charInstr: String = AssetPromptEnricher.instruction("character")
+        val sceneInstr: String = AssetPromptEnricher.instruction("scene")
+        val propInstr: String = AssetPromptEnricher.instruction("prop")
         assertTrue(charInstr.contains("人物"), "角色指令应强调人物")
         assertTrue(sceneInstr.contains("空场") || sceneInstr.contains("建筑"), "场景指令应强调空场/建筑")
         assertTrue(propInstr.contains("器物") || propInstr.contains("形制"), "道具指令应强调器物形制")
-        for (i: String in listOf(charInstr, sceneInstr, propInstr)) {
-            assertTrue(i.contains("现代元素") || i.contains("塑料"), "必须含禁现代元素提示")
-        }
     }
 
     @Test
-    fun instruction_携带少量高频禁词作负向提示() {
-        val instr: String = AssetPromptEnricher.instruction(
-            "character", "西汉",
-            listOf("塑料", "玻璃幕墙", "手机", "电灯", "汽车", "摩托车", "霓虹灯", "西装", "高跟鞋", "运动鞋",
-                "现代制服", "QR码", "屏幕", "空调", "监控", "不锈钢", "瓷砖", "水泥", "相机", "耳机", "电脑"))
-        assertTrue(instr.contains("塑料") && instr.contains("玻璃幕墙"), "应透传高频禁词")
-        assertFalse(instr.contains("vernier caliper"), "不应包含与扩写无关的远距禁词")
+    fun instruction_不再注入任何时代或禁词() {
+        for (kind in listOf("character", "scene", "prop")) {
+            val instr: String = AssetPromptEnricher.instruction(kind)
+            assertTrue(instr.contains("剧本"), "[$kind] 年代风格应以剧本为唯一依据：$instr")
+            assertFalse(instr.contains("现代元素"), "[$kind] 不应再禁现代元素")
+            assertFalse(instr.contains("塑料"), "[$kind] 不应再透传时代禁词")
+            assertFalse(instr.contains("古装"), "[$kind] 不应强加古装")
+        }
     }
 
     // ---------- v1.9.11：禁止人物扩写出「手持道具」 ----------
 
     @Test
     fun instruction_人物扩写明确禁止持握表述() {
-        val instr: String = AssetPromptEnricher.instruction("character", "西汉", emptyList())
+        val instr: String = AssetPromptEnricher.instruction("character")
         assertTrue(instr.contains("双手必须空置"), "应要求双手空置")
         assertTrue(instr.contains("holding") && instr.contains("in hand"), "应点名禁用 holding / in hand 表述")
     }

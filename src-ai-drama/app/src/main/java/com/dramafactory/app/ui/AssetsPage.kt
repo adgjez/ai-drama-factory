@@ -250,7 +250,7 @@ fun AssetsPage(
     val assetsState = vm?.assets?.collectAsState()
     val scriptMode by vm?.scriptMode?.collectAsState() ?: remember { mutableStateOf(false) }
     val eraAllowed by vm?.allowedCrossEra?.collectAsState() ?: remember { mutableStateOf(emptyList<String>()) }
-    val eraLabel by vm?.eraLabel?.collectAsState() ?: remember { mutableStateOf("西汉末年至新莽时期（默认）") }
+    val eraLabel by vm?.eraLabel?.collectAsState() ?: remember { mutableStateOf("服化道以剧本为准") }
     val extractMsg by vm?.extractMessage?.collectAsState() ?: remember { mutableStateOf<String?>(null) }
     // v1.9.2：副标题随剧集动态变化（项目名 + 第几集），不再写死
     val subtitle by vm?.subtitle?.collectAsState() ?: remember { mutableStateOf("资产库") }
@@ -358,7 +358,7 @@ fun AssetsPage(
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Icon(painterResource(R.drawable.ic_shield), contentDescription = "时代红线",
                                 tint = DramaColor.Warning, modifier = Modifier.size(22.dp))
-                            Text("时代红线", style = MaterialTheme.typography.titleMedium)
+                            Text("时代风格", style = MaterialTheme.typography.titleMedium)
                             Surface(
                                 color = DramaColor.Warning.copy(alpha = 0.15f),
                                 shape = MaterialTheme.shapes.extraSmall,
@@ -369,7 +369,7 @@ fun AssetsPage(
                                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp))
                             }
                         }
-                        Text("已根据剧本自动推断时代约束；若剧本为穿越设定，请手动改写红线后再生成图像。",
+                        Text("时代约束已移除：服化道、建筑形制与器物风格完全以剧本和资产描述为准；下方自定义禁词仅本剧生效。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.outline)
                         FlowRow(

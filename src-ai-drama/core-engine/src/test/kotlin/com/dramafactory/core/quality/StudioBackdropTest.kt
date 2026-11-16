@@ -21,8 +21,8 @@ class StudioBackdropTest {
         val out = preset.withCharacterStudioConstraints("一位将军，身穿汉代铠甲")
         assertTrue(out.contains("一位将军，身穿汉代铠甲"))
         assertTrue(out.contains(preset.studioBackdropPositive))
-        assertTrue(out.contains(preset.eraPositiveSubjectOnly), "仍应带 era 正向约束（主体版）")
-        assertFalse(out.contains(preset.era.positive), "完整 era 正文含建筑/场景语义，会诱导模型补背景")
+        assertFalse(out.contains(preset.era.positive), "不应再注入完整 era 正文")
+        assertFalse(out.contains("深衣"), "不应再注入朝代服饰红线")
     }
 
     @Test fun `studioNegativePromptFor 含棚拍负向干扰词`() {
@@ -33,11 +33,12 @@ class StudioBackdropTest {
         assertTrue(neg.contains("furniture"))
     }
 
-    @Test fun `studioNegativePromptFor 仍含 era 禁词`() {
+    @Test fun `studioNegativePromptFor 不再含时代禁词`() {
         val neg = preset.studioNegativePromptFor()
-        assertTrue(neg.contains("手机"))
-        assertTrue(neg.contains("car"))
-        assertTrue(neg.contains("modern"))
+        assertFalse(neg.contains("手机"), "时代禁词已移除：$neg")
+        assertFalse(neg.contains("汽车"), "时代禁词已移除：$neg")
+        assertFalse(neg.contains("塑料"), "时代禁词已移除：$neg")
+        assertFalse(neg.contains("smartphone"))
     }
 
     @Test fun `普通 withEraConstraints 不含棚拍约束`() {
@@ -62,13 +63,7 @@ class StudioBackdropTest {
     }
 
     // ---------- v1.9.11：角色「手持道具」修复 ----------
-
-    @Test fun `角色 era 正向显式要求双手空置`() {
-        val out = preset.withCharacterStudioConstraints("一位将军")
-        assertTrue(out.contains("双手自然垂于身侧且完全空置"),
-            "角色 era 正向应显式禁止持握器物，实际: $out")
-        assertTrue(out.contains("不持握任何器物"), "应列举具体禁用手持物")
-    }
+    // v1.9.46：空手约束不再来自 era 正文（时代红线已删除），改由尾部强指令与禁词保障。
 
     @Test fun `角色尾部强指令含空手中英双语且优先级最高`() {
         val anchor = preset.tailAnchorFor(AssetPromptBuilder.KIND_CHARACTER)
@@ -98,6 +93,7 @@ class StudioBackdropTest {
     @Test fun `场景与道具不受角色空手约束污染`() {
         assertFalse(preset.tailAnchorFor(AssetPromptBuilder.KIND_SCENE).contains("BOTH HANDS"),
             "空手指令不应泄漏到场景")
-        assertFalse(preset.eraPositiveScene.contains("不持握"), "场景正向不应含空手指令")
+        assertFalse(preset.tailAnchorFor(AssetPromptBuilder.KIND_PROP).contains("BOTH HANDS"),
+            "空手指令不应泄漏到道具")
     }
 }

@@ -314,22 +314,22 @@ object AppGraph {
     }.getOrNull()
 
     /**
-     * ★F3 修复：当前 AI 管线的时代红线 key（由 createEpisode 按剧本自动推断，
-     * 不再写死西汉）。generateImage 生成链路一律用 presetFor(currentEraKey) 组装约束。
-     * 单活跃 run 假设下用 @Volatile 保证可见性；并发多 run 由上层串行保证。
+     * v1.9.46：时代约束已从生成链路删除。
+     * 该 key 恒为 neutral，仅用于兼容既有调用点（presetFor / AssetPromptBuilder 签名保留）；
+     * 服化道、建筑形制、器物风格一律以剧本与资产描述为准，不再按朝代注入红线。
      */
     @Volatile internal var currentEraKey: String = "neutral"
 
-    /** 当前时代红线预设（AI 助手/资产生成共用；由 createEpisode 按剧本推断更新） */
+    /** 当前风格预设（v1.9.46 起恒为 neutral；保留给资产生成/提示词组装的既有调用点） */
     fun currentPreset(): com.dramafactory.core.quality.StylePreset =
         com.dramafactory.core.quality.EraDetector.presetFor(currentEraKey)
 
     /**
-     * v1.9.10：用已接好的文本 LLM 把资产裸名词扩写成聚焦主体、符合时代红线的视觉描述，
+     * v1.9.10：用已接好的文本 LLM 把资产裸名词扩写成聚焦主体、符合剧本设定的视觉描述，
      * 供各生图入口统一复用。失败（未配 Key / 401 / 超时）安全回退裸词，不阻断生图。
+     * v1.9.46：不再传时代/禁词参数——扩写只描述主体，年代风格完全以剧本为准。
      */
     internal suspend fun enrichAssetPrompt(kind: String, baseName: String): String {
-        val preset = currentPreset()
         return runCatching {
             com.dramafactory.core.quality.AssetPromptEnricher.enrich(
                 chat = { msg ->
@@ -339,10 +339,7 @@ object AppGraph {
                             com.dramafactory.core.model.ChatMessage("user", msg))))
                     }.getOrNull()?.content ?: ""
                 },
-                kind = kind, name = baseName,
-                eraLabel = preset.era.label, forbidden = preset.forbiddenEraTerms,
-                // 资产专业化：现代/当代/架空题材关闭「禁现代元素」，避免把现代剧资产扩成古装
-                modernAllowed = preset.name == "neutral" || preset.name == "modern" || preset.name == "fantasy")
+                kind = kind, name = baseName)
         }.getOrDefault(baseName)
     }
 

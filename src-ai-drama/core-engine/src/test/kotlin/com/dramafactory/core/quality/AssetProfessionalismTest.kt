@@ -58,36 +58,30 @@ class AssetProfessionalismTest {
         assertEquals("手机", LlmAssetExtractor.cardPrompt(LlmAssetExtractor.Asset("prop", "手机", "")))
     }
 
-    // ---------- 扩写：现代题材不再强行古装 ----------
+    // ---------- 扩写：时代约束已删除，风格以剧本为准 ----------
 
     @Test
-    fun `instruction 现代题材解除禁现代元素并保留当代器物`() {
-        val instr: String = AssetPromptEnricher.instruction(
-            "character", "当代都市（2020年代）", emptyList(), modernAllowed = true)
-        assertTrue(instr.contains("保留"), "现代题材应要求保留当代服饰器物：" + instr)
-        assertTrue(instr.contains("手机") && instr.contains("办公室"), "应点名当代器物")
-        assertTrue(instr.contains("不要强行添加古装"), "应明确不要强加古装")
-        assertFalse(instr.contains("严禁任何现代元素"), "现代题材不应再禁现代元素")
+    fun `instruction 不再注入任何时代或禁词`() {
+        for (kind in listOf("character", "scene", "prop")) {
+            val instr: String = AssetPromptEnricher.instruction(kind)
+            assertTrue(instr.contains("剧本"), "[$kind] 风格应以剧本为唯一依据：" + instr)
+            assertFalse(instr.contains("现代元素"), "[$kind] 不应再禁现代元素")
+            assertFalse(instr.contains("古装"), "[$kind] 不应强加古装")
+            assertFalse(instr.contains("塑料"), "[$kind] 不应再透传时代禁词")
+        }
     }
 
     @Test
-    fun `instruction 历史题材默认仍禁现代元素`() {
-        val instr: String = AssetPromptEnricher.instruction("scene", "西汉", emptyList())
-        assertTrue(instr.contains("严禁任何现代元素"), "历史题材默认必须禁现代元素")
-        assertFalse(instr.contains("不要强行添加古装"))
-    }
-
-    @Test
-    fun `enrich 现代题材把现代指令透传给文本模型`() = runTest {
+    fun `enrich 只传主体描述与剧本口径`() = runTest {
         var seen = ""
         val fakeChat: suspend (String) -> String = { msg ->
             seen = msg
             "A 32-year-old female CEO in a tailored black suit, shoulder-length hair"
         }
         val result: String = AssetPromptEnricher.enrich(
-            chat = fakeChat, kind = "character", name = "林见夕·集团总裁",
-            eraLabel = "当代都市（2020年代）", modernAllowed = true, fallback = "林见夕·集团总裁")
-        assertTrue(seen.contains("不要强行添加古装"), "发给模型的指令应带现代题材约束")
+            chat = fakeChat, kind = "character", name = "林见夕·集团总裁", fallback = "林见夕·集团总裁")
+        assertTrue(seen.contains("剧本"), "发给模型的指令应以剧本为唯一依据")
+        assertFalse(seen.contains("现代元素"), "不应再带时代禁词")
         assertTrue(result.contains("CEO"), "应保留模型产出的描述：" + result)
     }
 }
